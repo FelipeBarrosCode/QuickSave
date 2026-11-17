@@ -1,0 +1,23 @@
+[package]
+name = "quicksave-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Safe local additive encrypted QuickSave folder backup"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+fs2 = "0.4"
+quicksave-content.workspace = true
+quicksave-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

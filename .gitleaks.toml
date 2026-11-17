@@ -1,0 +1,11 @@
+title = "QuickSave source and upstream-reference secret scan"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public 64-hex SHA-256 integrity digests in the independently verified upstream file manifest"
+condition = "AND"
+paths = ['''^upstream/FILES\.sha256\.json$''']
+regexTarget = "secret"
+regexes = ['''^[a-f0-9]{64}$''']

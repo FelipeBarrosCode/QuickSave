@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discover-applications"
+description = "Enables the discover_applications command without any pre-configured scope."
+commands.allow = ["discover_applications"]
+
+[[permission]]
+identifier = "deny-discover-applications"
+description = "Denies the discover_applications command without any pre-configured scope."
+commands.deny = ["discover_applications"]

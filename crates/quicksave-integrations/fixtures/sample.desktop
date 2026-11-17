@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Fixture\sApp
+Exec=/bin/sh -c "this metadata must never run"
+TryExec=/nonexistent/application
+NoDisplay=false

@@ -1,0 +1,14 @@
+{
+  "source_repository": "https://github.com/FelipeBarrosCode/no_land",
+  "commit": "e81238a7536aae201540956ce76981364fd36595",
+  "archive_sha256": "157156c3812aba45fdbfcc97268eede85dd34c49c3df2db0628874c085247fa5",
+  "paths": [
+    "state-agent",
+    "LICENSE",
+    "docs/shared-storage-restore-pipeline.md",
+    "docs/shared-storage-io-validation.md",
+    "docs/shared-storage-dev-optimizations.md",
+    "docs/state-secret-storage.md"
+  ],
+  "policy": "Upstream snapshot is unmodified, read-only reference. Derived files must document provenance. Do not access production credentials or remote instances."
+}

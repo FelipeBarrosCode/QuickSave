@@ -1,0 +1,101 @@
+name: QuickSave isolated validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      native_desktop:
+        description: Also check the native Tauri backend (no packaging/signing)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quicksave-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guards-and-lints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify read-only upstream provenance and dependency boundaries
+        run: python scripts/verify_repository.py
+      - name: Test isolated verification and smoke harnesses
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  native-workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run workspace tests on the native host
+        run: cargo test --locked --workspace -- --test-threads=1
+      - name: Build CLI
+        run: cargo build --locked -p quicksave-cli
+      - name: Run isolated CLI round trip or verify explicit unsupported refusal
+        run: python scripts/cli_smoke.py --binary target/debug/quicksave${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  native-desktop-check:
+    if: github.event_name == 'workflow_dispatch' && inputs.native_desktop
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Update Linux package index
+        if: runner.os == 'Linux'
+        run: sudo apt-get update
+      - name: Install Linux native Tauri prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+      - name: Check separate native Tauri manifest
+        run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml

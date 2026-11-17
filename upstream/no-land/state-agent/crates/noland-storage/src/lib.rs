@@ -1,0 +1,495 @@
+//! Shared Storage providers. Pack uploads are immutable and additive. Explicit
+//! full deletion and post-commit generation retirement use a separate protocol.
+
+mod adaptive;
+mod commit;
+mod deletion;
+mod fetch;
+mod local;
+mod maintenance;
+mod metadata;
+mod rclone;
+mod reclamation;
+pub mod repository_recovery;
+mod rolling;
+mod stream;
+mod transfer;
+
+pub use adaptive::AdaptiveConcurrency;
+pub use commit::{
+    commit_bundle, commit_bundle_with_index, commit_bundle_with_index_for_operation,
+    commit_bundle_with_pack_index_for_operation, commit_checkpoint, commit_seal, load_catalog,
+    read_committed_manifest, read_pack_index, read_pack_index_for_operation,
+    update_catalog_with_bundle, upload_packs_for_operation, CatalogStore, PackUploadSession,
+};
+pub use deletion::{bundle_is_deleted, delete_bundle, BundleDeletion};
+pub use fetch::{MetadataReadMetrics, MAX_SMALL_READ_BYTES};
+pub use local::LocalStorage;
+pub use maintenance::{
+    clear_repository_activity, repository_activities, RepositoryAccess, RepositoryActivity,
+    RepositoryGuard,
+};
+pub use metadata::{
+    compact_json_hash, open_metadata, open_metadata_with_limit, seal_metadata, seal_metadata_json,
+    SealedMetadata, MAX_METADATA_BYTES,
+};
+pub use noland_rclone_adapter::{
+    classify_remote_error, GoogleDriveTransferOptions, ProviderCapabilities, ProviderKind,
+    ProviderOptions, ProviderRootIdentity, ProviderTransferConfig, RemoteErrorClass,
+    TransferProfile, TransferTuning, TransferWorkload,
+};
+pub use rclone::upload::UploadTransferDiagnostics;
+pub use rclone::{
+    shred_all_ephemeral_sessions, shred_ephemeral_session, write_ephemeral_session,
+    write_guarded_ephemeral_session, EphemeralSessionGuard, RcloneCommandBuilder, RcloneStorage,
+};
+pub use reclamation::{
+    converge_application, execute_full_deletion, execute_full_deletion_observed,
+    load_full_deletion, pending_deletions, prepare_full_deletion, prepare_full_deletion_selected,
+    retired_pack_ids, DeletionObserver, DeletionProgress, FullDeletionPlan, PrevalidatedDeletion,
+};
+pub use rolling::{RollingUploadWindow, UploadReservation};
+pub use stream::StreamTransferDiagnostics;
+pub use transfer::{
+    compare_remote_known, download_bounded, list_remote_known, upload_immutable_bounded,
+    DownloadBatchReport, DownloadRequest, ImmutableUpload, MetadataBatch, MetadataWrite,
+    RemoteKnownComparison, RemoteKnownSet, RemoteSizeConflict, SharedRetryGate, TransferDirection,
+    TransferJournalCallbacks, TransferJournalEvent, TransferJournalState, UploadBatchReport,
+};
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use noland_state_core::{Result, StateError};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RemoteKey(pub String);
+
+impl RemoteKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn join(&self, child: &str) -> Self {
+        if self.0.is_empty() {
+            Self(child.into())
+        } else {
+            Self(format!(
+                "{}/{}",
+                self.0.trim_end_matches('/'),
+                child.trim_start_matches('/')
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteMeta {
+    pub key: RemoteKey,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteEntry {
+    pub key: RemoteKey,
+    pub size: u64,
+    pub is_prefix: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageOperationMetrics {
+    pub rclone_invocations: u64,
+    pub remote_stat_calls: u64,
+    pub remote_list_calls: u64,
+    pub remote_mkdir_calls: u64,
+    pub remote_upload_calls: u64,
+    pub remote_download_calls: u64,
+    pub bytes_uploaded: u64,
+    pub bytes_downloaded: u64,
+}
+
+impl StorageOperationMetrics {
+    pub fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            rclone_invocations: self
+                .rclone_invocations
+                .saturating_sub(previous.rclone_invocations),
+            remote_stat_calls: self
+                .remote_stat_calls
+                .saturating_sub(previous.remote_stat_calls),
+            remote_list_calls: self
+                .remote_list_calls
+                .saturating_sub(previous.remote_list_calls),
+            remote_mkdir_calls: self
+                .remote_mkdir_calls
+                .saturating_sub(previous.remote_mkdir_calls),
+            remote_upload_calls: self
+                .remote_upload_calls
+                .saturating_sub(previous.remote_upload_calls),
+            remote_download_calls: self
+                .remote_download_calls
+                .saturating_sub(previous.remote_download_calls),
+            bytes_uploaded: self.bytes_uploaded.saturating_sub(previous.bytes_uploaded),
+            bytes_downloaded: self
+                .bytes_downloaded
+                .saturating_sub(previous.bytes_downloaded),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Health {
+    pub ok: bool,
+    pub provider: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImmutableUploadCompletion {
+    Uploaded,
+    ReusedRemote,
+}
+
+pub trait ImmutableUploadObserver: Send + Sync {
+    fn transfer_started(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn transfer_progress(&self, _bytes_transferred: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn transfer_diagnostics(&self, diagnostics: &UploadTransferDiagnostics) -> Result<()> {
+        self.transfer_progress(diagnostics.attempt_bytes)
+    }
+
+    fn completed(
+        &self,
+        uploads: &[ImmutableUpload],
+        completion: ImmutableUploadCompletion,
+    ) -> Result<()>;
+}
+
+pub trait DownloadObserver: Send + Sync {
+    fn transfer_started(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn transfer_retrying(&self, _reason: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn transfer_progress(&self, _bytes_transferred: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn transfer_progress_with_diagnostics(
+        &self,
+        bytes_transferred: u64,
+        _diagnostics: &StreamTransferDiagnostics,
+    ) -> Result<()> {
+        self.transfer_progress(bytes_transferred)
+    }
+}
+
+/// Ordered network bytes. Consumers must be restartable: authenticated records
+/// from an interrupted attempt may already have been accepted by the restore.
+#[async_trait]
+pub trait DownloadStreamConsumer: Send + Sync {
+    async fn restart(&self) -> Result<()>;
+    async fn write(&self, bytes: &[u8]) -> Result<()>;
+    async fn finish(&self) -> Result<()>;
+}
+
+#[async_trait]
+pub trait SharedStorageProvider: Send + Sync {
+    async fn health_check(&self) -> Result<Health>;
+    async fn ensure_root(&self) -> Result<()>;
+    async fn stat(&self, key: &RemoteKey) -> Result<Option<RemoteMeta>>;
+    async fn upload_immutable(&self, local: &Path, key: &RemoteKey) -> Result<RemoteMeta>;
+    async fn download(&self, key: &RemoteKey, dest: &Path) -> Result<()>;
+
+    /// Read one exact object, rejecting (never truncating) payloads above `limit`.
+    /// Limits above [`MAX_SMALL_READ_BYTES`] are invalid. Only an authoritative
+    /// absence is `StateError::NotFound`; auth, transport and integrity failures
+    /// must propagate. Bytes are not authenticated until the caller opens them.
+    ///
+    /// Legacy providers retain their stat/download behavior and bounded memory.
+    /// Their temporary disk copy can grow during download; streaming providers
+    /// should override this method to enforce the bound while receiving.
+    async fn read_small(&self, key: &RemoteKey, limit: u64) -> Result<Vec<u8>> {
+        fetch::read_small_fallback(self, key, limit).await
+    }
+
+    fn supports_streaming_downloads(&self) -> bool {
+        false
+    }
+
+    /// Backends with a byte stream override this to avoid an encrypted disk copy.
+    /// The compatibility fallback retains at most one bounded pack per caller.
+    async fn download_stream_observed(
+        &self,
+        key: &RemoteKey,
+        scratch: &Path,
+        consumer: &dyn DownloadStreamConsumer,
+        observer: Option<&(dyn DownloadObserver + '_)>,
+    ) -> Result<()> {
+        self.download_observed(key, scratch, observer).await?;
+        consumer.restart().await?;
+        let mut file = std::fs::File::open(scratch)?;
+        let mut buffer = vec![0; 256 * 1024];
+        use std::io::Read;
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            consumer.write(&buffer[..count]).await?;
+        }
+        consumer.finish().await
+    }
+
+    async fn download_observed(
+        &self,
+        key: &RemoteKey,
+        dest: &Path,
+        observer: Option<&(dyn DownloadObserver + '_)>,
+    ) -> Result<()> {
+        if let Some(observer) = observer {
+            observer.transfer_started()?;
+        }
+        self.download(key, dest).await?;
+        if let Some(observer) = observer {
+            observer.transfer_progress(std::fs::metadata(dest)?.len())?;
+        }
+        Ok(())
+    }
+    async fn list_prefix(&self, prefix: &RemoteKey) -> Result<Vec<RemoteEntry>>;
+    async fn put_small_versioned(&self, bytes: Bytes, key: &RemoteKey) -> Result<RemoteMeta>;
+
+    /// Explicit deletion only. Never called by capture, upload, or restore.
+    /// Implementations must delete exactly one object, and tolerate absence.
+    /// Fail before tombstones if the installed adapter cannot perform the
+    /// provider's permanent-removal operation (rather than trash/hide).
+    async fn check_full_deletion_support(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn delete_object(&self, _key: &RemoteKey) -> Result<()> {
+        Err(StateError::Storage(
+            "provider does not support explicit deletion".into(),
+        ))
+    }
+    /// Only the full-deletion executor can construct this capability, after its
+    /// preflight barrier. It must still verify absence before counting completion.
+    async fn delete_prevalidated(&self, object: &PrevalidatedDeletion) -> Result<()> {
+        self.delete_object(object.key()).await
+    }
+    async fn stat_for_deletion(&self, key: &RemoteKey) -> Result<Option<RemoteMeta>> {
+        self.stat(key).await
+    }
+    fn deletion_concurrency(&self) -> usize {
+        4
+    }
+    async fn remove_empty_bundle(
+        &self,
+        _app: &noland_state_core::AppId,
+        _bundle: uuid::Uuid,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn upload_immutable_bulk(&self, uploads: &[ImmutableUpload]) -> Result<Vec<RemoteMeta>> {
+        self.upload_immutable_bulk_observed(uploads, None).await
+    }
+
+    async fn upload_immutable_bulk_observed(
+        &self,
+        uploads: &[ImmutableUpload],
+        observer: Option<&(dyn ImmutableUploadObserver + '_)>,
+    ) -> Result<Vec<RemoteMeta>> {
+        let mut uploaded = Vec::with_capacity(uploads.len());
+        for upload in uploads {
+            if let Some(observer) = observer {
+                observer.transfer_started()?;
+            }
+            let meta = self.upload_immutable(&upload.local, &upload.key).await?;
+            if meta.key != upload.key || meta.size != std::fs::metadata(&upload.local)?.len() {
+                return Err(StateError::Conflict(format!(
+                    "immutable upload result differs for {}",
+                    upload.key.as_str()
+                )));
+            }
+            uploaded.push(meta);
+            if let Some(observer) = observer {
+                observer.completed(
+                    std::slice::from_ref(upload),
+                    ImmutableUploadCompletion::Uploaded,
+                )?;
+            }
+        }
+        Ok(uploaded)
+    }
+
+    /// Reuses a caller-owned, operation-scoped inventory. A missing key is only
+    /// a hint: the actual write must still enforce immutable semantics against
+    /// concurrent writers. Providers overriding bulk transfers should override
+    /// this too to avoid doing a second prefix listing.
+    async fn upload_immutable_bulk_known_observed(
+        &self,
+        uploads: &[ImmutableUpload],
+        known: &RemoteKnownSet,
+        observer: Option<&(dyn ImmutableUploadObserver + '_)>,
+    ) -> Result<Vec<RemoteMeta>> {
+        let comparison = known.compare(uploads)?;
+        comparison.ensure_immutable()?;
+        if let Some(observer) = observer {
+            let known_keys = comparison
+                .known
+                .iter()
+                .map(|meta| &meta.key)
+                .collect::<std::collections::HashSet<_>>();
+            let reused = uploads
+                .iter()
+                .filter(|upload| known_keys.contains(&upload.key))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !reused.is_empty() {
+                observer.completed(&reused, ImmutableUploadCompletion::ReusedRemote)?;
+            }
+        }
+        let mut result = comparison.known;
+        result.extend(
+            self.upload_immutable_bulk_observed(&comparison.missing, observer)
+                .await?,
+        );
+        Ok(result)
+    }
+
+    /// Group only when the backend preserves intra-group parallelism. The
+    /// sequential fallback must not serialize an otherwise rolling window.
+    fn supports_parallel_upload_groups(&self) -> bool {
+        false
+    }
+
+    /// Targeted immutable checks scale with this request, not repository history.
+    fn supports_targeted_uploads(&self) -> bool {
+        false
+    }
+
+    /// One transfer budget for the entire operation, independent of compression
+    /// workers. Bulk implementations must reserve all of their internal slots.
+    fn transfer_tuning(&self) -> TransferTuning {
+        TransferTuning::default()
+    }
+
+    /// Writes ordinary metadata first and the visibility marker last.
+    async fn put_metadata_batch(&self, batch: &MetadataBatch) -> Result<Vec<RemoteMeta>> {
+        let mut written = Vec::with_capacity(batch.total_len());
+        for entry in batch.entries() {
+            written.push(
+                self.put_small_versioned(entry.bytes.clone(), &entry.key)
+                    .await?,
+            );
+        }
+        if let Some(committed) = batch.committed() {
+            written.push(
+                self.put_small_versioned(committed.bytes.clone(), &committed.key)
+                    .await?,
+            );
+        }
+        Ok(written)
+    }
+
+    fn provider_kind(&self) -> Option<ProviderKind> {
+        None
+    }
+
+    fn capabilities(&self) -> Option<&ProviderCapabilities> {
+        None
+    }
+
+    fn storage_identity(&self) -> Option<ProviderRootIdentity> {
+        None
+    }
+
+    fn operation_metrics(&self) -> StorageOperationMetrics {
+        StorageOperationMetrics::default()
+    }
+
+    /// Separate from the stable operation-metrics struct so existing exhaustive
+    /// struct literals remain source compatible. Unsupported providers report zero.
+    fn metadata_read_metrics(&self) -> MetadataReadMetrics {
+        MetadataReadMetrics::default()
+    }
+}
+
+pub use noland_rclone_adapter::EphemeralRcloneSession;
+
+/// Legacy OAuth-only handoff. Prefer [`EphemeralRcloneSession`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EphemeralStorageAuth {
+    pub operation_id: String,
+    pub provider: String,
+    pub access_token: String,
+    pub expires_at_unix: i64,
+    pub root_name: String,
+    pub rclone_remote: Option<String>,
+}
+
+impl Drop for EphemeralStorageAuth {
+    fn drop(&mut self) {
+        self.access_token.clear();
+    }
+}
+
+pub fn write_ephemeral_auth(run_root: &Path, auth: &EphemeralStorageAuth) -> Result<PathBuf> {
+    let dir = run_root.join("storage").join(&auth.operation_id);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join("auth.json");
+    std::fs::write(&path, serde_json::to_vec(auth)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+pub fn shred_ephemeral_auth(run_root: &Path, operation_id: &str) -> Result<()> {
+    let dir = run_root.join("storage").join(operation_id);
+    if dir.exists() {
+        for filename in ["auth.json", "rclone.conf", "session.json"] {
+            if let Ok(path) = dir.join(filename).canonicalize() {
+                let len = std::fs::metadata(&path)
+                    .map(|metadata| metadata.len().min(1024 * 1024) as usize)
+                    .unwrap_or(64);
+                let _ = std::fs::write(&path, vec![0u8; len]);
+            }
+        }
+        std::fs::remove_dir_all(dir)?;
+    }
+    Ok(())
+}
+
+pub fn forbid_rclone_sync(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "sync" || a == "bisync") {
+        return Err(StateError::Storage(
+            "rclone sync is forbidden for backup; use copy".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub const DEFAULT_ROOT: &str = noland_state_core::constants::DEFAULT_SHARED_STORAGE_ROOT;

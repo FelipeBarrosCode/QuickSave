@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "source_commit": "e81238a7536aae201540956ce76981364fd36595",
+  "archive_sha256": "157156c3812aba45fdbfcc97268eede85dd34c49c3df2db0628874c085247fa5",
+  "algorithm": "sha256(sorted UTF-8 relative-path NUL decimal-size NUL file-sha256 LF)",
+  "file_count": 227,
+  "tree_sha256": "597d8cb35df99f5aa94ad509b5030160d5916dd56d2bc50fdc933ff257dcdd26",
+  "note": "Independent unpacked-tree baseline, not a recomputation of the original archive digest. Do not regenerate to conceal a vendor modification."
+}

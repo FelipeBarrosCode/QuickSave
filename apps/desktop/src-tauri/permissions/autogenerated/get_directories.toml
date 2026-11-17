@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-directories"
+description = "Enables the get_directories command without any pre-configured scope."
+commands.allow = ["get_directories"]
+
+[[permission]]
+identifier = "deny-get-directories"
+description = "Denies the get_directories command without any pre-configured scope."
+commands.deny = ["get_directories"]

@@ -1,0 +1,13 @@
+"libraryfolders"
+{
+    "0"
+    {
+        "path" "/games/Steam"
+        "apps" { "480" "1024" }
+    }
+    "1"
+    {
+        "path" "D:\\Games\\SteamLibrary"
+        "apps" { "481" "2048" }
+    }
+}
