@@ -3,6 +3,10 @@
 
 use super::*;
 
+#[path = "container_scope_tests.rs"]
+mod container_scope_tests;
+#[path = "index_access_tests.rs"]
+mod index_access_tests;
 #[path = "trackingresume_tests.rs"]
 mod trackingresume_tests;
 
@@ -1120,27 +1124,29 @@ fn full_source_identity_and_coverage_are_authenticated_not_plaintext_state_optio
 
 #[test]
 fn explicit_permission_failures_never_become_successful_zero_count_bundles() {
-    use std::os::unix::fs::PermissionsExt;
     let h = Harness::new();
     let base = h.root("apps");
     let root = h.root("apps/Restricted.app");
     fs::write(root.join("data"), b"actual bytes").unwrap();
     let plan = candidate("synthetic.permissions", &root);
     let sealed = authority(&h, &base, &[plan.clone()], true);
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+    // Deterministic even under elevated CI users: inject the actual native
+    // EACCES category at the root approval boundary, not OS chmod assumptions.
+    h.tracker
+        .shared
+        .policy
+        .faults
+        .deny(&root, "approve_directory_identity", None, 13);
     let report = h.tracker.materialize_bundles(&[plan], &sealed).unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-    if report["bundles"].as_array().unwrap().is_empty() {
-        assert_eq!(report["diagnostics"].as_array().unwrap().len(), 1);
-    } else {
-        // Elevated test users can legitimately bypass mode bits. That is a real
-        // nonempty native inventory, not an invented permission-success result.
-        assert_eq!(report["bundles"][0]["fileCount"], 1);
-        assert_eq!(
-            report["bundles"][0]["logicalBytes"],
-            b"actual bytes".len() as u64
-        );
-    }
+    assert!(report["bundles"].as_array().unwrap().is_empty());
+    assert_eq!(report["diagnostics"].as_array().unwrap().len(), 1);
+    let diagnostic = &report["diagnostics"][0]["rootDiagnostics"][0];
+    assert_eq!(diagnostic["rootId"], "native:synthetic.permissions");
+    assert_eq!(diagnostic["path"], json!(root));
+    assert_eq!(diagnostic["stage"], "approve_directory_identity");
+    assert_eq!(diagnostic["osError"], 13);
+    assert!(diagnostic["message"].as_str().unwrap().contains("13"));
+    assert!(h.store.records.lock().unwrap().is_empty());
     assert_eq!(h.tracker.performance_counters()["bytesRead"], 0);
 }
 

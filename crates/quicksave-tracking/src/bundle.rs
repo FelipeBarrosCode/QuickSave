@@ -2,6 +2,7 @@
 //! Real immutable local bundle indexes. Discovery plans are never bundle DTOs.
 
 use crate::{
+    diagnostics::{self, RootContext, RootFailures},
     model::{
         self, validate_absolute, validate_id, validate_name, validate_relative, ApprovedRoot,
         RootIdentity, Snapshot, TrackedSoftware, TrackingPolicy, MAX_BASELINE_BYTES, MAX_FILES,
@@ -26,6 +27,7 @@ use std::{
 
 const MAX_BASES: usize = 64;
 const MAX_DIAGNOSTICS: usize = 256;
+const MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -78,6 +80,33 @@ pub(crate) struct AutoEnrollment {
 }
 
 impl AutoEnrollment {
+    pub(crate) fn has_failed_roots(&self) -> bool {
+        self.failed_roots().next().is_some()
+    }
+
+    fn failed_roots(&self) -> impl Iterator<Item = &Value> {
+        self.unresolved_roots
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|root| {
+                root["preventsFullScopeCapture"] == true
+                    || root["code"] == "native_root_index_unavailable"
+                    || root["code"] == "container_boundary_indexed_via_verified_children"
+            })
+    }
+
+    pub(crate) fn root_failure_message(&self) -> Option<String> {
+        let first = self.failed_roots().next()?;
+        Some(diagnostics::bounded_message(format_args!(
+            "{} native application root scope(s) unresolved; explicitly partial coverage. {}",
+            self.failed_roots().count(),
+            first["message"]
+                .as_str()
+                .unwrap_or("Native root indexing failed.")
+        )))
+    }
+
     pub(crate) fn binding(&self) -> Value {
         json!({
             "policyHash": digest(&self.policy_scope).unwrap_or_default(),
@@ -552,6 +581,7 @@ impl BundleIndexSource {
             "roots": self.roots, "coverage": self.coverage,
             "coverageScope": "approved_evidenced_roots_only",
             "consistency": "validated_stable_files_not_application_atomic",
+            "payloadReadability": "not_established",
             "cloudCommitted": false
         })
     }
@@ -721,6 +751,7 @@ pub(crate) fn write_index(
         "captureReceipt": record.capture_receipt,
         "previousRevision": previous,
         "applicationAtomic": false, "cloudCommitted": false,
+        "payloadReadability": "not_established",
     });
     source.manifest = write_sidecar(&safe, &manifest, "manifest", &source, record, store)?;
     Ok(source)
@@ -933,6 +964,7 @@ impl Tracker {
             );
         }
         let mut diagnostics = Vec::new();
+        let mut diagnostic_bytes = 0_u64;
         let mut omitted = 0_u64;
         let mut indexed = Vec::new();
         let mut partial = 0_u64;
@@ -945,11 +977,24 @@ impl Tracker {
                 self.materialize_candidate(candidate, &parsed, &bases, &enrollment)
             };
             match result {
-                Ok(bundle) => {
+                Ok((bundle, root_diagnostics)) => {
                     if bundle["bundle"]["coverage"] == "partial" {
                         partial += 1;
                     }
                     indexed.push(bundle);
+                    if !root_diagnostics.is_empty() {
+                        push_diagnostic(
+                            &mut diagnostics,
+                            &mut diagnostic_bytes,
+                            &mut omitted,
+                            json!({
+                                "appId":app,"displayName":candidate["displayName"],
+                                "code":"bundle_materialization_partial",
+                                "materialized":true,"rootDiagnostics":root_diagnostics,
+                                "message":"Only complete independently verified roots were indexed; unavailable roots remain unresolved.",
+                            }),
+                        );
+                    }
                 }
                 Err(error) => {
                     if !app.is_empty() && app.len() <= 512 {
@@ -961,16 +1006,19 @@ impl Tracker {
                             self.shared.persist(old)?;
                         }
                     }
-                    if diagnostics.len() < MAX_DIAGNOSTICS {
-                        diagnostics.push(json!({
+                    push_diagnostic(
+                        &mut diagnostics,
+                        &mut diagnostic_bytes,
+                        &mut omitted,
+                        json!({
                             "appId": if app.len() <= 512 { app } else { "" },
+                            "displayName":candidate["displayName"],
                             "code": "bundle_materialization_rejected",
                             "message": bounded_error(&error),
                             "materialized": false,
-                        }));
-                    } else {
-                        omitted += 1;
-                    }
+                            "rootDiagnostics":diagnostics::failures(&error),
+                        }),
+                    );
                 }
             }
         }
@@ -986,7 +1034,7 @@ impl Tracker {
         policy: &EnrollmentPolicy,
         bases: &[(BaseDirectory, scan::PinnedRoot)],
         template: &AutoEnrollment,
-    ) -> Result<Value> {
+    ) -> Result<(Value, Vec<Value>)> {
         model::bounded_json(candidate, 512 * 1024)?;
         let app_id = candidate["appId"]
             .as_str()
@@ -1026,6 +1074,11 @@ impl Tracker {
                     });
                 if !old.scheduler.paused
                     && same_policy_candidate
+                    && !old
+                        .record
+                        .auto_enrollment
+                        .as_ref()
+                        .is_some_and(AutoEnrollment::has_failed_roots)
                     && old.record.tracked
                     && old.current.is_some()
                     && old.record.bundle_index_source.is_some()
@@ -1040,7 +1093,7 @@ impl Tracker {
                         self.shared.reconcile_mode(old, false, false)?;
                     }
                     crate::sync_record(old);
-                    return Ok(old.record.sanitized());
+                    return Ok((old.record.sanitized(), Vec::new()));
                 }
             }
         }
@@ -1064,7 +1117,11 @@ impl Tracker {
         let mut pins = Vec::new();
         let mut native_ids = BTreeMap::new();
         let mut normalization_notes = Vec::new();
+        let mut root_errors = Vec::new();
+        let refreshing = self.shared.apps()?.contains_key(&id);
         for root in roots_input {
+            let prepared: Result<(ApprovedRoot,scan::PinnedRoot)> =
+                RootContext::candidate(root,"prepare_native_root").run(&effective,|| {
             ensure!(
                 root["status"] == "verified_candidate",
                 "a proposed/unresolved root is not native authority"
@@ -1124,6 +1181,17 @@ impl Tracker {
                     "shared group root lacks validated signed ownership evidence"
                 );
             }
+            // Necessary policy checks precede native I/O. A denied/outside
+            // candidate is not an availability failure that can be skipped.
+            // Positive containment is still proved by pinned native handles.
+            ensure!(
+                bases.iter().any(|(base,_)|
+                    path != base.path && path.starts_with(&base.path)
+                        && base.allowed_roles.contains(native_role(classification))
+                        && roles.is_subset(&base.allowed_roles)
+                        && !root_kinds.is_disjoint(&base.ownership_rules)),
+                "native root is not granted by an approved base/ownership/role policy"
+            );
             let (identity, directory) = candidate_identity(&root["nativeIdentity"])?;
             ensure!(
                 native_ids
@@ -1136,7 +1204,8 @@ impl Tracker {
                 (
                     path.clone(),
                     None,
-                    scan::approve_root_identity(&path, &effective, false)?,
+                    RootContext::candidate(root,"approve_directory_identity")
+                        .run(&effective,||scan::pin_candidate_identity(&path,&effective,scan::CandidateScope::Tree))?,
                 )
             } else {
                 let parent = path
@@ -1152,14 +1221,20 @@ impl Tracker {
                     !model::is_secret_component(leaf),
                     "candidate file is credential/vault material"
                 );
-                let parent_id = scan::approve_root_identity(&parent, &effective, true)?;
-                let safe = SafeRoot::open(&parent)?;
-                let (_, stamp) = safe.read_file(leaf)?;
+                let parent_id = RootContext::candidate(root,"approve_file_parent")
+                    .run(&effective,||scan::pin_candidate_identity(&parent,&effective,scan::CandidateScope::SelectedLeaves))?;
+                let safe = RootContext::candidate(root,"pin_file_parent")
+                    .run(&effective,||SafeRoot::open(&parent))?;
+                let stamp = RootContext::candidate(root,"observe_candidate_file_metadata")
+                    .run(&effective,||safe.file_metadata(leaf))?;
                 ensure!(
                     identity.device == stamp.device && identity.file_id == stamp.file_id,
                     "verified candidate file identity changed"
                 );
-                safe.verify_file(leaf, &stamp)?;
+                RootContext::candidate(root,"verify_candidate_file_metadata").run(&effective,|| {
+                    ensure!(safe.file_metadata(leaf)? == stamp,"verified candidate file metadata changed");
+                    Ok(())
+                })?;
                 (parent, Some(BTreeSet::from([leaf.to_owned()])), parent_id)
             };
             if directory {
@@ -1183,7 +1258,8 @@ impl Tracker {
                 allowed_files: allowlist,
                 source: None,
             };
-            let pin = scan::PinnedRoot::open(&approved)?;
+            let pin = RootContext::approved(&approved,None,"pin_approved_root")
+                .run(&effective,||scan::PinnedRoot::open(&approved))?;
             let mut granting_base = None;
             for (base, base_pin) in bases {
                 if path != base.path
@@ -1211,13 +1287,68 @@ impl Tracker {
                 "ownership": ownership,
             }));
             approved.validate()?;
+            Ok((approved,pin))
+            });
+            let (approved, pin) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) if !refreshing && diagnostics::unavailable(&error) => {
+                    root_errors.extend(diagnostics::root_failure(&error));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             normalize_root(
                 &mut roots,
                 &mut pins,
                 approved,
                 pin,
                 &mut normalization_notes,
-            )?;
+            )
+            .with_context(|| RootContext::candidate(root, "normalize_approved_roots"))?;
+        }
+        if roots.is_empty() {
+            return Err(RootFailures(root_errors).into());
+        }
+        let approved_pins = roots
+            .iter()
+            .map(|root| root.id.clone())
+            .zip(pins)
+            .collect::<BTreeMap<_, _>>();
+        // Normalization has issued no capture/index/tracking authority. Only
+        // retained roots now receive complete protected-root and mutual alias
+        // audits; discarded broad container scaffolds are never content walks.
+        let mut audited_roots = Vec::with_capacity(roots.len());
+        for root in roots {
+            let audit = RootContext::approved(&root, None, "audit_normalized_root_policy").run(
+                &effective,
+                || {
+                    scan::check_policy(&root.path, &effective, root.allowed_files.is_some())?;
+                    approved_pins
+                        .get(&root.id)
+                        .context("normalized root has no native pin")?
+                        .check()
+                },
+            );
+            match audit {
+                Ok(()) => audited_roots.push(root),
+                Err(error) if !refreshing && diagnostics::unavailable(&error) => {
+                    root_errors.extend(diagnostics::root_failure(&error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let roots = audited_roots;
+        if roots.is_empty() {
+            return Err(RootFailures(root_errors).into());
+        }
+        for (index, root) in roots.iter().enumerate() {
+            for other in &roots[..index] {
+                RootContext::approved(root,None,"audit_normalized_root_aliases").run(&effective,|| {
+                    ensure!(!roots_overlap(other,root)?,
+                        diagnostics::ScopeGrantViolation("incompatible native root aliases/overlaps require explicit reviewed scopes"));
+                    Ok(())
+                })?;
+            }
         }
         let mut enrollment = template.clone();
         enrollment.identity_evidence = candidate["identityEvidence"].clone();
@@ -1230,6 +1361,9 @@ impl Tracker {
             .cloned()
             .unwrap_or_else(|| json!([]));
         enrollment.roots_complete = candidate["rootsComplete"].as_bool().unwrap_or(false);
+        if !root_errors.is_empty() {
+            enrollment.roots_complete = false;
+        }
         if !normalization_notes.is_empty() {
             enrollment
                 .unresolved_roots
@@ -1255,8 +1389,8 @@ impl Tracker {
         let old = apps.get(&id);
         if let Some(old) = old {
             ensure!(
-                old.pending.is_none(),
-                "bundle has an active upload; reconcile after completion"
+                old.pending.is_none() && old.record.pending_work.is_none(),
+                "bundle has active or durable original work; recover/finalize it before changing authority"
             );
             ensure!(
                 old.record.auto_enrollment.is_some(),
@@ -1292,7 +1426,7 @@ impl Tracker {
             last_saved_at: None,
             file_count: None,
             logical_bytes: None,
-            error: None,
+            error: enrollment.root_failure_message(),
             roots,
             dirty_generation: old
                 .map_or(0, |old| old.scheduler.dirty_generation)
@@ -1317,27 +1451,29 @@ impl Tracker {
         // paint a dashboard; the engine's actual capture supplies content later.
         let mut snapshot = Snapshot::default();
         let mut readable_roots = Vec::new();
-        let mut root_errors = Vec::new();
         let mut total_path_bytes = 0_usize;
         for root in &record.roots {
-            let capture = scan::capture_index(
-                std::slice::from_ref(root),
-                None,
-                true,
-                false,
-                &effective,
-                &self.shared.stop,
-                &self.shared.io,
-            )
-            .and_then(|index| {
-                ensure!(
-                    root.allowed_files.as_ref().is_none_or(|leaves| leaves
-                        .iter()
-                        .all(|leaf| index.nodes.contains_key(&crate::file_id(&root.id, leaf)))),
-                    "new verified source file disappeared during initial metadata indexing"
-                );
-                Ok(index)
-            });
+            let capture = RootContext::approved(root, None, "index_complete_root")
+                .run(&effective, || {
+                    scan::capture_index(
+                        std::slice::from_ref(root),
+                        None,
+                        true,
+                        false,
+                        &effective,
+                        &self.shared.stop,
+                        &self.shared.io,
+                    )
+                })
+                .and_then(|index| {
+                    ensure!(
+                        root.allowed_files.as_ref().is_none_or(|leaves| leaves
+                            .iter()
+                            .all(|leaf| index.nodes.contains_key(&crate::file_id(&root.id, leaf)))),
+                        "new verified source file disappeared during initial metadata indexing"
+                    );
+                    Ok(index)
+                });
             match capture {
                 Ok(index) => {
                     ensure!(
@@ -1362,17 +1498,21 @@ impl Tracker {
                     readable_roots.push(root.clone());
                 }
                 Err(error) => {
-                    ensure!(old.is_none_or(|old| !old.record.roots.iter().any(|previous| previous.id == root.id)),
-                        "a previously approved root is unavailable; retain the old revision and reconcile, never shrink its scope");
-                    root_errors.push(json!({
-                        "rootId": root.id, "path": root.path, "role": root.role,
-                        "code": "native_root_index_unavailable", "message": bounded_error(&error),
-                    }));
+                    if old.is_some() {
+                        return Err(error).context(
+                            "root refresh failed; prior authority, index and baseline are retained",
+                        );
+                    }
+                    if !diagnostics::unavailable(&error) {
+                        return Err(error);
+                    }
+                    root_errors.extend(diagnostics::root_failure(&error));
                 }
             }
         }
-        ensure!(!readable_roots.is_empty() && (root_errors.is_empty() || !snapshot.nodes.is_empty()),
-            "no readable actual application index could be built; unavailable roots are diagnostics, not empty bundles");
+        if readable_roots.is_empty() || (!root_errors.is_empty() && snapshot.nodes.is_empty()) {
+            return Err(RootFailures(root_errors).into());
+        }
         if !root_errors.is_empty() {
             record.roots = readable_roots;
             let enrollment = record
@@ -1384,11 +1524,12 @@ impl Tracker {
                 .unresolved_roots
                 .as_array_mut()
                 .context("invalid unresolved native roots")?
-                .extend(root_errors);
+                .extend(root_errors.iter().cloned());
             enrollment.app_evidence_hash = digest(&json!({
                 "appId": app_id, "identityEvidence": enrollment.identity_evidence,
                 "roots": record.roots.iter().map(scan::root_request).collect::<Vec<_>>(),
             }))?;
+            record.error = enrollment.root_failure_message();
         }
         snapshot.validate(&record.roots)?;
         snapshot.identity()?;
@@ -1423,8 +1564,16 @@ impl Tracker {
             total_paths <= model::MAX_PATH_BYTES,
             "workspace native path/link memory exceeds bounded limit"
         );
-        for pin in &pins {
-            pin.check()?;
+        for root in &record.roots {
+            RootContext::approved(root, None, "verify_materialized_root_identity").run(
+                &effective,
+                || {
+                    approved_pins
+                        .get(&root.id)
+                        .context("materialized root lost its native authority handle")?
+                        .check()
+                },
+            )?;
         }
         template.verify(self.shared.store.as_ref(), &self.shared.policy)?;
         record.tracking_grant = self
@@ -1450,8 +1599,16 @@ impl Tracker {
         record.bundle_index_source = Some(source);
         record.previous_bundle_manifest = None;
         record.tracked = true;
-        for pin in &pins {
-            pin.check()?;
+        for root in &record.roots {
+            RootContext::approved(root, None, "verify_persisted_root_identity").run(
+                &effective,
+                || {
+                    approved_pins
+                        .get(&root.id)
+                        .context("persisted root lost its native authority handle")?
+                        .check()
+                },
+            )?;
         }
         self.shared
             .store
@@ -1499,7 +1656,7 @@ impl Tracker {
             .index_path_bytes
             .store(total_paths, Ordering::Release);
         self.shared.reconfigure.store(true, Ordering::Release);
-        Ok(value)
+        Ok((value, root_errors))
     }
 
     /// Sanitized cached real bundle revisions. No source scans or content I/O.
@@ -1771,6 +1928,7 @@ fn normalization_note(root: &ApprovedRoot) -> Value {
         "rootId": root.id, "path": root.path,
         "classification": root.source.as_ref().and_then(|source| source.get("classification")),
         "code": "container_boundary_indexed_via_verified_children",
+        "preventsFullScopeCapture":true,"complete":false,
         "message": "Only independently verified child scopes are indexed; the enclosing container is not claimed as fully captured.",
     })
 }
@@ -1832,8 +1990,10 @@ fn merge_root_provenance(parent: &mut ApprovedRoot, child: &ApprovedRoot) -> Res
     parent.validate()
 }
 
-/// A parent grant can subsume a verified child only after both native policies
-/// were checked. Container boundaries instead yield to independently evidenced
+/// These are native candidate pins, not grants or disjointness proofs. A
+/// parent may subsume a verified child only on positive native containment;
+/// retained roots receive full policy/alias audits after normalization.
+/// Container boundaries instead yield to independently evidenced
 /// children, preserving partial coverage rather than claiming caches/vaults or
 /// unselected container siblings. No bytes are counted twice.
 fn normalize_root(
@@ -1845,10 +2005,6 @@ fn normalize_root(
 ) -> Result<()> {
     let mut index = 0;
     while index < roots.len() {
-        if !roots_overlap(&roots[index], &root)? {
-            index += 1;
-            continue;
-        }
         if roots[index].path == root.path
             && roots[index].identity == root.identity
             && roots[index].allowed_files == root.allowed_files
@@ -1882,7 +2038,9 @@ fn normalize_root(
             pins.remove(index);
             continue;
         }
-        bail!("incompatible native root aliases/overlaps require explicit reviewed scopes");
+        // Lack of native containment is NOT disjointness. Preserve both
+        // candidates for the mandatory final anti-alias audit.
+        index += 1;
     }
     roots.push(root);
     pins.push(pin);
@@ -1907,5 +2065,22 @@ fn roots_overlap(left: &ApprovedRoot, right: &ApprovedRoot) -> Result<bool> {
 
 fn bounded_error(error: &anyhow::Error) -> String {
     // Native diagnostics only. Never format grants, keys or source file bytes.
-    error.to_string().chars().take(1024).collect()
+    diagnostics::message(error)
+}
+
+fn push_diagnostic(output: &mut Vec<Value>, bytes: &mut u64, omitted: &mut u64, diagnostic: Value) {
+    let size = model::serialized_size(&diagnostic, MAX_DIAGNOSTIC_BYTES);
+    if output.len() < MAX_DIAGNOSTICS {
+        if let Ok(size) = size {
+            if let Some(total) = bytes
+                .checked_add(size)
+                .filter(|total| *total <= MAX_DIAGNOSTIC_BYTES)
+            {
+                *bytes = total;
+                output.push(diagnostic);
+                return;
+            }
+        }
+    }
+    *omitted = omitted.saturating_add(1);
 }

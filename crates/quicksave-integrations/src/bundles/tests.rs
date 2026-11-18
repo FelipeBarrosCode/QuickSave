@@ -80,6 +80,41 @@ fn product<'a>(report: &'a Value, product_id: &str) -> &'a Value {
 }
 
 #[test]
+fn protected_products_are_not_enrolled_or_treated_as_unresolved_apps() {
+    let temp = temporary();
+    let root = temp.path();
+    let scope = mac_scope(root);
+    for (name, id) in [
+        ("Unrelated filename.app", "com.noland.connect"),
+        ("Another filename.app", "app.quicksave.desktop"),
+    ] {
+        let bundle = root.join("Applications").join(name);
+        app(&bundle, id);
+        // Protected products are excluded before executable validation.
+        fs::remove_file(bundle.join("Contents/MacOS/fixture-executable")).unwrap();
+    }
+    let ordinary = root.join("Applications/Ordinary.app");
+    app(&ordinary, "org.fixture.Ordinary");
+    let mut backend = FixtureBundleBackend::new(root, Platform::MacOs).unwrap();
+    let report = run(&mut backend, &scope);
+    assert_eq!(plans(&report).len(), 1);
+    assert_eq!(
+        plans(&report)[0]["productId"],
+        "mac-bundle:org.fixture.Ordinary"
+    );
+    assert!(unresolved(&report).is_empty());
+    assert_eq!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["code"] == "protected_application_excluded")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn real_native_install_and_exact_bundle_data_not_title_folders() {
     let temp = temporary();
     let root = temp.path();

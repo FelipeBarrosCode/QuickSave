@@ -19,6 +19,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+mod overlap;
 mod privacy;
 
 const DIR_FLAGS: libc::c_int =
@@ -233,6 +234,23 @@ impl Root {
         );
         parent.check()?;
         Ok((file, opened_stamp))
+    }
+
+    pub(crate) fn file_metadata(&self, relative: &str) -> Result<FileStamp> {
+        let (parent, name) = self.parent(relative)?;
+        let before = statat(parent.file(), &name)
+            .context("inspect native regular-file metadata without following links")?;
+        require_regular(&before)?;
+        let before = stamp(&before)?;
+        parent.check()?;
+        let after = statat(parent.file(), &name)?;
+        require_regular(&after)?;
+        ensure!(
+            before == stamp(&after)?,
+            "native file metadata changed during inspection"
+        );
+        self.check()?;
+        Ok(before)
     }
 
     pub(crate) fn open_directory(&self, relative: &str) -> Result<File> {

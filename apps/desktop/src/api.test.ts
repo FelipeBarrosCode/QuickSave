@@ -205,6 +205,16 @@ describe('bounded, sanitized workspace DTOs', () => {
     expect(() => normalizeFiles({ files, nextCursor: {} })).toThrow()
     expect(() => normalizeFiles({ files: [{ ...files[0], size: -1 }] })).toThrow()
   })
+
+  it('preserves exact Unix filenames instead of interpreting Windows separators', () => {
+    const page = normalizeFiles({ files: [
+      { ...files[0], id: 'literal', name: 'a\\b', path: 'a\\b' },
+      { ...files[0], id: 'nested', name: 'b', path: 'a/b' },
+      { ...files[0], id: 'colon', name: 'a:b', path: 'a:b' },
+    ] })
+    expect(page.items.map((file) => file.path)).toEqual(['a\\b', 'a/b', 'a:b'])
+    expect(page.items.map((file) => file.id)).toEqual(['literal', 'nested', 'colon'])
+  })
   it('keeps missing bundle counts unknown and validates operation identity', async () => {
     expect(normalizeBundles({ bundles: [{
       id: 'test', appId: 'test', name: 'test', providerId: 'test',

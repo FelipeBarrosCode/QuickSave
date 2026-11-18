@@ -2193,6 +2193,196 @@ async fn native_full_scope_keeps_actual_directories_and_confined_link_metadata()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_unix_exact_names_roundtrip_files_directories_links_and_additive_history(
+) -> Result<()> {
+    // All content, roots, provider objects and recovery keys are freshly
+    // synthetic. This never opens iMovie, a real HOME, vault or app runtime.
+    let mut fixture = Fixture::create(MIB, 8)?;
+    let exact_root_leaf = r"Approved:scope\literal";
+    let renamed = fixture._owned.path.join(exact_root_leaf);
+    fs::rename(&fixture.source, &renamed)?;
+    fixture.source = renamed;
+    let root_metadata = SourcePath::new(&fixture.source)?.metadata()?;
+    fixture.agent.native_register(
+        AppIdentity::new(fixture.app.clone(), "Synthetic Exact Native Names"),
+        vec![ApprovedNativeRoot {
+            id: "payload".into(),
+            path: fixture.source.clone(),
+            allowed_files: None,
+            expected_identity: Some((root_metadata.dev(), root_metadata.ino())),
+            role: noland_state_agent::native_host::NativeRootRole::Data,
+        }],
+    )?;
+    let names = [
+        r"a\b",
+        "a/b",
+        "state:version",
+        r"directory:one\literal/child:two\literal",
+    ];
+    for (index, relative) in names.iter().enumerate() {
+        fixture.generate((*relative).into(), 97, 0xc010 + index as u64, false)?;
+        let logical = fixture
+            .agent
+            .native_logical_path(&fixture.app, &fixture.source.join(relative))?;
+        assert_eq!(logical.relative_path, *relative);
+    }
+    let empty = r"empty:directory\literal";
+    fs::create_dir(fixture.source.join(empty))?;
+    let links = [
+        (r"link:one\literal", r"a\b"),
+        (r"directory:one\literal/link:two\literal", r"../a\b"),
+        ("nested-link", "a/b"),
+    ];
+    for (name, target) in links {
+        std::os::unix::fs::symlink(target, fixture.source.join(name))?;
+    }
+    let (first_id, first_sink) = queue_full_capture(&fixture, None)?;
+    let first = fixture.execute(first_id).await?;
+    assert!(first_sink.accepted.load(Ordering::Acquire));
+    assert_eq!(first.files.len(), first_sink.nodes.len());
+    let read = noland_storage::read_committed_manifest(
+        &fixture.provider,
+        &fixture.master,
+        &fixture.app,
+        first.bundle_id,
+    )
+    .await?;
+    native_capture::verify_prepared(&fixture.agent, first_id, &read)?;
+    let original = serde_json::to_vec(&read)?;
+    for relative in names {
+        let file = read
+            .files
+            .iter()
+            .find(|file| file.relative_path == relative)
+            .unwrap();
+        assert_eq!(file.file_type, "file");
+        assert_eq!(
+            file.source_path_hint.as_deref(),
+            fixture.source.join(relative).to_str()
+        );
+    }
+    let literal = read
+        .files
+        .iter()
+        .find(|file| file.relative_path == r"a\b")
+        .unwrap();
+    let nested = read
+        .files
+        .iter()
+        .find(|file| file.relative_path == "a/b")
+        .unwrap();
+    assert_ne!(literal.file_hash, nested.file_hash);
+    assert_ne!(
+        native_file_id(&literal.logical_root, &literal.relative_path),
+        native_file_id(&nested.logical_root, &nested.relative_path),
+    );
+    for relative in [empty, r"directory:one\literal"] {
+        let entry = read
+            .files
+            .iter()
+            .find(|file| file.relative_path == relative)
+            .unwrap();
+        assert_eq!(entry.file_type, "directory");
+        assert_eq!(entry.size, 0);
+        assert!(entry.file_hash.is_empty() && entry.chunks.is_empty());
+    }
+    for (name, target) in links {
+        let entry = read
+            .files
+            .iter()
+            .find(|file| file.relative_path == name)
+            .unwrap();
+        assert_eq!(entry.file_type, "symlink");
+        assert_eq!(entry.symlink_target.as_deref(), Some(target));
+    }
+    let layout = native_layout::native_root_layouts(&read)?.unwrap();
+    assert_eq!(layout.roots[0].leaf_name, exact_root_leaf);
+    assert!(native_layout::validate_windows_restore_names(&read).is_err());
+    assert_eq!(
+        serde_json::to_vec(&read)?,
+        original,
+        "preflight never rewrites signed source JSON"
+    );
+
+    let destination = fixture._owned.path.join("exact-name-roundtrip");
+    let restored = fixture.restore(&first, &destination, None, false).await?;
+    assert_eq!(restored["readback"], 0);
+    let roots = native_restore_roots(&destination, &read)?;
+    let mapped = roots
+        .resolve(&literal.logical_root_parsed().unwrap())
+        .unwrap();
+    assert_eq!(mapped.file_name().unwrap().to_str(), Some(exact_root_leaf));
+    assert_ne!(
+        fs::read(mapped.join(r"a\b"))?,
+        fs::read(mapped.join("a/b"))?
+    );
+    assert!(mapped.join(empty).is_dir());
+    for (name, target) in links {
+        assert_eq!(fs::read_link(mapped.join(name))?.to_str(), Some(target));
+    }
+    let reused_restore = fixture.restore(&first, &destination, None, true).await?;
+    assert_eq!(reused_restore["packsDownloaded"], 0);
+    assert_eq!(reused_restore["readback"], 0);
+
+    let before = fixture.provider.snapshot();
+    let (second_id, second_sink) = queue_full_capture(&fixture, Some((&first, &first_sink)))?;
+    let second = fixture.execute(second_id).await?;
+    assert!(second_sink.accepted.load(Ordering::Acquire));
+    let metrics: OperationMetrics = serde_json::from_value(
+        fixture
+            .agent
+            .db
+            .get_operation(second_id)?
+            .unwrap()
+            .detail_json["metrics"]
+            .clone(),
+    )?;
+    assert_eq!(metrics.bytes_hashed, 0);
+    assert_eq!(metrics.num_files_rehashed, 0);
+    assert_eq!(
+        fixture.provider.snapshot().pack_uploads,
+        before.pack_uploads
+    );
+    assert_eq!(
+        second
+            .files
+            .iter()
+            .map(|file| (&file.relative_path, &file.file_type))
+            .collect::<BTreeSet<_>>(),
+        first
+            .files
+            .iter()
+            .map(|file| (&file.relative_path, &file.file_type))
+            .collect::<BTreeSet<_>>(),
+    );
+    // An exact deletion of the literal leaf must never delete its a/b sibling.
+    fs::remove_file(fixture.source.join(r"a\b"))?;
+    let (third_id, third_sink) = queue_full_capture(&fixture, Some((&second, &second_sink)))?;
+    let third = fixture.execute(third_id).await?;
+    assert!(third_sink.accepted.load(Ordering::Acquire));
+    assert_eq!(third.tombstones.len(), 1);
+    assert_eq!(third.tombstones[0].relative_path, r"a\b");
+    assert!(third.files.iter().any(|file| file.relative_path == "a/b"));
+    assert!(!third.files.iter().any(|file| file.relative_path == r"a\b"));
+    assert_eq!(
+        fixture.provider.snapshot().pack_uploads,
+        before.pack_uploads
+    );
+    // Ordinary restore does not acknowledge tombstones. The additive old
+    // revision still restores the exact original literal leaf independently.
+    fixture
+        .restore(
+            &first,
+            &fixture._owned.path.join("exact-old-leaf-roundtrip"),
+            Some(r"a\b"),
+            false,
+        )
+        .await?;
+    assert_eq!(serde_json::to_vec(&read)?, original);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_full_scope_tracker_metadata_digests_are_raw_and_never_rewrite_signed_fields(
 ) -> Result<()> {
     let fixture = Fixture::create(MIB, 8)?;

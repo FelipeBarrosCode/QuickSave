@@ -52,10 +52,71 @@ Exact duplicates and compatible installation parent/child roots are indexed
 once, preserving authenticated child evidence and roles. Container boundaries
 yield to independently verified child roots; omitted container siblings remain
 explicit partial-coverage diagnostics. Unsupported aliases fail. A new
-candidate with some readable real roots can retain those roots as a **partial**
+candidate with some independently indexable real roots can retain those roots as a **partial**
 bundle and record unavailable roots as diagnostics; all-root failure never
 creates a zero-count placeholder. An unavailable previously indexed root cannot
 silently disappear from a refreshed scope or its confirmed baseline.
+
+Metadata indexing does not test payload readability. Whole-tree enumeration
+uses native enumeration stamps; manual leaves and regular-file rechecks use
+`SafeRoot::file_metadata` (pinned parents, no-follow regular-file enforcement,
+complete native ID/length/write/change stamp, **no READ_DATA open**). Required
+Unix/Windows metadata remains native and stamp-bound. A read-denied regular file
+can therefore be `metadata_indexed` with absent content hashes and
+`payloadReadability:"not_established"`. Actual capture still opens/reads the real
+file and validates its complete pre/post stamps; read denial cannot become Saved.
+Existing hash reuse still requires the existing full native stamp and qualified
+watcher/uncertainty proof.
+
+Per-root failures are all-or-nothing, never partial subtrees. Native
+`diagnostics[].rootDiagnostics` and authenticated `autoEnrollment.unresolvedRoots`
+retain exact root ID/path/role, operation `stage`, optional `relativePath`,
+native `osError`, and the actual bounded error reason. Error text is at most
+1024 UTF-8 bytes; batch diagnostics are capped at 256 entries / 4 MiB with an
+explicit omitted count. An initial independent-root partial bundle cannot mint
+full-scope capture/omission/head authority (`fullScopeCaptureBlocked:true`);
+only explicit selected-node partial capture remains available until a genuine
+successful reindex of the failed roots. A failed refresh scan retains prior
+roots/index/baseline and forces reconciliation. Revocation, policy rejection,
+invalid native identity, unsafe entries and resource bounds are not downgraded
+to successful availability omissions.
+
+On Unix, exact native file/link names may contain literal `:` and `\\`; those
+bytes are not separators or rewritten. NUL, absolute paths, slash traversal,
+empty/dot components and existing bounds remain rejected. Windows keeps its
+strict punctuation rules. App/provider identity validation and raw-path
+`file_id` derivation are unchanged.
+
+Automatic candidates first receive **identity pins only**: exact native identity,
+base/role/ownership proof, lexical exclusions and positive native-ancestor denies.
+`pin_candidate_identity(..., CandidateScope::{Tree,SelectedLeaves})` does not
+authorize a tree, index, or grant. Normalization may discard a broad container
+in favor of independently evidenced owned child scopes without ever traversing
+the discarded Desktop/Downloads scaffold. No unknown container siblings are
+inferred to belong to the child; the container omission remains authenticated
+partial coverage and blocks a full-scope head.
+
+After normalization, **every retained root** must pass `check_policy`'s full
+native selected/protected overlap proof via
+`SafeRoot::overlaps_directory_identities`, and retained root pairs must pass their
+full anti-alias audit, before metadata indexing or grant issuance. Absence of
+positive ancestor containment is never treated as disjointness. A protected
+root inspection failure fails policy approval, not an omittable app root.
+Directory-only approval does not impose capture link semantics on protected
+repository/state trees or grant readability of their files. Actual metadata
+capture, payload reads and the strict `SafeRoot::overlaps` API remain unchanged.
+Root diagnostics distinguish `inspectionSide`, `selectedRootPath` and
+`protectedRootPath`. Native overlap errors are downcast through caller context
+to `DirectoryIdentityInspectionFailure`; typed side refines pair attribution,
+and typed stage appears as the stable `nativeInspectionStage` code. No English
+message is used for classification. Known relative directory text is retained
+exactly up to 32 KiB, without separator/Unicode normalization. Over-bound or
+non-UTF-8 native paths produce `relativePath:null` with an explicit
+`relativePathUnavailableReason`, never a lossy guessed path.
+An unattributed pair error reports `path:null` /
+`inspectionSide:"undetermined"` rather than guessing the app was unreadable.
+Native missing protected paths retain the existing lexical protection; failed
+opens other than real NotFound cannot silently disappear behind `Path::exists`.
 
 ### Cached software-root display projection
 
@@ -98,6 +159,7 @@ display name, installation instance ID, or a raw UI path.
   "nodeCount": 0,
   "metadataOnly": true,
   "fileStateTrust": "VERIFY_REQUIRED",
+  "payloadReadability": "not_established",
   "reconciliationRequired": true,
   "coverageTrusted": false,
   "complete": false,

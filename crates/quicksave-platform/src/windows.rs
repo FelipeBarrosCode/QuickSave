@@ -45,10 +45,11 @@ use windows_sys::{
     },
 };
 
-mod config;
 pub(super) mod browser;
+mod config;
 mod durability;
 mod links;
+mod overlap;
 mod privacy;
 mod write;
 
@@ -297,6 +298,35 @@ impl Root {
         );
         self.check_parents(&parents)?;
         Ok((file, before))
+    }
+
+    pub(crate) fn file_metadata(&self, relative: &str) -> Result<FileStamp> {
+        let (parents, name) = self.parents(relative)?;
+        let parent = parents
+            .last()
+            .map(|directory| &directory.file)
+            .unwrap_or_else(|| self.file());
+        let observe = || -> Result<File> {
+            open_options(
+                parent,
+                &name,
+                Some(false),
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_OPEN,
+                ptr::null(),
+                false,
+                false,
+            )
+        };
+        let held = observe()?;
+        let before = metadata(&held, false)?;
+        let second = observe()?;
+        ensure!(
+            metadata(&second, false)? == before,
+            "native file metadata or identity changed during inspection"
+        );
+        self.check_parents(&parents)?;
+        Ok(before)
     }
 
     pub(crate) fn open_directory(&self, relative: &str) -> Result<File> {

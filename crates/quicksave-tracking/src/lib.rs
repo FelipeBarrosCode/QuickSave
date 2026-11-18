@@ -7,6 +7,7 @@
 
 mod approval;
 mod bundle;
+mod diagnostics;
 mod metadata_index;
 mod model;
 mod native;
@@ -576,7 +577,7 @@ impl Tracker {
                 for leaf in leaves {
                     // Approval of an individual file cannot silently become
                     // approval of a nonexistent name or a directory.
-                    pinned.safe.read_file(leaf)?;
+                    pinned.safe.file_metadata(leaf)?;
                 }
                 pinned.check()?;
             }
@@ -1527,7 +1528,12 @@ impl Shared {
         match capture {
             Ok(snapshot) => {
                 let changed = app.current.as_deref() != Some(&snapshot);
-                let dirty = !app.record.baseline_full_scope
+                let dirty = app
+                    .record
+                    .auto_enrollment
+                    .as_ref()
+                    .is_some_and(bundle::AutoEnrollment::has_failed_roots)
+                    || !app.record.baseline_full_scope
                     || !snapshot.content_verified()
                     || app.baseline.as_deref() != Some(&snapshot);
                 let identity = snapshot.identity()?;
@@ -1569,7 +1575,11 @@ impl Shared {
                 app.record.bundle_index_source = Some(source);
                 app.record.previous_bundle_manifest = None;
                 app.record.tracked = true;
-                app.record.error = None;
+                app.record.error = app
+                    .record
+                    .auto_enrollment
+                    .as_ref()
+                    .and_then(bundle::AutoEnrollment::root_failure_message);
                 if app.event_epoch.load(Ordering::Acquire) != event_before
                     || self.uncertainty_epoch.load(Ordering::Acquire) != uncertainty_before
                 {
@@ -1590,10 +1600,10 @@ impl Shared {
                     app.record.error =
                         Some("Approved root identity changed; native approval is required.".into());
                 } else {
-                    app.record.error = Some(
-                        "Source is unavailable, unsafe, or changing; reconciliation will retry."
-                            .into(),
-                    );
+                    app.record.error = Some(diagnostics::bounded_message(format_args!(
+                        "Source is unavailable, unsafe, or changing; reconciliation will retry. {}",
+                        diagnostics::message(&error)
+                    )));
                 }
                 self.persist(app)?;
                 Err(error)
@@ -1614,7 +1624,10 @@ impl Shared {
             "keepsLocalCopy": true
             ,"contentState": if app.current.as_ref().is_some_and(|s| s.content_verified()) {
                 "content_verified"
-            } else { "metadata_indexed_unknown_content" }
+            } else { "metadata_indexed_unknown_content" },
+            "payloadReadability": "not_established",
+            "fullScopeCaptureBlocked": app.record.auto_enrollment.as_ref()
+                .is_some_and(bundle::AutoEnrollment::has_failed_roots)
         }))
     }
 
@@ -1727,6 +1740,9 @@ impl Shared {
         let empty = Snapshot::default();
         let baseline = app.baseline.as_deref().unwrap_or(&empty);
         let full_scope = file_ids.is_none();
+        ensure!(!full_scope || !app.record.auto_enrollment.as_ref()
+            .is_some_and(bundle::AutoEnrollment::has_failed_roots),
+            "a discovered native root scope remains unresolved; repair/reindex it before a full-scope save/head, or explicitly select a custom partial capture");
         let selected: BTreeSet<String> = if let Some(ids) = file_ids {
             ensure!(
                 !ids.is_empty() && ids.len() <= MAX_SELECTION,
@@ -2063,6 +2079,11 @@ impl Shared {
         }
         let pending = app.pending.as_ref().unwrap();
         let fully_confirmed = confirmed
+            && !app
+                .record
+                .auto_enrollment
+                .as_ref()
+                .is_some_and(bundle::AutoEnrollment::has_failed_roots)
             && app.record.baseline_full_scope
             && app.current.as_deref() == app.baseline.as_deref();
         app.scheduler.complete(

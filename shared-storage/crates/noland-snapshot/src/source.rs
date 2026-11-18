@@ -24,15 +24,10 @@ fn validate_leaf(name: &std::ffi::OsStr) -> Result<()> {
     let text = name
         .to_str()
         .ok_or_else(|| StateError::UnsafePath("native name is not UTF-8".into()))?;
-    if text.is_empty()
-        || text == "."
-        || text == ".."
-        || text.len() > 255
-        || text.contains(['/', '\\', '\0', ':'])
-    {
-        return Err(StateError::UnsafePath("invalid native leaf name".into()));
-    }
-    Ok(())
+    // GPL-3.0-only native integration for the audited e81238a source fork.
+    // Dataset filenames use the actual filesystem's rules, not control-ID or
+    // provider-key rules. Unix colon/backslash bytes are never separators.
+    noland_state_core::validate_native_component(text)
 }
 
 fn confined_link_target(relative: &Path, target: &Path) -> Result<()> {
@@ -42,50 +37,7 @@ fn confined_link_target(relative: &Path, target: &Path) -> Result<()> {
     let target = target
         .to_str()
         .ok_or_else(|| StateError::UnsafePath("logical link target is not UTF-8".into()))?;
-    let parts: Vec<_> = relative.split('/').collect();
-    if parts.is_empty() || parts.len() > 128 || relative.len() > 32768 {
-        return Err(StateError::UnsafePath(
-            "invalid logical link depth or path size".into(),
-        ));
-    }
-    for part in &parts {
-        validate_leaf(std::ffi::OsStr::new(part))?;
-    }
-    if target.is_empty()
-        || target.len() > 32768
-        || target.starts_with('/')
-        || target.contains(['\\', '\0', ':'])
-    {
-        return Err(StateError::UnsafePath(
-            "symlink target must be confined to the approved logical root".into(),
-        ));
-    }
-    let mut depth = parts.len() - 1;
-    for (index, part) in target.split('/').enumerate() {
-        if index >= 128 {
-            return Err(StateError::UnsafePath(
-                "symlink target exceeds depth limit".into(),
-            ));
-        }
-        match part {
-            "." => {}
-            ".." => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| StateError::UnsafePath("symlink escapes logical root".into()))?
-            }
-            normal => {
-                validate_leaf(std::ffi::OsStr::new(normal))?;
-                depth += 1;
-            }
-        }
-        if depth > 128 {
-            return Err(StateError::UnsafePath(
-                "symlink target exceeds depth limit".into(),
-            ));
-        }
-    }
-    Ok(())
+    noland_state_core::validate_relative_symlink_target_within_root(relative, target)
 }
 
 #[cfg(unix)]

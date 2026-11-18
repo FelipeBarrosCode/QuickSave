@@ -104,24 +104,30 @@ fn nested_escape_is_rejected_before_creation() -> Result<()> {
 }
 
 #[test]
-fn drive_stream_and_nt_targets_are_rejected() -> Result<()> {
+fn windows_looking_targets_remain_literal_relative_unix_names() -> Result<()> {
     let temp = isolated();
     let root = SafeRoot::open(temp.path())?;
-    for target in [
+    for (index, target) in [
         r"C:\outside",
         "C:outside",
         r"\??\C:\outside",
         r"\\server\share",
         "file:stream",
         r"\\?\GLOBALROOT\Device",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = format!("link-{index}");
+        let link = root.create_new_relative_symlink(&path, target, None)?;
+        assert_eq!(link.target, target);
+        assert_eq!(root.read_link(&path)?, link);
         assert!(
-            root.create_new_relative_symlink("link", target, None)
-                .is_err(),
-            "{target}"
+            root.read_file(&path).is_err(),
+            "links are never payload-read authority"
         );
     }
-    assert!(root.metadata_entries()?.is_empty());
+    assert_eq!(root.metadata_entries()?.len(), 6);
     Ok(())
 }
 
@@ -129,7 +135,7 @@ fn drive_stream_and_nt_targets_are_rejected() -> Result<()> {
 fn nul_empty_and_ambiguous_targets_are_rejected() -> Result<()> {
     let temp = isolated();
     let root = SafeRoot::open(temp.path())?;
-    for target in ["", "nul\0text", "a//b", "a/", r"a\b"] {
+    for target in ["", "nul\0text", "a//b", "a/"] {
         assert!(root
             .create_new_relative_symlink("link", target, None)
             .is_err());

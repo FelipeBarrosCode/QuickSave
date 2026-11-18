@@ -179,18 +179,7 @@ impl NativeSelection {
 }
 
 pub fn validate_native_relative(relative: &str) -> Result<()> {
-    validate_relative_path(relative)?;
-    if relative.contains(['\\', '\0'])
-        || relative
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part.len() > 255)
-        || relative.split('/').count() > 128
-    {
-        return Err(StateError::UnsafePath(
-            "non-canonical native relative path".into(),
-        ));
-    }
-    Ok(())
+    validate_native_relative_path(relative)
 }
 
 /// Hash identities are opaque browse handles, never authority or absolute paths.
@@ -351,7 +340,7 @@ fn native_root_leaf_name(path: &Path) -> Result<&str> {
     Ok(leaf)
 }
 
-/// Portable reconstruction metadata from actual pinned bindings, not source
+/// Exact native reconstruction metadata from actual pinned bindings, not source
 /// path hints, UI labels or guesses about a host's HOME/Applications directories.
 pub(crate) fn root_layouts_from_pins(
     app: &AppId,
@@ -950,8 +939,7 @@ impl StateAgent {
                 "native root directory is not a file".into(),
             ));
         }
-        validate_native_relative(relative)?;
-        Ok(LogicalPath::new(root.logical.clone(), relative))
+        LogicalPath::new_native(root.logical.clone(), relative)
     }
 
     pub(crate) fn native_selection_for_operation(

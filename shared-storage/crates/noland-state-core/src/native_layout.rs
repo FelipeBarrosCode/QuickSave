@@ -11,7 +11,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::{BundleManifest, LogicalRoot, LogicalRootMap, Result, StateError};
+use crate::{
+    validate_native_component, validate_native_relative_path,
+    validate_relative_symlink_target_within_root, validate_unix_relative_path,
+    validate_windows_relative_path, validate_windows_relative_symlink_target_within_root,
+    BundleManifest, LogicalRoot, LogicalRootMap, Result, StateError,
+};
 
 pub const NATIVE_ROOT_LAYOUTS_KEY: &str = "quicksave_native_root_layouts";
 pub const MAX_NATIVE_LAYOUT_ROOTS: usize = 64;
@@ -105,33 +110,21 @@ pub struct NativeRestoreLayout {
     pub metadata: Option<NativeRootLayouts>,
 }
 
-/// Conservative portable basename, including Windows device/stream aliases.
-/// Unicode normalization is used for collision checks, never to rename a leaf.
+/// Exact basename for the current native filesystem. Only Windows applies its
+/// device/stream aliases. Normalization detects collisions; it never renames.
 pub fn validate_native_layout_leaf(leaf: &str) -> Result<()> {
-    let stem = leaf
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(' ')
-        .nfkc()
-        .flat_map(char::to_uppercase)
-        .collect::<String>();
-    if leaf.is_empty()
-        || leaf.len() > 255
-        || leaf == "."
-        || leaf == ".."
-        || leaf.ends_with(['.', ' '])
-        || leaf.starts_with(' ')
-        || leaf
-            .chars()
-            .any(|c| c.is_control() || "/\\:\0<>\"|?*".contains(c))
-        || matches!(
-            stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-        )
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+    validate_native_component(leaf)?;
+    validate_layout_leaf_for(leaf, cfg!(windows))
+}
+
+fn validate_layout_leaf_for(leaf: &str, windows: bool) -> Result<()> {
+    if windows {
+        validate_windows_relative_path(leaf)?;
+    } else {
+        validate_unix_relative_path(leaf)?;
+    }
+    if leaf.contains('/')
+        || (windows && leaf.starts_with(' '))
         || collision_key(leaf).starts_with(".quicksave-")
         || collision_key(leaf).starts_with(".noland-")
     {
@@ -291,7 +284,12 @@ pub fn native_root_layouts(manifest: &BundleManifest) -> Result<Option<NativeRoo
     let mut ids = BTreeSet::new();
     for layout in &layouts.roots {
         canonical_logical(&layout.logical_root)?;
-        validate_native_layout_leaf(&layout.leaf_name)?;
+        // Parse authenticated source syntax without letting the destination OS
+        // reinterpret a Unix basename as a Windows path/stream.
+        validate_layout_leaf_for(
+            &layout.leaf_name,
+            layouts.platform == NativeLayoutPlatform::Windows,
+        )?;
         if layout.root_id.is_empty()
             || layout.root_id.len() > 256
             || layout
@@ -379,6 +377,9 @@ pub fn native_restore_layout(
     manifest: &BundleManifest,
     destination: &Path,
 ) -> Result<NativeRestoreLayout> {
+    // No target PathBuf (nor RootScaffold write in callers) may precede this
+    // complete, string-only target-name compatibility gate.
+    validate_native_restore_names(manifest)?;
     if !destination.is_absolute()
         || destination
             .components()
@@ -407,6 +408,63 @@ pub fn native_restore_layout(
     };
     validate_native_root_mappings(destination, &roots)?;
     Ok(NativeRestoreLayout { roots, metadata })
+}
+
+/// Read-only preflight of an already authenticated/projected native manifest.
+/// This checks the actual target OS, independently of the source platform.
+/// Run before scaffolding destination roots or joining any source filenames.
+pub fn validate_native_restore_names(manifest: &BundleManifest) -> Result<()> {
+    validate_restore_names_for(manifest, cfg!(windows))
+}
+
+/// Pure Windows target-name preflight, also callable on Unix for rejection
+/// tests. Original manifest strings and cryptographic identities are unchanged.
+pub fn validate_windows_restore_names(manifest: &BundleManifest) -> Result<()> {
+    validate_restore_names_for(manifest, true)
+}
+
+fn validate_restore_names_for(manifest: &BundleManifest, windows: bool) -> Result<()> {
+    if manifest
+        .files
+        .len()
+        .saturating_add(manifest.tombstones.len())
+        > 250_000
+    {
+        return Err(StateError::Invalid(
+            "native restore exceeds its 250000-entry bound".into(),
+        ));
+    }
+    for file in &manifest.files {
+        if windows {
+            validate_windows_relative_path(&file.relative_path)?;
+        } else {
+            validate_native_relative_path(&file.relative_path)?;
+        }
+        if file.file_type == "symlink" {
+            let target = file
+                .symlink_target
+                .as_deref()
+                .ok_or_else(|| StateError::Integrity("native symlink target missing".into()))?;
+            if windows {
+                validate_windows_relative_symlink_target_within_root(&file.relative_path, target)?;
+            } else {
+                validate_relative_symlink_target_within_root(&file.relative_path, target)?;
+            }
+        }
+    }
+    for entry in &manifest.tombstones {
+        if windows {
+            validate_windows_relative_path(&entry.relative_path)?;
+        } else {
+            validate_native_relative_path(&entry.relative_path)?;
+        }
+    }
+    if let Some(layouts) = native_root_layouts(manifest)? {
+        for root in &layouts.roots {
+            validate_layout_leaf_for(&root.leaf_name, windows)?;
+        }
+    }
+    Ok(())
 }
 
 /// Rebuilds the SAME deterministic frame when checking a device-MAC-bound
@@ -616,15 +674,14 @@ mod tests {
         let base = manifest();
         let destination = std::env::temp_dir().join("layout-pure-validation");
         for leaf in [
+            ".",
             "..",
             "../outside",
             "/absolute",
-            r"bad\leaf",
-            "stream:alias",
-            "NUL",
-            "COM1.txt",
-            "COM¹",
-            "trailing.",
+            "bad/leaf",
+            "nul\0byte",
+            ".quicksave-reserved",
+            ".noland-reserved",
         ] {
             let mut manifest = base.clone();
             manifest.environment[NATIVE_ROOT_LAYOUTS_KEY]["roots"][0]["leaf_name"] = json!(leaf);
@@ -648,6 +705,88 @@ mod tests {
         collision.environment[NATIVE_ROOT_LAYOUTS_KEY]["roots"][1]["leaf_name"] =
             json!("ACTUAL APPLICATION.APP");
         assert!(native_restore_layout(&collision, &destination).is_err());
+    }
+
+    #[test]
+    fn unix_source_layout_parse_is_distinct_from_windows_target_compatibility() {
+        let mut manifest = manifest();
+        let leaf = r"Actual:Application\literal.app";
+        manifest.environment[NATIVE_ROOT_LAYOUTS_KEY]["roots"][0]["leaf_name"] = json!(leaf);
+        let original = serde_json::to_vec(&manifest).unwrap();
+        let layout = native_root_layouts(&manifest).unwrap().unwrap();
+        assert_eq!(
+            layout
+                .roots
+                .iter()
+                .find(|root| root.root_id == "installation")
+                .unwrap()
+                .leaf_name,
+            leaf
+        );
+        assert!(validate_windows_restore_names(&manifest).is_err());
+        assert_eq!(serde_json::to_vec(&manifest).unwrap(), original);
+        #[cfg(unix)]
+        {
+            let destination = std::env::temp_dir().join("native-exact-layout-no-io");
+            let mapped = native_restore_layout(&manifest, &destination).unwrap();
+            assert_eq!(mapped.roots[&token("installation")], destination.join(leaf));
+        }
+        manifest.environment[NATIVE_ROOT_LAYOUTS_KEY]["platform"] = json!("windows");
+        assert!(
+            native_root_layouts(&manifest).is_err(),
+            "Windows source names remain strict too"
+        );
+    }
+
+    #[test]
+    fn windows_preflight_checks_entries_deletions_link_names_and_targets_without_rewriting() {
+        let base = manifest();
+        validate_windows_restore_names(&base).unwrap();
+        for path in [
+            r"a\b",
+            "state:version",
+            r"C:\absolute",
+            "C:relative",
+            r"\\server\share",
+            "dir/../escape",
+            "/absolute",
+            "dir/NUL.txt",
+            "dir/trailing.",
+            "dir/ｃｏｎ",
+        ] {
+            for deletion in [false, true] {
+                let mut manifest = base.clone();
+                if deletion {
+                    manifest.tombstones.push(crate::ManifestTombstone {
+                        logical_root: token("saves"),
+                        relative_path: path.into(),
+                        reason: "pure target-name rejection fixture".into(),
+                    });
+                } else {
+                    manifest.files[1].relative_path = path.into();
+                }
+                let original = serde_json::to_vec(&manifest).unwrap();
+                assert!(validate_windows_restore_names(&manifest).is_err(), "{path}");
+                assert_eq!(serde_json::to_vec(&manifest).unwrap(), original);
+            }
+        }
+        for (name, target) in [
+            (r"link\literal", "safe"),
+            ("link:literal", "safe"),
+            ("link", "stream:ads"),
+            ("dir/link", r"../a\b"),
+            ("link", r"\\server\share"),
+            ("dir/link", "child/../escape"),
+        ] {
+            let mut manifest = base.clone();
+            manifest.files[1].file_type = "symlink".into();
+            manifest.files[1].relative_path = name.into();
+            manifest.files[1].symlink_target = Some(target.into());
+            assert!(
+                validate_windows_restore_names(&manifest).is_err(),
+                "{name} -> {target}"
+            );
+        }
     }
 
     #[test]

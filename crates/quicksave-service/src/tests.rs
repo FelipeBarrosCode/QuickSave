@@ -41,12 +41,20 @@ impl FakeStore {
     }
 }
 impl ServiceStore for FakeStore {
-    fn provider_credential_generation(&self,id:&str) -> Result<u64> {
-        ensure!(id == "provider-1","Synthetic provider mismatch");
+    fn provider_credential_generation(&self, id: &str) -> Result<u64> {
+        ensure!(id == "provider-1", "Synthetic provider mismatch");
         Ok(17)
     }
-    fn complete_provider_reauthorization(&self,id:&str,expected:u64,credentials:&Value) -> Result<()> {
-        ensure!(id == "provider-1" && expected == 17,"Synthetic native CAS mismatch");
+    fn complete_provider_reauthorization(
+        &self,
+        id: &str,
+        expected: u64,
+        credentials: &Value,
+    ) -> Result<()> {
+        ensure!(
+            id == "provider-1" && expected == 17,
+            "Synthetic native CAS mismatch"
+        );
         *self.received_credentials.lock().unwrap() = Some(credentials.clone());
         let mut document = self.document.lock().unwrap();
         document["providers"][0]["status"] = json!("connecting");
@@ -396,25 +404,42 @@ impl FakeEngine {
     }
 }
 impl ServiceEngine for FakeEngine {
-    fn shutdown<'a>(&'a self) -> NativeFuture<'a,()> {
+    fn shutdown<'a>(&'a self) -> NativeFuture<'a, ()> {
         Box::pin(async move {
-            ensure!(self.statuses.lock().unwrap().values().all(dto::terminal),
-                "Synthetic native work is still active");
+            ensure!(
+                self.statuses.lock().unwrap().values().all(dto::terminal),
+                "Synthetic native work is still active"
+            );
             Ok(())
         })
     }
-    fn delete_guarded<'a>(&'a self,access:ProviderAccess,selection:Value,guard:PublishGuard) -> NativeFuture<'a,Value> {
+    fn delete_guarded<'a>(
+        &'a self,
+        access: ProviderAccess,
+        selection: Value,
+        guard: PublishGuard,
+    ) -> NativeFuture<'a, Value> {
         Box::pin(async move {
             guard()?;
-            self.guards.lock().unwrap().insert(dto::id(&selection,"operationId")?.to_owned(),guard);
-            self.call("delete",Some(access),selection).await
+            self.guards
+                .lock()
+                .unwrap()
+                .insert(dto::id(&selection, "operationId")?.to_owned(), guard);
+            self.call("delete", Some(access), selection).await
         })
     }
-    fn recover_restore_local<'a>(&'a self, selection:Value, guard:PublishGuard) -> NativeFuture<'a,Value> {
+    fn recover_restore_local<'a>(
+        &'a self,
+        selection: Value,
+        guard: PublishGuard,
+    ) -> NativeFuture<'a, Value> {
         Box::pin(async move {
             guard()?;
-            self.guards.lock().unwrap().insert(dto::id(&selection,"operationId")?.to_owned(),guard);
-            self.call("recover_restore_local",None,selection).await
+            self.guards
+                .lock()
+                .unwrap()
+                .insert(dto::id(&selection, "operationId")?.to_owned(), guard);
+            self.call("recover_restore_local", None, selection).await
         })
     }
     fn download_guarded<'a>(
@@ -543,12 +568,10 @@ impl ServiceEngine for FakeEngine {
                         json!({"canList":good,"canRead":good,"repositoryAccessible":good,"repositoryEmpty":false,"keyVerified":good,"credentials":SECRET}),
                     )
                 }
-                "preview_delete" => Ok(
-                    json!({"previewId":"preview-1","dependentBundles":[
+                "preview_delete" => Ok(json!({"previewId":"preview-1","dependentBundles":[
                         {"id":"dependent-1","appId":"app-1","commitId":"commit-1"},
                         {"id":"dependent-2","appId":"app-1","commitId":"commit-2"}],
-                        "dependentBundleCount":2,"items":3,"logicalBytes":7,"physicalBytes":11,"names":["synthetic"]}),
-                ),
+                        "dependentBundleCount":2,"items":3,"logicalBytes":7,"physicalBytes":11,"names":["synthetic"]})),
                 "preview_restore" => Ok(
                     json!({"previewId":"restore-preview-1","requiresOverwriteAcknowledgement":false,"frozenPlanFingerprint":"b".repeat(64),
                     "fileCount":1,"logicalBytes":7,"conflictCount":0,
@@ -562,7 +585,9 @@ impl ServiceEngine for FakeEngine {
                     "frozenPlanFingerprint":"c".repeat(64),"roots":[{"path":"/synthetic/original-restore-target"}],
                     "summary":"Recover only original owned local restore outputs. No cloud connection or download is authorized.",
                 })),
-                "recover_restore_local" => Ok(json!({"operationId":input["operationId"],"retained":0,"recovered":true})),
+                "recover_restore_local" => {
+                    Ok(json!({"operationId":input["operationId"],"retained":0,"recovered":true}))
+                }
                 "catalog" => Ok(
                     json!({"bundles":[{"id":"bundle-1","appId":"stable.app.identity","name":"Synthetic backup","providerId":"provider-1","credentials":SECRET}]}),
                 ),
@@ -673,9 +698,12 @@ async fn automatic_noland_finder_is_consent_only_and_import_uses_opaque_source()
         .await
         .unwrap();
     assert_eq!(result["selectedId"], "native-source-1");
-    assert_eq!(result["candidates"][0], json!({
-        "id":"native-source-1","label":"No Land","path":"…/com.noland.connect/state.json",
-    }));
+    assert_eq!(
+        result["candidates"][0],
+        json!({
+            "id":"native-source-1","label":"No Land","path":"…/com.noland.connect/state.json",
+        })
+    );
     assert_eq!(result["manualFallback"], "advanced_only");
     assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst), 0);
     let params = json!({"sourceId":result["selectedId"]});
@@ -707,45 +735,68 @@ async fn automatic_noland_finder_is_consent_only_and_import_uses_opaque_source()
 #[tokio::test]
 async fn local_restore_recovery_never_connects_or_retries_a_disconnected_provider() {
     let fixture = Fixture::new(true);
-    fixture.engine.missing_rclone.store(true,Ordering::SeqCst);
+    fixture.engine.missing_rclone.store(true, Ordering::SeqCst);
     fixture.store.document.lock().unwrap()["providers"][0]["status"] = json!("disconnected");
     let original = uuid::Uuid::new_v4().to_string();
     let params = json!({"operationId":original});
-    let scope = fixture.service.approval_scope("recover_restore",&params).await.unwrap();
+    let scope = fixture
+        .service
+        .approval_scope("recover_restore", &params)
+        .await
+        .unwrap();
     assert_eq!(scope["restore"]["operationId"], original);
     assert_eq!(scope["restore"]["requestedOperationId"], original);
     assert!(scope.get("provider").is_none());
-    assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst),0);
-    let result = fixture.service.execute_authorized("recover_restore",params).await.unwrap();
-    assert_eq!(result["recovery"]["operationId"],original);
-    assert_eq!(result["recovery"]["recovered"],true);
-    assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst),0);
-    assert_eq!(fixture.engine.published.load(Ordering::SeqCst),0);
+    assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst), 0);
+    let result = fixture
+        .service
+        .execute_authorized("recover_restore", params)
+        .await
+        .unwrap();
+    assert_eq!(result["recovery"]["operationId"], original);
+    assert_eq!(result["recovery"]["recovered"], true);
+    assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.engine.published.load(Ordering::SeqCst), 0);
     let calls = fixture.engine.calls.lock().unwrap();
-    assert!(calls.iter().all(|(method,_)| matches!(method.as_str(),
-        "restore_recovery_scope" | "recover_restore_local")));
+    assert!(calls.iter().all(|(method, _)| matches!(
+        method.as_str(),
+        "restore_recovery_scope" | "recover_restore_local"
+    )));
     drop(calls);
-    assert!(fixture.engine.guards.lock().unwrap()[&original]().is_err(),
-        "Recovery authority must expire when the owned local recovery returns");
+    assert!(
+        fixture.engine.guards.lock().unwrap()[&original]().is_err(),
+        "Recovery authority must expire when the owned local recovery returns"
+    );
     fixture.service.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn native_previews_match_renderer_contract_without_exposing_engine_authority() {
     let fixture = Fixture::new(true);
-    let disabled = fixture.service.query("app_tracking",json!({})).await.unwrap();
-    assert_eq!(disabled["enabled"],false);
-    assert_eq!(disabled["scanning"],false);
-    assert_eq!(disabled["completedApps"],0);
-    assert_eq!(disabled["totalApps"],0);
-    let preview = fixture.service.execute_authorized("preview_restore",json!({
-        "providerId":"provider-1","bundleId":"b","appId":"a",
-        "destination":"/synthetic/native-target","mode":"create_new",
-    })).await.unwrap();
-    assert_eq!(preview["files"],1);
-    assert_eq!(preview["bytes"],7);
-    assert_eq!(preview["conflicts"],json!([]));
-    assert_eq!(preview["requiresOverwriteAcknowledgement"],false);
+    let disabled = fixture
+        .service
+        .query("app_tracking", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["scanning"], false);
+    assert_eq!(disabled["completedApps"], 0);
+    assert_eq!(disabled["totalApps"], 0);
+    let preview = fixture
+        .service
+        .execute_authorized(
+            "preview_restore",
+            json!({
+                "providerId":"provider-1","bundleId":"b","appId":"a",
+                "destination":"/synthetic/native-target","mode":"create_new",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["files"], 1);
+    assert_eq!(preview["bytes"], 7);
+    assert_eq!(preview["conflicts"], json!([]));
+    assert_eq!(preview["requiresOverwriteAcknowledgement"], false);
     assert!(preview.get("device_mac").is_none());
     assert!(preview.get("manifest").is_none());
     fixture.service.shutdown().await.unwrap();
@@ -756,18 +807,48 @@ async fn reauthorization_keeps_provider_scope_private_and_requires_fresh_health(
     let fixture = Fixture::new(true);
     let request = json!({"providerId":"provider-1","credentials":{"type":"access_key",
         "value":{"access_key_id":"synthetic","secret_access_key":SECRET}}});
-    let approved = fixture.service.approval_scope("reauthorize_provider",&request).await.unwrap();
-    assert_eq!(approved["provider"]["id"],"provider-1");
+    let approved = fixture
+        .service
+        .approval_scope("reauthorize_provider", &request)
+        .await
+        .unwrap();
+    assert_eq!(approved["provider"]["id"], "provider-1");
     assert!(!approved.to_string().contains(SECRET));
-    let result = fixture.service.execute_authorized("reauthorize_provider",request).await.unwrap();
+    let result = fixture
+        .service
+        .execute_authorized("reauthorize_provider", request)
+        .await
+        .unwrap();
     fixture.join().await;
-    let activity = fixture.service.operation(result["operationId"].as_str().unwrap()).await.unwrap();
-    assert_eq!(activity["state"],"completed","{activity}");
+    let activity = fixture
+        .service
+        .operation(result["operationId"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(activity["state"], "completed", "{activity}");
     assert!(!activity.to_string().contains(SECRET));
-    assert_eq!(fixture.store.document.lock().unwrap()["software"][0]["autosave"],false);
-    assert_eq!(fixture.store.document.lock().unwrap()["providers"][0]["readOnly"],true);
-    assert!(fixture.engine.calls.lock().unwrap().iter().any(|(method,_)| method == "health_check"));
-    assert!(!fixture.engine.calls.lock().unwrap().iter().any(|(_,input)| input.to_string().contains(SECRET)));
+    assert_eq!(
+        fixture.store.document.lock().unwrap()["software"][0]["autosave"],
+        false
+    );
+    assert_eq!(
+        fixture.store.document.lock().unwrap()["providers"][0]["readOnly"],
+        true
+    );
+    assert!(fixture
+        .engine
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(method, _)| method == "health_check"));
+    assert!(!fixture
+        .engine
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, input)| input.to_string().contains(SECRET)));
     fixture.service.shutdown().await.unwrap();
 }
 
@@ -1655,6 +1736,23 @@ async fn missing_rclone_is_actionable_fixed_failure_not_fake_connection_or_raw_o
         "error"
     );
     fixture.service.shutdown().await.unwrap();
+}
+
+#[test]
+fn source_native_listing_preserves_literal_backslashes_without_turning_them_into_paths() {
+    let raw = json!({"files":[
+        {"id":"literal","name":"a\\b","path":"a\\b","directory":false,"size":1},
+        {"id":"nested","name":"b","path":"a/b","directory":false,"size":2},
+        {"id":"colon","name":"a:b","path":"a:b","directory":false,"size":3},
+    ],"nextCursor":null});
+    let page = dto::files(&raw, 3).unwrap();
+    assert_eq!(page["files"][0]["path"], "a\\b");
+    assert_eq!(page["files"][1]["path"], "a/b");
+    for path in ["../escape", "a/../escape", "/absolute", "bad\0name"] {
+        let mut invalid = raw.clone();
+        invalid["files"][0]["path"] = json!(path);
+        assert!(dto::files(&invalid, 3).is_err());
+    }
 }
 
 #[test]

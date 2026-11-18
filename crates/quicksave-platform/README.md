@@ -5,6 +5,122 @@ was copied into this crate.
 
 ## API
 
+### Directory-identity approval (not capture)
+
+```rust
+impl SafeRoot {
+    pub fn overlaps_directory_identities(&self, protected: &SafeRoot)
+        -> anyhow::Result<bool>;
+}
+pub enum DirectoryIdentityInspectionSide { Selected, Protected }
+#[non_exhaustive]
+pub enum DirectoryIdentityInspectionStage {
+    ValidatePinnedRoot,
+    RecordDirectories,
+    VerifyDirectories,
+    RevalidateRootIdentity,
+    RevalidatePinnedRoot,
+    UnsupportedPlatform,
+}
+pub struct DirectoryIdentityInspectionFailure {
+    pub side: DirectoryIdentityInspectionSide,
+    pub stage: DirectoryIdentityInspectionStage,
+    pub relative_path: Option<std::path::PathBuf>,
+    // Private construction; also implements std::error::Error + Display.
+}
+```
+
+Tracker's root-identity approval may use this new purpose-specific method. The
+receiver is the **selected** root and the argument is the **protected** root;
+errors identify the side, native operation and relative directory. Callers should
+add their approved root/path label as error context. This is not a payload
+readability or capture receipt.
+
+Every error from this method carries `DirectoryIdentityInspectionFailure` as
+typed `anyhow` context. Stable public field names are **`side`**, **`stage`** and
+**`relative_path`**; construction is private. Downcast through caller context:
+
+```rust
+let failure = error.downcast_ref::<DirectoryIdentityInspectionFailure>();
+let failed_side = failure.map(|failure| failure.side);
+```
+
+The native cause remains downcastable as well (for example `std::io::Error`).
+`relative_path` is `None` for root/global failures or unavailable location;
+otherwise it is the inspected directory (possibly a containing directory),
+relative to that side's root. Unix non-UTF-8 bytes are preserved, not parsed from
+display text. `stage` is a non-exhaustive enum; callers must not parse its Display
+text. A protected-side permission or topology failure is **not** evidence that
+the selected app root is missing/unavailable. An error without this context
+(from another API) must not be silently classified as selected-side failure.
+Generic capture errors are unchanged; no string-based whitelist or new
+`UnsupportedNativeCaptureEntry` classification is introduced.
+
+- The ancestor-ID fast path and intersection of **all real directory IDs** still
+  catch same-root, containment, shared-descendant bind/firmlink aliases and case
+  aliases. A descendant matching the protected root already proves overlap and
+  avoids inspecting that subtree again. Negative results never come from
+  lexical prefixes or blind ancestor-only checks.
+- Native handle-relative enumeration classifies entry kinds without following
+  links. Unix uses no-follow `fstatat` for kind (directory-entry type hints are not
+  alias authority). Windows uses byte-bounded extended native directory records
+  and verifies both halves of each directory's 128-bit handle ID.
+- No regular-file handles, payload reads, or symlink target-text reads occur.
+  Files, sockets/FIFOs and known symlinks are excluded from the directory census,
+  including absolute/escaping symlinks. Windows directory junctions and unknown
+  directory reparse tags fail explicitly, never as disjointness.
+- Directory before/open/after edges, retained parents, native identities, and
+  directory-only children are rechecked. A second deterministic census verifies
+  the recorded topology without allocating another inventory. File sizes,
+  timestamps and file-name sets are not compared; ordinary file churn does not
+  invalidate approval. A vanished **known directory**, changed directory set,
+  alias cycle, inaccessible directory or exhausted bound still fails.
+- Each census bounds total enumeration work by the existing 1,000,000-entry /
+  128 MiB summed-name limits. Its retained directory inventory additionally
+  allows at most 131,072 directories including the root, with 32 MiB summed
+  relative directory paths. Existing depth/path limits still apply. No retries,
+  permission repair, elevation, or "unknown means safe" fallback is installed.
+
+**Topology/performance limitation:** native ancestor IDs are positive overlap
+evidence, not a disjointness proof. No trusted cross-platform OS proof excluding
+interior bind/firmlink aliases is implemented here; a mount-table or lexical
+prefix comparison alone would not establish one on macOS. Otherwise both
+directory trees are inspected, with the above precise failure diagnostics. This
+does not promise to eliminate protected-directory enumeration per application.
+Do not cache a negative census as a permanent mount/namespace authorization.
+
+`overlaps()`, `entries()`, `metadata_entries()`, `read_file()`, and the parent's
+`file_metadata()` / Unix native-filename changes are preserved. Generic overlap
+and capture continue to reject unsupported/escaping links; identity approval
+does not authorize their capture or relax source/root guards. Like the existing
+overlap guard, this is a validated census, not an atomic namespace/mount lock.
+
+Synthetic tests: `tests/directory_identity_overlap_unix.rs`, common inventory
+unit tests and Windows native/parser regressions. The real shared-descendant
+Linux bind-alias fixture is **ignored by default**; it requires explicitly
+selected native capability acceptance and creates a private, non-propagating
+mount namespace in a subprocess, never in the test runner. No mounts, native
+apps, protected accounts, vaults or repository trees were probed by this agent.
+Parent-owned serialized Cargo/native validation is required; these new tests
+have not been run by the assigned agent.
+
+Assigned-agent static checks (not compilation/native acceptance):
+
+```sh
+rustfmt --check --edition 2021 \
+  crates/quicksave-platform/src/lib.rs \
+  crates/quicksave-platform/src/overlap.rs \
+  crates/quicksave-platform/src/unix.rs \
+  crates/quicksave-platform/src/unix/overlap.rs \
+  crates/quicksave-platform/src/windows.rs \
+  crates/quicksave-platform/src/windows/overlap.rs \
+  crates/quicksave-platform/tests/directory_identity_overlap_unix.rs \
+  crates/quicksave-platform/tests/safe_root_unix.rs \
+  crates/quicksave-platform/tests/safe_links_unix.rs \
+  crates/quicksave-platform/tests/safe_root_windows.rs
+git diff --check -- crates/quicksave-platform
+```
+
 ### Additive native metadata / state contract (2026-11)
 
 ```rust

@@ -46,6 +46,52 @@ fn children(path: &Path) -> Vec<String> {
 }
 
 #[test]
+fn metadata_observation_needs_no_payload_read_permission_and_rejects_links() -> Result<()> {
+    let temp = isolated();
+    let path = temp.path().join("metadata-only");
+    fs::write(&path, b"synthetic protected payload")?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000))?;
+    let root = SafeRoot::open(temp.path())?;
+    let observed = root.file_metadata("metadata-only")?;
+    assert_eq!(observed.size, 27);
+    // These fixtures require an ordinary unprivileged test account.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(root.read_file("metadata-only").is_err());
+    }
+    symlink("metadata-only", temp.path().join("alias"))?;
+    assert!(root.file_metadata("alias").is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    assert_ne!(root.file_metadata("metadata-only")?, observed);
+    assert_eq!(
+        root.read_file("metadata-only")?.1,
+        root.file_metadata("metadata-only")?
+    );
+    Ok(())
+}
+
+#[test]
+fn native_unix_names_do_not_alias_colons_or_literal_backslashes() -> Result<()> {
+    let temp = isolated();
+    fs::create_dir(temp.path().join("a"))?;
+    for (path, bytes) in [
+        ("a:b", b"colon".as_slice()),
+        ("a\\b", b"backslash".as_slice()),
+        ("a/b", b"nested".as_slice()),
+    ] {
+        fs::write(temp.path().join(path), bytes)?;
+    }
+    let root = SafeRoot::open(temp.path())?;
+    for (path, size) in [("a:b", 5), ("a\\b", 9), ("a/b", 6)] {
+        assert_eq!(root.file_metadata(path)?.size, size);
+        assert_eq!(root.read_file(path)?.1.size, size);
+    }
+    for invalid in ["../escape", "a/../escape", "/absolute", "bad\0name"] {
+        assert!(root.file_metadata(invalid).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn stable_read_and_stamp_serde_roundtrip() -> Result<()> {
     let temp = isolated();
     fs::write(temp.path().join("source"), b"stable bytes")?;
@@ -170,8 +216,6 @@ fn all_traversal_and_invalid_paths_fail_before_callbacks() -> Result<()> {
         "a/./b".into(),
         "a//b".into(),
         "a/".into(),
-        r"a\b".into(),
-        "C:drive".into(),
         "nul\0byte".into(),
         "x".repeat(256),
         "a/".repeat(MAX_DEPTH) + "b",

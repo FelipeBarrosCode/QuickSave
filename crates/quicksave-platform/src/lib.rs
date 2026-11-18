@@ -10,11 +10,16 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::{fs::File, path::Path};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 #[cfg(any(unix, windows))]
 use std::collections::BTreeSet;
 
+#[cfg(any(unix, windows))]
+mod overlap;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -71,9 +76,9 @@ pub struct MetadataEntry {
 }
 
 #[cfg(windows)]
-pub use windows::{flush_native_directory, PrivateDirectory, PrivateFileVersion, PrivateLock};
-#[cfg(windows)]
 pub use windows::browser::open_oauth_browser;
+#[cfg(windows)]
+pub use windows::{flush_native_directory, PrivateDirectory, PrivateFileVersion, PrivateLock};
 #[cfg(all(test, not(windows)))]
 #[path = "windows/browser.rs"]
 mod windows_browser_validation_tests;
@@ -86,6 +91,110 @@ pub struct RootIdentity {
     pub device: u64,
     pub file_id: [u64; 2],
 }
+
+/// Which root could not be inspected by directory-identity approval. In
+/// particular, a protected-side failure is NOT evidence the app root is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryIdentityInspectionSide {
+    Selected,
+    Protected,
+}
+
+impl std::fmt::Display for DirectoryIdentityInspectionSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Selected => "selected-root",
+            Self::Protected => "protected-root",
+        })
+    }
+}
+
+/// The phase that failed, not a classification derived from an error message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DirectoryIdentityInspectionStage {
+    ValidatePinnedRoot,
+    RecordDirectories,
+    VerifyDirectories,
+    RevalidateRootIdentity,
+    RevalidatePinnedRoot,
+    UnsupportedPlatform,
+}
+
+impl std::fmt::Display for DirectoryIdentityInspectionStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ValidatePinnedRoot => "validate pinned root",
+            Self::RecordDirectories => "record directory census",
+            Self::VerifyDirectories => "verify directory census",
+            Self::RevalidateRootIdentity => "revalidate root ID",
+            Self::RevalidatePinnedRoot => "revalidate pinned root after census",
+            Self::UnsupportedPlatform => "native inspection unsupported",
+        })
+    }
+}
+
+/// Typed context on every error returned by overlaps_directory_identities().
+/// Use anyhow::Error::downcast_ref::<DirectoryIdentityInspectionFailure>() even
+/// through additional caller context; do not classify the Display text.
+///
+/// This is an error context, not a replacement for the underlying native error.
+/// Root/global failures or an unavailable location have relative_path == None.
+/// Otherwise the path identifies the native directory being inspected (possibly
+/// a containing directory), relative to `side`'s root. Unix bytes are not lossy.
+/// Construction is private to this boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryIdentityInspectionFailure {
+    pub side: DirectoryIdentityInspectionSide,
+    pub stage: DirectoryIdentityInspectionStage,
+    pub relative_path: Option<PathBuf>,
+    _private: (),
+}
+
+impl DirectoryIdentityInspectionFailure {
+    fn new(
+        side: DirectoryIdentityInspectionSide,
+        stage: DirectoryIdentityInspectionStage,
+        relative_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            side,
+            stage,
+            relative_path,
+            _private: (),
+        }
+    }
+
+    fn attach<T>(
+        result: Result<T>,
+        side: DirectoryIdentityInspectionSide,
+        stage: DirectoryIdentityInspectionStage,
+    ) -> Result<T> {
+        result.map_err(|error| {
+            #[cfg(any(unix, windows))]
+            let relative_path = overlap::failure_relative_path(&error);
+            #[cfg(not(any(unix, windows)))]
+            let relative_path = None;
+            error.context(Self::new(side, stage, relative_path))
+        })
+    }
+}
+
+impl std::fmt::Display for DirectoryIdentityInspectionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} directory-identity approval: {}",
+            self.side, self.stage
+        )?;
+        if let Some(relative_path) = &self.relative_path {
+            write!(formatter, " at {relative_path:?}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DirectoryIdentityInspectionFailure {}
 
 pub const MAX_TREE_ENTRIES: usize = 1_000_000;
 pub const MAX_DEPTH: usize = 128;
@@ -181,6 +290,17 @@ impl SafeRoot {
         return self.inner.read_file(relative);
         #[cfg(not(any(unix, windows)))]
         bail!("safe native file reads are unsupported on this platform")
+    }
+
+    /// Observe a regular file through retained no-follow native parents without
+    /// asking for payload read access. This is metadata, not content/readability
+    /// proof; capture must still use `read_file` and validate the actual bytes.
+    pub fn file_metadata(&self, relative: &str) -> Result<FileStamp> {
+        validate_relative(relative)?;
+        #[cfg(any(unix, windows))]
+        return self.inner.file_metadata(relative);
+        #[cfg(not(any(unix, windows)))]
+        bail!("native no-follow file metadata is unsupported on this platform")
     }
 
     /// Open a real read-only native directory below this pinned root. Relative
@@ -280,6 +400,85 @@ impl SafeRoot {
         {
             let _ = other;
             bail!("native directory-overlap detection is unsupported on this platform")
+        }
+    }
+
+    /// Directory-identity approval only, NOT a capture/readability check.
+    ///
+    /// The receiver is the selected root and `protected` is the excluded root.
+    /// After checking pinned ancestors, bounded native directory-only censuses
+    /// detect shared descendants (including bind mounts/firmlinks). Files and
+    /// symbolic links are not opened, followed, or read for their target text.
+    /// Regular-file changes and directory timestamps are not stability evidence.
+    /// Directory replacements, topology changes, inaccessible directories, and
+    /// exhausted bounds fail with DirectoryIdentityInspectionFailure context,
+    /// retaining the underlying native error and any known relative directory.
+    ///
+    /// No negative result is inferred from lexical prefixes or ancestors alone.
+    /// Without an OS proof excluding descendant aliases, BOTH directory trees
+    /// are inspected. Capture must still use the stricter traversal/read APIs.
+    /// This is a validated census, not an atomic namespace or mount lock.
+    pub fn overlaps_directory_identities(&self, protected: &SafeRoot) -> Result<bool> {
+        #[cfg(any(unix, windows))]
+        {
+            use crate::DirectoryIdentityInspectionSide::{Protected, Selected};
+            use crate::DirectoryIdentityInspectionStage::{
+                RevalidatePinnedRoot, RevalidateRootIdentity, ValidatePinnedRoot,
+            };
+            DirectoryIdentityInspectionFailure::attach(
+                self.inner.check(),
+                Selected,
+                ValidatePinnedRoot,
+            )?;
+            DirectoryIdentityInspectionFailure::attach(
+                protected.inner.check(),
+                Protected,
+                ValidatePinnedRoot,
+            )?;
+            let result = (|| -> Result<bool> {
+                if self.inner.ancestors_overlap(&protected.inner) {
+                    return Ok(true);
+                }
+                let selected = overlap::directory_identities(&self.inner, Selected)?;
+                let protected_identity = DirectoryIdentityInspectionFailure::attach(
+                    protected.inner.directory_identity(None),
+                    Protected,
+                    RevalidateRootIdentity,
+                )?;
+                if selected.contains(&protected_identity) {
+                    // A real descendant alias of the protected root is already
+                    // proof of overlap; do not open its protected subtree again.
+                    return Ok(true);
+                }
+                let excluded = overlap::directory_identities(&protected.inner, Protected)?;
+                Ok(!selected.is_disjoint(&excluded))
+            })();
+            // Evaluate both checks, even when the census failed. A changed root
+            // must never be converted into a disjoint result.
+            let selected_check = DirectoryIdentityInspectionFailure::attach(
+                self.inner.check(),
+                Selected,
+                RevalidatePinnedRoot,
+            );
+            let protected_check = DirectoryIdentityInspectionFailure::attach(
+                protected.inner.check(),
+                Protected,
+                RevalidatePinnedRoot,
+            );
+            selected_check?;
+            protected_check?;
+            result
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = protected;
+            DirectoryIdentityInspectionFailure::attach(
+                Err(anyhow::anyhow!(
+                    "native directory-identity approval is unsupported on this platform"
+                )),
+                DirectoryIdentityInspectionSide::Selected,
+                DirectoryIdentityInspectionStage::UnsupportedPlatform,
+            )
         }
     }
 
@@ -486,8 +685,8 @@ pub(crate) fn validate_relative(relative: &str) -> Result<Vec<&str>> {
     if relative.is_empty() || relative.len() > MAX_PATH_BYTES {
         bail!("relative path is empty or exceeds the {MAX_PATH_BYTES}-byte limit");
     }
-    if relative.contains(['\\', '\0', ':']) {
-        bail!("relative paths cannot contain backslashes, NUL, or colons");
+    if relative.contains('\0') || (!cfg!(unix) && relative.contains(['\\', ':'])) {
+        bail!("relative path contains a character unsupported by this native filesystem");
     }
     let components: Vec<_> = relative.split('/').collect();
     if components.len() > MAX_DEPTH {
@@ -504,9 +703,10 @@ pub(crate) fn validate_component(component: &str) -> Result<()> {
         || component == "."
         || component == ".."
         || component.len() > 255
-        || component.contains(['/', '\\', '\0', ':'])
+        || component.contains(['/', '\0'])
+        || (!cfg!(unix) && component.contains(['\\', ':']))
     {
-        bail!("invalid or non-portable path component");
+        bail!("invalid native path component");
     }
     Ok(())
 }
@@ -519,7 +719,8 @@ pub(crate) fn validate_link_target(relative: &str, target: &str) -> Result<()> {
         !target.is_empty()
             && target.len() <= MAX_PATH_BYTES
             && !target.starts_with('/')
-            && !target.contains(['\\', '\0', ':']),
+            && !target.contains('\0')
+            && (cfg!(unix) || !target.contains(['\\', ':'])),
         "symlink target must be a bounded relative logical-root path"
     );
     let mut depth = components.len() - 1;

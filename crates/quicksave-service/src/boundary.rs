@@ -662,41 +662,80 @@ pub fn activity(value: &Value) -> Result<Value> {
         output["error"] = json!(public_activity_error(value["error"].as_str().unwrap_or("")));
     }
     if let Some(operation_id) = value.get("operationId") {
-        ensure!(operation_id == &value["id"],"Native activity changed its original operation identity");
+        ensure!(
+            operation_id == &value["id"],
+            "Native activity changed its original operation identity"
+        );
         output["operationId"] = operation_id.clone();
     }
     if let Some(batch) = value.get("batch").filter(|batch| !batch.is_null()) {
-        ensure!(batch.is_object(),"Native batch activity is invalid");
+        ensure!(batch.is_object(), "Native batch activity is invalid");
         let mut summary = json!({});
-        for field in ["softwareCount","completed","failed","cancelled","interrupted","active",
-            "notStarted","unknown","awaitingFinalization","reconciliationGapCount"] {
+        for field in [
+            "softwareCount",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "active",
+            "notStarted",
+            "unknown",
+            "awaitingFinalization",
+            "reconciliationGapCount",
+        ] {
             if let Some(count) = batch[field].as_u64() {
-                ensure!(count <= 4096,"Native batch activity exceeded the approved instance bound");
+                ensure!(
+                    count <= 4096,
+                    "Native batch activity exceeded the approved instance bound"
+                );
                 summary[field] = json!(count);
             }
         }
         if let Some(jobs) = batch["jobCount"].as_u64() {
-            ensure!(jobs <= 32,"Native batch job count exceeded its bound");
+            ensure!(jobs <= 32, "Native batch job count exceeded its bound");
             summary["jobCount"] = json!(jobs);
         }
-        for field in ["closeBlocked","reconciliationRequired","requiresNativeReattachment","previewOnly"] {
-            if let Some(flag) = batch[field].as_bool() { summary[field] = json!(flag); }
+        for field in [
+            "closeBlocked",
+            "reconciliationRequired",
+            "requiresNativeReattachment",
+            "previewOnly",
+        ] {
+            if let Some(flag) = batch[field].as_bool() {
+                summary[field] = json!(flag);
+            }
         }
         if let Some(progress) = batch["progress"].as_array() {
-            ensure!(progress.len() <= 64,"Native batch progress exceeded its phase bound");
+            ensure!(
+                progress.len() <= 64,
+                "Native batch progress exceeded its phase bound"
+            );
             let mut phases = Vec::with_capacity(progress.len());
             for row in progress {
-                let phase = text(row,"phase",128)?;
-                let unit = text(row,"unit",32)?;
-                ensure!(matches!(unit,"bytes" | "files" | "items"),"Native batch progress has an unknown unit");
-                let completed = row["completed"].as_u64()
-                    .ok_or_else(||anyhow::anyhow!("Native batch progress completion is missing"))?;
-                let total = if row["total"].is_null() { None } else {
-                    Some(row["total"].as_u64().ok_or_else(||anyhow::anyhow!("Native batch progress total is invalid"))?)
-                };
-                let mut item = json!({"phase":phase,"unit":unit,"completed":completed,"total":total});
+                let phase = text(row, "phase", 128)?;
+                let unit = text(row, "unit", 32)?;
+                ensure!(
+                    matches!(unit, "bytes" | "files" | "items"),
+                    "Native batch progress has an unknown unit"
+                );
+                let completed = row["completed"].as_u64().ok_or_else(|| {
+                    anyhow::anyhow!("Native batch progress completion is missing")
+                })?;
+                let total =
+                    if row["total"].is_null() {
+                        None
+                    } else {
+                        Some(row["total"].as_u64().ok_or_else(|| {
+                            anyhow::anyhow!("Native batch progress total is invalid")
+                        })?)
+                    };
+                let mut item =
+                    json!({"phase":phase,"unit":unit,"completed":completed,"total":total});
                 if let Some(children) = row["reportingChildren"].as_u64() {
-                    ensure!(children <= 4096,"Native progress child count exceeded its bound");
+                    ensure!(
+                        children <= 4096,
+                        "Native progress child count exceeded its bound"
+                    );
                     item["reportingChildren"] = json!(children);
                 }
                 phases.push(item);
@@ -731,7 +770,10 @@ pub fn files(value: &Value, requested_limit: usize) -> Result<Value> {
         let path = text(entry, "path", 32_768)?;
         ensure!(
             !path.starts_with('/')
-                && !path.contains(['\\', '\0'])
+                // Display source-native names exactly. A backslash may be a
+                // literal Unix filename, never a separator to normalize here.
+                // Restore target compatibility is checked by the native plan.
+                && !path.contains('\0')
                 && path
                     .split('/')
                     .all(|p| !p.is_empty() && p != "." && p != ".."),

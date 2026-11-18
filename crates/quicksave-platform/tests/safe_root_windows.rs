@@ -270,6 +270,53 @@ fn ordinary_live_writers_are_not_treated_as_stable_timestamp_proofs() -> Result<
 }
 
 #[test]
+fn directory_identity_approval_never_opens_an_exclusively_held_payload() -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-directory-approval-")
+        .tempdir()?;
+    let selected_path = temp.path().join("selected");
+    let protected_path = temp.path().join("protected");
+    fs::create_dir_all(selected_path.join("nested"))?;
+    fs::create_dir_all(protected_path.join("nested"))?;
+    fs::write(selected_path.join("payload"), b"synthetic locked payload")?;
+    let _exclusive = fs::OpenOptions::new()
+        .write(true)
+        .share_mode(0)
+        .open(selected_path.join("payload"))?;
+    let selected = SafeRoot::open(&selected_path)?;
+    let protected = SafeRoot::open(&protected_path)?;
+    assert!(!selected.overlaps_directory_identities(&protected)?);
+    assert!(!protected.overlaps_directory_identities(&selected)?);
+    assert!(selected.read_file("payload").is_err());
+    Ok(())
+}
+
+#[test]
+fn escaping_native_symlink_does_not_become_directory_overlap_or_capture_permission() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-directory-links-")
+        .tempdir()?;
+    let selected_path = temp.path().join("selected");
+    let protected_path = temp.path().join("protected");
+    fs::create_dir(&selected_path)?;
+    fs::create_dir(&protected_path)?;
+    match std::os::windows::fs::symlink_dir(&protected_path, selected_path.join("escape")) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(1314) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let selected = SafeRoot::open(&selected_path)?;
+    let protected = SafeRoot::open(&protected_path)?;
+    assert!(!selected.overlaps_directory_identities(&protected)?);
+    assert!(!protected.overlaps_directory_identities(&selected)?);
+    assert!(selected.metadata_entries().is_err());
+    assert!(selected.entries().is_err());
+    assert!(selected.overlaps(&protected).is_err());
+    Ok(())
+}
+
+#[test]
 fn device_names_alternate_streams_and_traversal_are_rejected() -> Result<()> {
     let temp = tempfile::Builder::new()
         .prefix("quicksave-platform-")
@@ -314,6 +361,11 @@ fn native_directory_overlap_and_file_alias_guards_use_native_ids() -> Result<()>
     assert!(!left.same_root(&nested)?);
     assert!(!left.overlaps(&right)?);
     assert!(!right.overlaps(&left)?);
+    assert!(left.overlaps_directory_identities(&same)?);
+    assert!(left.overlaps_directory_identities(&nested)?);
+    assert!(nested.overlaps_directory_identities(&left)?);
+    assert!(!left.overlaps_directory_identities(&right)?);
+    assert!(!right.overlaps_directory_identities(&left)?);
     assert!(!left.same_root(&right)?);
     let (file, stamp) = left.read_file("key")?;
     assert!(left.contains_file_identity(&stamp)?);

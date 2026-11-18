@@ -46,7 +46,7 @@ pub(super) fn link_hints(environment: &Value) -> Result<BTreeMap<(&str, &str), b
         let path = object["relativePath"]
             .as_str()
             .ok_or_else(|| StateError::Integrity("Windows link hint path is missing".into()))?;
-        super::validate_relative(path)?;
+        noland_state_core::validate_windows_relative_path(path)?;
         let directory = object["targetIsDirectory"].as_bool().ok_or_else(|| {
             StateError::Integrity("Windows link kind must be an actual boolean".into())
         })?;
@@ -316,6 +316,9 @@ mod tests {
             json!([{"logicalRoot":"$DOCUMENTS","relativePath":"Game/link"}]),
             json!([{"logicalRoot":"$DOCUMENTS","relativePath":"Game/link","targetIsDirectory":1}]),
             json!([{"logicalRoot":"$DOCUMENTS","relativePath":"../link","targetIsDirectory":false}]),
+            json!([{"logicalRoot":"$DOCUMENTS","relativePath":r"Game/link\literal","targetIsDirectory":false}]),
+            json!([{"logicalRoot":"$DOCUMENTS","relativePath":"Game/link:stream","targetIsDirectory":false}]),
+            json!([{"logicalRoot":"$DOCUMENTS","relativePath":"Game/NUL.txt","targetIsDirectory":false}]),
             json!([{"logicalRoot":"$DOCUMENTS","relativePath":"Game/link","targetIsDirectory":true,"guess":true}]),
             json!([
                 environment["windowsSymlinkMetadata"][0],

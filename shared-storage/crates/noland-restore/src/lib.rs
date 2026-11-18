@@ -927,13 +927,23 @@ impl<'a> RestoreTransaction<'a> {
             let root = match self.resolved_roots.get(&file.logical_root) {
                 Some(root) => root.clone(),
                 None => {
-                    let (root, _) = resolve_destination(self.roots, file)?;
+                    let (root, _) = if self.native.is_some() {
+                        native::resolve_destination(self.roots, file)?
+                    } else {
+                        resolve_destination(self.roots, file)?
+                    };
                     self.resolved_roots
                         .insert(file.logical_root.clone(), root.clone());
                     root
                 }
             };
-            let destination = join_validated(&root, &file.relative_path)?;
+            // New GPL-3.0-only native integration for the audited e81238a fork:
+            // preserve exact Unix filenames without changing legacy joins.
+            let destination = if self.native.is_some() {
+                join_native_relative(&root, &file.relative_path)?
+            } else {
+                join_validated(&root, &file.relative_path)?
+            };
             if !destinations.insert(destination.clone()) {
                 return Err(StateError::Invalid(format!(
                     "multiple manifest entries resolve to {}",

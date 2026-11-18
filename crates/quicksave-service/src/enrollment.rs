@@ -30,6 +30,75 @@ const OWNERSHIP: &[&str] = &[
     "reviewed_exact_product_mapping",
 ];
 
+fn diagnostic_message(diagnostic: &Value) -> &str {
+    fn message(value: &Value) -> Option<&str> {
+        value.as_str().filter(|text| {
+            !text.is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
+        })
+    }
+    message(&diagnostic["message"])
+        .or_else(|| diagnostic["unresolvedReasons"].as_array()
+            .and_then(|reasons| reasons.iter().take(32)
+                .find_map(|reason| message(&reason["message"]))))
+        .unwrap_or("Native ownership, root permissions, or application coverage needs review. No placeholder bundle was created.")
+}
+
+fn project_diagnostics(input: &Value) -> Vec<Value> {
+    fn clean(value: &Value, limit: usize) -> Option<&str> {
+        value.as_str().filter(|text| {
+            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+        })
+    }
+    let mut output = Vec::new();
+    for diagnostic in input.as_array().into_iter().flatten().take(256) {
+        if output.len() == 256 {
+            break;
+        }
+        let mut item = super::boundary::copy_fields(diagnostic, &["appId", "code"]);
+        if let Some(name) = diagnostic
+            .get("displayName")
+            .or_else(|| diagnostic.get("name"))
+            .and_then(|value| clean(value, 512))
+        {
+            item["name"] = json!(name);
+        }
+        item["message"] = json!(diagnostic_message(diagnostic));
+        output.push(item.clone());
+        for root in diagnostic["rootDiagnostics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(48)
+        {
+            if output.len() == 256 {
+                break;
+            }
+            let role = clean(&root["role"], 64).unwrap_or("application");
+            let stage = clean(&root["stage"], 128).unwrap_or("native metadata");
+            let reason = clean(&root["reason"], 1024)
+                .unwrap_or("Native access or root identity could not be verified.");
+            let subject = match clean(&root["inspectionSide"], 32) {
+                Some("protected") => "Protected-folder safety check".to_owned(),
+                Some("both" | "undetermined") => "Folder-overlap safety check".to_owned(),
+                _ => format!("{role} root"),
+            };
+            let mut detail = super::boundary::copy_fields(&item, &["appId", "name"]);
+            detail["code"] = json!("native_root_unavailable");
+            detail["message"] = json!(match clean(&root["relativePath"], 1024) {
+                Some(relative) => format!("{subject}, {stage}: {reason} Entry: {relative}"),
+                None => format!("{subject}, {stage}: {reason}"),
+            });
+            if let Some(path) = clean(&root["path"], 4096) {
+                detail["path"] = json!(path);
+            } else if let Some(path) = clean(&root["protectedRootPath"], 4096) {
+                detail["path"] = json!(path);
+            }
+            output.push(detail);
+        }
+    }
+    output
+}
+
 /// `input` is assembled solely from trusted Rust discovery and the spent native
 /// tracking ticket. This helper is not an IPC dispatcher.
 pub(super) fn materialize(
@@ -245,21 +314,7 @@ impl super::WorkspaceService {
             .max(completed);
         status["completedApps"] = json!(completed);
         status["totalApps"] = json!(total);
-        let diagnostics = status["diagnostics"].as_array().into_iter().flatten().take(256)
-            .map(|diagnostic| {
-                let mut item = super::boundary::copy_fields(diagnostic, &["appId","code"]);
-                if let Some(name) = diagnostic.get("displayName").or_else(|| diagnostic.get("name"))
-                    .and_then(Value::as_str).filter(|name| name.len() <= 512 && !name.chars().any(char::is_control))
-                {
-                    item["name"] = json!(name);
-                }
-                let message = diagnostic.get("message").and_then(Value::as_str)
-                    .filter(|message| !message.is_empty() && message.len() <= 4096
-                        && !message.chars().any(char::is_control))
-                    .unwrap_or("Native ownership, root permissions, or application coverage needs review. No placeholder bundle was created.");
-                item["message"] = json!(message);
-                item
-            }).collect::<Vec<_>>();
+        let diagnostics = project_diagnostics(&status["diagnostics"]);
         status["diagnostics"] = json!(diagnostics);
         Ok(status)
     }
@@ -326,5 +381,86 @@ impl super::WorkspaceService {
         });
         self.remember_task(task)?;
         Ok(json!({"appTracking":self.app_tracking_status()?}))
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_apps_preserve_the_actual_native_reason_instead_of_generic_fallback() {
+        let diagnostic = json!({"displayName":"Synthetic.app","unresolvedReasons":[
+            {"code":"installation_identity_unverified",
+             "message":"App installation is linked, missing, denied or not a real directory."}
+        ]});
+        assert_eq!(
+            diagnostic_message(&diagnostic),
+            "App installation is linked, missing, denied or not a real directory."
+        );
+        assert_eq!(
+            diagnostic_message(&json!({"message":"Explicit native reason"})),
+            "Explicit native reason"
+        );
+    }
+
+    #[test]
+    fn invalid_native_reason_text_is_not_forwarded() {
+        let diagnostic = json!({"message":"bad\nmessage","unresolvedReasons":[
+            {"message":"x".repeat(4097)},{"message":"Bounded native diagnosis"}
+        ]});
+        assert_eq!(diagnostic_message(&diagnostic), "Bounded native diagnosis");
+    }
+
+    #[test]
+    fn protected_policy_failures_are_not_presented_as_an_unreadable_application() {
+        let projected = project_diagnostics(&json!([{
+            "displayName":"Synthetic application","message":"Policy inspection failed",
+            "rootDiagnostics":[{"role":"install","inspectionSide":"protected",
+                "stage":"inspect_policy_overlap","reason":"Permission denied",
+                "path":"/synthetic/protected","selectedRootPath":"/synthetic/app"}],
+        }]));
+        assert_eq!(projected[1]["path"], "/synthetic/protected");
+        assert!(projected[1]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Protected-folder safety check"));
+        assert!(!projected[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("install root"));
+    }
+
+    #[test]
+    fn root_denials_reach_the_ui_with_name_stage_and_approved_path() {
+        let result = project_diagnostics(&json!([{
+            "appId":"native-instance","displayName":"Synthetic",
+            "message":"Independent-root coverage is partial.",
+            "rootDiagnostics":[{"role":"save","stage":"enumerate_metadata",
+                "reason":"Permission denied (os error 13)",
+                "path":"/synthetic/approved","relativePath":"private-directory",
+                "grant":{"mustNeverReachUi":true}}],
+        }]));
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1]["name"], "Synthetic");
+        assert_eq!(result[1]["path"], "/synthetic/approved");
+        assert!(result[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("enumerate_metadata"));
+        assert!(result[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("private-directory"));
+        assert!(result[1].get("grant").is_none());
+        let oversized = project_diagnostics(&json!(vec![
+            json!({
+                "message":"Synthetic","rootDiagnostics":vec![json!({
+                    "reason":"Denied","path":"/synthetic","role":"save","stage":"metadata",
+                });48],
+            });
+            256
+        ]));
+        assert_eq!(oversized.len(), 256);
     }
 }

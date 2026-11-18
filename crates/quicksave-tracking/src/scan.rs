@@ -2,6 +2,7 @@
 //! Bounded, read-only stable-file capture. This is not an app-atomic snapshot.
 
 use crate::{
+    diagnostics::{InspectionSide, PolicyRootFailure, RootContext, ScopeGrantViolation},
     model::{
         is_secret_component, validate_absolute, validate_relative, ApprovedRoot, BaselineReference,
         NativeMetadata, Node, RootIdentity, Snapshot, TrackedSoftware, TrackingPolicy,
@@ -366,6 +367,33 @@ pub(crate) fn approve_root_identity(
     manual_leaves: bool,
 ) -> Result<RootIdentity> {
     check_policy(path, policy, manual_leaves)?;
+    pin_identity(path)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CandidateScope {
+    Tree,
+    SelectedLeaves,
+}
+
+/// Candidate identity/provenance only, NOT content/index/grant authority.
+/// Every retained normalized root still requires check_policy()'s complete
+/// native anti-alias proof before indexing or granting it.
+pub(crate) fn pin_candidate_identity(
+    path: &Path,
+    policy: &TrackingPolicy,
+    scope: CandidateScope,
+) -> Result<RootIdentity> {
+    check_policy_mode(
+        path,
+        policy,
+        matches!(scope, CandidateScope::SelectedLeaves),
+        false,
+    )?;
+    pin_identity(path)
+}
+
+fn pin_identity(path: &Path) -> Result<RootIdentity> {
     let anchor = anchor::Anchor::open(path)?;
     let safe = SafeRoot::open(path)?;
     anchor.check()?;
@@ -378,6 +406,15 @@ pub(crate) fn check_policy(
     policy: &TrackingPolicy,
     manual_leaves: bool,
 ) -> Result<()> {
+    check_policy_mode(path, policy, manual_leaves, true)
+}
+
+fn check_policy_mode(
+    path: &Path,
+    policy: &TrackingPolicy,
+    manual_leaves: bool,
+    full_audit: bool,
+) -> Result<()> {
     validate_absolute(path)?;
     for component in path.components() {
         if let std::path::Component::Normal(text) = component {
@@ -387,34 +424,88 @@ pub(crate) fn check_policy(
             );
         }
     }
-    let safe = SafeRoot::open(path)?;
-    let anchor = anchor::Anchor::open(path)?;
+    let safe = PolicyRootFailure::new(
+        path,
+        None,
+        InspectionSide::Selected,
+        "pin_policy_selected_root",
+    )
+    .run(policy, || SafeRoot::open(path))?;
+    let anchor = PolicyRootFailure::new(
+        path,
+        None,
+        InspectionSide::Selected,
+        "pin_policy_selected_anchor",
+    )
+    .run(policy, || anchor::Anchor::open(path))?;
     for denied in std::iter::once(&policy.data_dir).chain(policy.excluded_paths.iter()) {
         ensure!(
             !path.starts_with(denied) && (manual_leaves || !denied.starts_with(path)),
-            "selected root overlaps excluded QuickSave/repository/config/key material"
+            ScopeGrantViolation(
+                "selected root overlaps excluded QuickSave/repository/config/key material"
+            )
         );
-        if denied.exists() {
-            if manual_leaves {
-                // No recursive scan of unapproved siblings. The actual selected
-                // leaves are opened as regular files only, never directories.
-                let excluded = anchor::Anchor::open(denied)?;
-                ensure!(
-                    !anchor.inside(&excluded),
-                    "selected native parent is inside an excluded root"
-                );
-                excluded.check()?;
-            } else {
-                let excluded = SafeRoot::open(denied)
-                    .context("excluded path must be a real no-follow directory")?;
-                ensure!(
-                    !safe.overlaps(&excluded)?,
-                    "selected native root aliases an excluded root"
-                );
-            }
+        if manual_leaves || !full_audit {
+            // No recursive scan of unapproved siblings. The actual selected
+            // leaves are opened as regular files only, never directories.
+            let excluded = match PolicyRootFailure::new(
+                path,
+                Some(denied),
+                InspectionSide::Protected,
+                "pin_policy_protected_anchor",
+            )
+            .run(policy, || anchor::Anchor::open(denied))
+            {
+                Ok(excluded) => excluded,
+                Err(error) if is_missing(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            ensure!(
+                !anchor.inside(&excluded) && (manual_leaves || !excluded.inside(&anchor)),
+                ScopeGrantViolation(
+                    "selected native root/parent has a forbidden protected ancestor relationship"
+                )
+            );
+            PolicyRootFailure::new(
+                path,
+                Some(denied),
+                InspectionSide::Protected,
+                "verify_policy_protected_anchor",
+            )
+            .run(policy, || excluded.check())?;
+        } else {
+            let excluded = match PolicyRootFailure::new(
+                path,
+                Some(denied),
+                InspectionSide::Protected,
+                "pin_policy_protected_root",
+            )
+            .run(policy, || SafeRoot::open(denied))
+            {
+                Ok(excluded) => excluded,
+                Err(error) if is_missing(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let overlap = PolicyRootFailure::new(
+                path,
+                Some(denied),
+                InspectionSide::Both,
+                "inspect_policy_overlap",
+            )
+            .run(policy, || safe.overlaps_directory_identities(&excluded))?;
+            ensure!(
+                !overlap,
+                ScopeGrantViolation("selected native root aliases an excluded root")
+            );
         }
     }
-    anchor.check()?;
+    PolicyRootFailure::new(
+        path,
+        None,
+        InspectionSide::Selected,
+        "verify_policy_selected_anchor",
+    )
+    .run(policy, || anchor.check())?;
     Ok(())
 }
 
@@ -462,11 +553,25 @@ pub(crate) fn capture_index(
     let mut tree_entries = Vec::new();
     for root in roots {
         stopped(stop)?;
-        let handle = PinnedRoot::open(root)?;
+        let handle =
+            RootContext::approved(root, None, "pin_root").run(policy, || PinnedRoot::open(root))?;
         if let Some(leaves) = &root.allowed_files {
             for leaf in leaves {
                 stopped(stop)?;
-                match handle.safe.read_file(leaf) {
+                let observed = if hash_content {
+                    RootContext::approved(root, Some(leaf), "open_payload").run(policy, || {
+                        handle
+                            .safe
+                            .read_file(leaf)
+                            .map(|(file, stamp)| (Some(file), stamp))
+                    })
+                } else {
+                    RootContext::approved(root, Some(leaf), "observe_file_metadata")
+                        .run(policy, || {
+                            handle.safe.file_metadata(leaf).map(|stamp| (None, stamp))
+                        })
+                };
+                match observed {
                     Ok(opened) => {
                         add_file(
                             &mut snapshot,
@@ -484,21 +589,25 @@ pub(crate) fn capture_index(
                         )?;
                     }
                     Err(error) if is_missing(&error) => {} // Absence is compared to the baseline.
-                    Err(error) => return Err(error).context("read approved manual file"),
+                    Err(error) => return Err(error),
                 }
             }
             tree_entries.push(None);
         } else {
-            let mut metadata = handle.metadata(None, None)?;
+            let mut metadata = RootContext::approved(root, None, "read_root_metadata")
+                .run(policy, || handle.metadata(None, None))?;
             metadata.retain_read_time(
                 previous.and_then(|snapshot| snapshot.root_metadata.get(&root.id)),
             );
             snapshot.root_metadata.insert(root.id.clone(), metadata);
-            snapshot
-                .root_stamps
-                .insert(root.id.clone(), handle.root_stamp()?);
+            snapshot.root_stamps.insert(
+                root.id.clone(),
+                RootContext::approved(root, None, "read_root_stamp")
+                    .run(policy, || handle.root_stamp())?,
+            );
             counters.fs_walks.fetch_add(1, Ordering::Relaxed);
-            let entries = handle.safe.metadata_entries()?;
+            let entries = RootContext::approved(root, None, "enumerate_metadata")
+                .run(policy, || handle.safe.metadata_entries())?;
             counters
                 .metadata_nodes
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -514,18 +623,28 @@ pub(crate) fn capture_index(
                 );
                 match entry.kind {
                     EntryKind::File => {
-                        let opened = handle.safe.read_file(&entry.relative_path)?;
-                        ensure!(
-                            opened.1 == entry.stamp,
-                            "file changed after native enumeration"
-                        );
+                        let opened = if hash_content {
+                            let (file, stamp) = RootContext::approved(
+                                root,
+                                Some(&entry.relative_path),
+                                "open_payload",
+                            )
+                            .run(policy, || handle.safe.read_file(&entry.relative_path))?;
+                            ensure!(
+                                stamp == entry.stamp,
+                                "file changed after native enumeration"
+                            );
+                            Some(file)
+                        } else {
+                            None
+                        };
                         add_file(
                             &mut snapshot,
                             &mut path_bytes,
                             root,
                             &handle,
                             &entry.relative_path,
-                            opened,
+                            (opened, entry.stamp.clone()),
                             previous,
                             force_hash,
                             hash_content,
@@ -541,14 +660,27 @@ pub(crate) fn capture_index(
                                 .link
                                 .as_ref()
                                 .context("native link lacks target evidence")?;
-                            handle.safe.verify_link(&entry.relative_path, link)?;
+                            RootContext::approved(
+                                root,
+                                Some(&entry.relative_path),
+                                "verify_link_metadata",
+                            )
+                            .run(policy, || {
+                                handle.safe.verify_link(&entry.relative_path, link)
+                            })?;
                             Some(link.clone())
                         } else {
                             ensure!(entry.link.is_none(), "directory has invalid link metadata");
                             None
                         };
-                        let mut metadata =
-                            handle.metadata(Some(&entry.relative_path), Some(&entry.stamp))?;
+                        let mut metadata = RootContext::approved(
+                            root,
+                            Some(&entry.relative_path),
+                            "read_required_metadata",
+                        )
+                        .run(policy, || {
+                            handle.metadata(Some(&entry.relative_path), Some(&entry.stamp))
+                        })?;
                         metadata.retain_read_time(
                             previous
                                 .and_then(|snapshot| {
@@ -586,23 +718,28 @@ pub(crate) fn capture_index(
         stopped(stop)?;
         if let Some(before) = entries {
             counters.fs_walks.fetch_add(1, Ordering::Relaxed);
+            let after = RootContext::approved(root, None, "verify_namespace")
+                .run(policy, || handle.safe.metadata_entries())?;
+            ensure!(after == before, "source tree changed during reconciliation");
+            let metadata = RootContext::approved(root, None, "verify_root_metadata")
+                .run(policy, || handle.metadata(None, None))?;
             ensure!(
-                handle.safe.metadata_entries()? == before,
-                "source tree changed during reconciliation"
-            );
-            ensure!(
-                snapshot.root_metadata.get(&root.id) == Some(&handle.metadata(None, None)?),
+                snapshot.root_metadata.get(&root.id) == Some(&metadata),
                 "source root ownership/permissions changed during reconciliation"
             );
+            let stamp = RootContext::approved(root, None, "verify_root_stamp")
+                .run(policy, || handle.root_stamp())?;
             ensure!(
-                snapshot.root_stamps.get(&root.id) == Some(&handle.root_stamp()?),
+                snapshot.root_stamps.get(&root.id) == Some(&stamp),
                 "source root namespace/timestamps changed during reconciliation"
             );
         } else {
             for leaf in root.allowed_files.as_ref().unwrap() {
                 let id = crate::file_id(&root.id, leaf);
                 if !snapshot.nodes.contains_key(&id) {
-                    match handle.safe.read_file(leaf) {
+                    match RootContext::approved(root, Some(leaf), "verify_absent_manual_metadata")
+                        .run(policy, || handle.safe.file_metadata(leaf))
+                    {
                         Err(error) if is_missing(&error) => {}
                         Err(error) => return Err(error),
                         Ok(_) => bail!("manual file appeared during reconciliation"),
@@ -617,18 +754,23 @@ pub(crate) fn capture_index(
         {
             stopped(stop)?;
             if let Some(link) = &node.link {
-                handle.safe.verify_link(&node.path, link)?;
+                RootContext::approved(root, Some(&node.path), "verify_link_metadata")
+                    .run(policy, || handle.safe.verify_link(&node.path, link))?;
             } else if !node.directory {
                 let stamp = node.stamp.as_ref().context("file stamp is missing")?;
-                handle.safe.verify_file(&node.path, stamp)?;
+                verify_regular(root, handle, &node.path, stamp, hash_content, policy)?;
             }
+            let metadata =
+                RootContext::approved(root, Some(&node.path), "verify_required_metadata")
+                    .run(policy, || {
+                        handle.metadata(Some(&node.path), node.stamp.as_ref())
+                    })?;
             ensure!(
-                node.metadata.as_ref()
-                    == Some(&handle.metadata(Some(&node.path), node.stamp.as_ref())?),
+                node.metadata.as_ref() == Some(&metadata),
                 "source native ownership/permissions changed during reconciliation"
             );
         }
-        handle.check()?;
+        RootContext::approved(root, None, "verify_root_identity").run(policy, || handle.check())?;
     }
     snapshot.validate(roots)?;
     // Establish the serialized-metadata bound before any service can enqueue a
@@ -660,7 +802,7 @@ fn add_file(
     root: &ApprovedRoot,
     handle: &PinnedRoot,
     relative: &str,
-    (mut file, stamp): (File, quicksave_platform::FileStamp),
+    (mut file, stamp): (Option<File>, quicksave_platform::FileStamp),
     previous: Option<&Snapshot>,
     force_hash: bool,
     hash_content: bool,
@@ -683,12 +825,17 @@ fn add_file(
     } else if !hash_content {
         None
     } else {
+        let file = file
+            .as_mut()
+            .context("actual content capture has no readable native file handle")?;
         let mut hash = blake3::Hasher::new();
         let mut buffer = [0_u8; 128 * 1024];
         let mut total = 0_u64;
         loop {
             stopped(stop)?;
-            let read = file.read(&mut buffer)?;
+            let read = file.read(&mut buffer).map_err(|error| {
+                RootContext::approved(root, Some(relative), "read_payload").attach(error.into())
+            })?;
             if read == 0 {
                 break;
             }
@@ -708,9 +855,10 @@ fn add_file(
         counters.files_hashed.fetch_add(1, Ordering::Relaxed);
         Some(hash.finalize().to_hex().to_string())
     };
-    handle.safe.verify_file(relative, &stamp)?;
+    verify_regular(root, handle, relative, &stamp, hash_content, policy)?;
     handle.check()?;
-    let mut metadata = handle.metadata(Some(relative), Some(&stamp))?;
+    let mut metadata = RootContext::approved(root, Some(relative), "read_required_metadata")
+        .run(policy, || handle.metadata(Some(relative), Some(&stamp)))?;
     metadata.retain_read_time(
         previous
             .and_then(|snapshot| snapshot.nodes.get(&id))
@@ -730,12 +878,43 @@ fn add_file(
     Ok(())
 }
 
-fn is_missing(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+fn verify_regular(
+    root: &ApprovedRoot,
+    handle: &PinnedRoot,
+    relative: &str,
+    before: &FileStamp,
+    hash_content: bool,
+    policy: &TrackingPolicy,
+) -> Result<()> {
+    RootContext::approved(
+        root,
+        Some(relative),
+        if hash_content {
+            "verify_payload_stamp"
+        } else {
+            "verify_file_metadata"
+        },
+    )
+    .run(policy, || {
+        if hash_content {
+            handle.safe.verify_file(relative, before)
+        } else {
+            ensure!(
+                handle.safe.file_metadata(relative)? == *before,
+                "native metadata-only file identity/size/write/change stamp changed"
+            );
+            Ok(())
+        }
     })
+}
+
+fn is_missing(error: &anyhow::Error) -> bool {
+    crate::diagnostics::os_error(error) == Some(2)
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
 }
 
 pub(crate) fn save_baseline(

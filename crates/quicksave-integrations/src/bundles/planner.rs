@@ -871,6 +871,14 @@ impl<'a> Planner<'a> {
         }
         for mut installation in installations {
             if let Some(id) = &installation.bundle_id {
+                if protected_mac_bundle(id) {
+                    self.diagnostic(
+                        "protected_application_excluded",
+                        None,
+                        "QuickSave and No Land are excluded from automatic application tracking. No Land import requires its separate read-only consent.",
+                    );
+                    continue;
+                }
                 if ids.get(id).copied().unwrap_or(0) != 1 {
                     self.missing(&mut installation.plan, None, RootClassification::Data, "ambiguous_bundle_identifier",
                         "Multiple installations claim this bundle ID; shared data ownership is refused.");
@@ -950,6 +958,12 @@ impl<'a> Planner<'a> {
             metadata_path: Some(metadata_path.clone()),
             native_identity: Some(document.native_identity.clone()),
         });
+        // Identity metadata is enough to exclude these products. Never inspect
+        // their executable, entitlements or app-data associations for enrollment.
+        if protected_mac_bundle(&id) {
+            result.plan = plan;
+            return result;
+        }
         let Some(executable_name) = metadata.executable_name else {
             self.missing(&mut plan, None, RootClassification::Runtime, "bundle_executable_not_declared",
                 "CFBundleExecutable is absent; an installation bundle is not fabricated from its name.");
@@ -1924,6 +1938,10 @@ fn permission_denied(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+fn protected_mac_bundle(id: &str) -> bool {
+    matches!(id, "com.noland.connect" | "app.quicksave.desktop")
 }
 
 fn exclusion_components() -> Vec<&'static str> {

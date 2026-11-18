@@ -101,6 +101,30 @@ fn tracked(store: &WorkspaceStore, provider: &str) {
     store.seal_tracking_grant("software-1").unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_manual_leaves_keep_exact_native_names_in_the_tracking_grant() {
+    let (_temporary, _vault, store) = fixture();
+    let mut approved = roots("/synthetic/approved");
+    approved[0]["allowedFiles"] = json!(["a:b", "a\\b"]);
+    store
+        .update_software(&json!({
+            "id":"native-names","appId":"test.native.names","name":"Synthetic native names",
+            "tracked":true,"roots":approved,"dirtyGeneration":1,
+        }))
+        .unwrap();
+    store.seal_tracking_grant("native-names").unwrap();
+    assert!(store.verify_tracking_grant("native-names").unwrap());
+    let record = store.software_record("native-names").unwrap();
+    assert_eq!(record["roots"][0]["allowedFiles"], json!(["a:b", "a\\b"]));
+    let mut changed = record["roots"].clone();
+    changed[0]["allowedFiles"] = json!(["a:b", "ab"]);
+    store
+        .update_software(&json!({"id":"native-names","roots":changed}))
+        .unwrap();
+    assert!(!store.verify_tracking_grant("native-names").unwrap());
+}
+
 /// Exact trackingresume::frame_scope / write_frame schema, not an authentic
 /// frame or grant. No signing API, private work file or native vault is used.
 fn pending_work_reference(software: &str, bytes: u64) -> Value {

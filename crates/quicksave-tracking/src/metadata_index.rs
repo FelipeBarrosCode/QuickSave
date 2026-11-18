@@ -126,6 +126,7 @@ impl NativeMetadataIndex {
             "nodeCount": count, "revisionId": self.source.revision_id,
             "metadataIdentity": self.source.snapshot_identity,
             "metadataOnly": true, "fileStateTrust": "VERIFY_REQUIRED",
+            "payloadReadability": "not_established",
             "reconciliationRequired": true, "saved": false,
         });
         model::bounded_serialized(&page, MAX_NATIVE_INDEX_PAGE_BYTES)?;
@@ -322,6 +323,7 @@ impl Tracker {
             "revisionId": source.revision_id, "snapshotIdentity": identity,
             "trackingScopeHash": source.tracking_scope_hash, "nodeCount": snapshot.nodes.len(),
             "metadataOnly": true, "fileStateTrust": "VERIFY_REQUIRED",
+            "payloadReadability": "not_established",
             "reconciliationRequired": true, "coverageTrusted": false,
             "complete": false, "saved": false, "cloudWrite": false,
         });

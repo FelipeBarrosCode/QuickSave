@@ -2142,7 +2142,8 @@ pub fn authority_roots(record: &Value) -> Result<Value> {
                     !leaf.is_empty()
                         && leaf.len() <= 255
                         && !matches!(leaf, "." | "..")
-                        && !leaf.contains(['/', '\\', ':', '\0'])
+                        && !leaf.contains(['/', '\0'])
+                        && (cfg!(unix) || !leaf.contains(['\\', ':']))
                         && !leaf.chars().any(char::is_control)
                         && seen.insert(leaf),
                     "Invalid native manual leaf authority"

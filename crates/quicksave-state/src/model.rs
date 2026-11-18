@@ -301,7 +301,10 @@ impl StateSoftware {
                 for file in files {
                     validate_text(file, 255, "manual file leaf")?;
                     ensure!(
-                        !file.contains(['/', '\\', ':']) && file != "." && file != "..",
+                        !file.contains('/')
+                            && (cfg!(unix) || !file.contains(['\\', ':']))
+                            && file != "."
+                            && file != "..",
                         "manual file allowlist must contain ordinary leaves only"
                     );
                 }

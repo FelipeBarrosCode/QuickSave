@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Result, StateError};
 use crate::identity::AppId;
@@ -102,6 +103,19 @@ impl LogicalPath {
             relative_path: normalize_relative(relative_path.into()),
             source_path_hint: None,
         }
+    }
+
+    /// Native filesystem names are exact signed data, not legacy portable path
+    /// input. In particular, Unix backslashes must never become separators.
+    /// New GPL-3.0-only integration for the audited e81238a source fork.
+    pub fn new_native(logical_root: LogicalRoot, relative_path: impl Into<String>) -> Result<Self> {
+        let relative_path = relative_path.into();
+        validate_native_relative_path(&relative_path)?;
+        Ok(Self {
+            logical_root,
+            relative_path,
+            source_path_hint: None,
+        })
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -312,6 +326,137 @@ pub fn join_validated(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(joined)
 }
 
+// Native filename API: original GPL-3.0-only integration, derived from the
+// audited No Land e81238a path confinement boundary. Legacy functions above,
+// control identifiers, remote object keys and the serialized format are unchanged.
+const NATIVE_PATH_BYTES: usize = 32_768;
+const NATIVE_COMPONENT_BYTES: usize = 255;
+const NATIVE_PATH_DEPTH: usize = 128;
+
+fn validate_unix_component(component: &str) -> Result<()> {
+    if component.is_empty()
+        || matches!(component, "." | "..")
+        || component.len() > NATIVE_COMPONENT_BYTES
+        || component.contains(['/', '\0'])
+        || component.chars().any(char::is_control)
+    {
+        return Err(StateError::UnsafePath(
+            "invalid bounded native filename component".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_windows_component(component: &str) -> Result<()> {
+    validate_unix_component(component)?;
+    // Examine normalized aliases only to reject them; never rename signed data.
+    let alias = component.nfkc().collect::<String>();
+    for name in [component, alias.as_str()] {
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_uppercase();
+        if matches!(name, "." | "..")
+            || name.ends_with(['.', ' '])
+            || name
+                .chars()
+                .any(|c| c.is_control() || r#"/\:<>"|?*"#.contains(c))
+            || matches!(
+                stem.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.chars().count() == 4
+                && stem
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')))
+        {
+            return Err(StateError::UnsafePath(
+                "native filename is incompatible with Windows: device, stream, separator or alias"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_relative_for(relative: &str, windows: bool) -> Result<()> {
+    if relative.is_empty()
+        || relative.len() > NATIVE_PATH_BYTES
+        || relative.starts_with('/')
+        || relative.contains('\0')
+        || relative.split('/').count() > NATIVE_PATH_DEPTH
+    {
+        return Err(StateError::UnsafePath(
+            "invalid bounded native relative path".into(),
+        ));
+    }
+    for component in relative.split('/') {
+        if windows {
+            validate_windows_component(component)?;
+        } else {
+            validate_unix_component(component)?;
+        }
+    }
+    Ok(())
+}
+
+/// Exact UTF-8 Unix filename syntax. Slash alone separates components; colon
+/// and backslash are ordinary data. This performs no I/O or normalization.
+pub fn validate_unix_relative_path(relative: &str) -> Result<()> {
+    validate_native_relative_for(relative, false)
+}
+
+/// Pure Windows target compatibility check, callable on Unix before any target
+/// mutation. Rejects drive/UNC/device/ADS spellings rather than reinterpreting
+/// Unix names. On the wire, slash is the only directory separator.
+pub fn validate_windows_relative_path(relative: &str) -> Result<()> {
+    validate_native_relative_for(relative, true)
+}
+
+pub fn validate_native_component(component: &str) -> Result<()> {
+    #[cfg(windows)]
+    return validate_windows_component(component);
+    #[cfg(unix)]
+    return validate_unix_component(component);
+    #[cfg(not(any(unix, windows)))]
+    Err(StateError::UnsafePath(
+        "native filename rules are unsupported on this platform".into(),
+    ))
+}
+
+pub fn validate_native_relative_path(relative: &str) -> Result<()> {
+    #[cfg(windows)]
+    return validate_windows_relative_path(relative);
+    #[cfg(unix)]
+    return validate_unix_relative_path(relative);
+    #[cfg(not(any(unix, windows)))]
+    Err(StateError::UnsafePath(
+        "native path rules are unsupported on this platform".into(),
+    ))
+}
+
+/// Join exact native dataset names, never replacing backslashes or guessing a
+/// source parent. Native filesystem handles must still enforce no-follow access.
+pub fn join_native_relative(root: &Path, relative: &str) -> Result<PathBuf> {
+    validate_native_relative_path(relative)?;
+    if !root.is_absolute() {
+        return Err(StateError::UnsafePath(
+            "native logical root must be absolute".into(),
+        ));
+    }
+    let joined = root.join(relative);
+    if !joined.starts_with(root) {
+        return Err(StateError::UnsafePath(
+            "native relative target escaped its logical root".into(),
+        ));
+    }
+    Ok(joined)
+}
+
 /// Link text is never followed during capture/publication. Leading parent steps
 /// (e.g. Proton dosdevices/c: -> ../drive_c) may ascend only within the link's
 /// logical root. A parent step after a named component is unsafe: that component
@@ -354,15 +499,64 @@ pub fn validate_symlink_target_within_root(relative_path: &str, target: &str) ->
 /// Native app bundles preserve relative link text only. The original Linux
 /// engine's absolute system-link policy is deliberately NOT native authority.
 /// Nothing resolves or reads the target here.
-pub fn validate_relative_symlink_target_within_root(relative_path: &str, target: &str) -> Result<()> {
-    if target.is_empty() || target.len() > 32_768 || target.starts_with('/')
-        || target.contains(['\\','\0',':']) || target.chars().any(char::is_control)
-        || target.split('/').count() > 128
-        || target.split('/').any(|part| part.is_empty() || part.len() > 255)
+pub fn validate_relative_symlink_target_within_root(
+    relative_path: &str,
+    target: &str,
+) -> Result<()> {
+    validate_native_relative_path(relative_path)?;
+    validate_native_link_for(relative_path, target, cfg!(windows))
+}
+
+/// The same lexical link confinement using Windows target-name rules, without
+/// opening a Windows filesystem or changing original Unix link text.
+pub fn validate_windows_relative_symlink_target_within_root(
+    relative_path: &str,
+    target: &str,
+) -> Result<()> {
+    validate_windows_relative_path(relative_path)?;
+    validate_native_link_for(relative_path, target, true)
+}
+
+fn validate_native_link_for(relative_path: &str, target: &str, windows: bool) -> Result<()> {
+    if target.is_empty()
+        || target.len() > NATIVE_PATH_BYTES
+        || target.starts_with('/')
+        || target.contains('\0')
+        || target.split('/').count() > NATIVE_PATH_DEPTH
     {
-        return Err(StateError::UnsafePath("native symbolic link needs a bounded confined relative target".into()));
+        return Err(StateError::UnsafePath(
+            "native symbolic link needs a bounded confined relative target".into(),
+        ));
     }
-    validate_symlink_target_within_root(relative_path, target)
+    let mut depth = relative_path.split('/').count() - 1;
+    let mut leading = true;
+    for component in target.split('/') {
+        match component {
+            "." => {}
+            ".." if leading && depth > 0 => depth -= 1,
+            ".." => {
+                return Err(StateError::UnsafePath(
+                    "native symbolic link escapes its root or crosses a named traversal edge"
+                        .into(),
+                ))
+            }
+            name => {
+                if windows {
+                    validate_windows_component(name)?;
+                } else {
+                    validate_unix_component(name)?;
+                }
+                leading = false;
+                depth += 1;
+                if depth > NATIVE_PATH_DEPTH {
+                    return Err(StateError::UnsafePath(
+                        "native symbolic link exceeds its depth bound".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -371,13 +565,113 @@ mod tests {
 
     #[test]
     fn native_relative_links_never_inherit_absolute_linux_system_link_permission() {
-        assert!(validate_symlink_target_within_root("link","/usr/lib/libc.so").is_ok());
-        for target in ["/usr/lib/libc.so", "../outside", "C:/outside", r"..\outside",
-            "child/../outside", "a//b", ""] {
-            assert!(validate_relative_symlink_target_within_root("link",target).is_err());
+        assert!(validate_symlink_target_within_root("link", "/usr/lib/libc.so").is_ok());
+        for target in [
+            "/usr/lib/libc.so",
+            "../outside",
+            "child/../outside",
+            "a//b",
+            "",
+        ] {
+            assert!(validate_relative_symlink_target_within_root("link", target).is_err());
         }
-        assert!(validate_relative_symlink_target_within_root("Versions/Current","A").is_ok());
-        assert!(validate_relative_symlink_target_within_root("a/link","../sibling").is_ok());
+        assert!(validate_relative_symlink_target_within_root("Versions/Current", "A").is_ok());
+        assert!(validate_relative_symlink_target_within_root("a/link", "../sibling").is_ok());
+    }
+
+    #[test]
+    fn native_target_rules_preserve_unix_names_and_reject_windows_aliases() {
+        for path in [
+            "com.apple.iMovie:project",
+            r"a\b",
+            r"directory:one\literal/child:two",
+            r"C:\one-native-unix-filename",
+            "C:relative",
+        ] {
+            validate_unix_relative_path(path).unwrap();
+            assert!(validate_windows_relative_path(path).is_err(), "{path}");
+        }
+        for path in [
+            r"\\server\share",
+            r"\??\C:\device",
+            r"..\escape",
+            "C:/outside",
+            "stream:ads",
+            "NUL.txt",
+            "com0",
+            "LPT9.bin",
+            "COM¹",
+            "ｃｏｎ.txt",
+            "trailing.",
+            "trailing ",
+            "bad*name",
+            "bad?name",
+            "fullwidth：stream",
+        ] {
+            assert!(validate_windows_relative_path(path).is_err(), "{path}");
+        }
+        validate_windows_relative_path("safe directory/data.bin").unwrap();
+        for path in [
+            "",
+            "/absolute",
+            "//unc/share",
+            ".",
+            "..",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a/",
+            "nul\0byte",
+        ] {
+            assert!(validate_unix_relative_path(path).is_err(), "{path:?}");
+            assert!(validate_windows_relative_path(path).is_err(), "{path:?}");
+        }
+        for path in ["x".repeat(256), vec!["x"; 129].join("/"), "x".repeat(32769)] {
+            assert!(validate_unix_relative_path(&path).is_err());
+            assert!(validate_windows_relative_path(&path).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_constructor_join_and_json_are_exact_without_changing_legacy_normalization() {
+        let root = LogicalRoot::NolandCustomRoot {
+            id: "control-scope-unchanged".into(),
+        };
+        let literal = LogicalPath::new_native(root.clone(), r"a\b").unwrap();
+        let nested = LogicalPath::new_native(root.clone(), "a/b").unwrap();
+        assert_ne!(literal.relative_path, nested.relative_path);
+        assert_eq!(literal.logical_root.as_token(), root.as_token());
+        let restored: LogicalPath =
+            serde_json::from_slice(&serde_json::to_vec(&literal).unwrap()).unwrap();
+        assert_eq!(restored.relative_path, r"a\b");
+        let base = Path::new("/synthetic-native-no-io");
+        assert_eq!(
+            join_native_relative(base, r"a\b").unwrap(),
+            base.join(r"a\b")
+        );
+        assert_ne!(
+            join_native_relative(base, r"a\b").unwrap(),
+            join_native_relative(base, "a/b").unwrap()
+        );
+        assert_eq!(LogicalPath::new(root, r"a\b").relative_path, "a/b");
+        assert_eq!(join_validated(base, r"a\b").unwrap(), base.join("a/b"));
+        for relative in ["../escape", "/escape", "a/../b", "nul\0byte"] {
+            assert!(LogicalPath::new_native(LogicalRoot::Home, relative).is_err());
+            assert!(join_native_relative(base, relative).is_err());
+        }
+        // Backslash and colon here are filename data, not traversal or a drive.
+        validate_relative_symlink_target_within_root(r"dir:one\literal/link", r"../a\b").unwrap();
+        validate_relative_symlink_target_within_root("link", r"..\one-literal-leaf").unwrap();
+        assert!(
+            validate_windows_relative_symlink_target_within_root("dir/link", r"../a\b").is_err()
+        );
+        assert!(
+            validate_windows_relative_symlink_target_within_root("link", r"C:\outside").is_err()
+        );
+        assert!(
+            validate_relative_symlink_target_within_root("dir/link", r"a\b/../../outside").is_err()
+        );
     }
 
     #[test]

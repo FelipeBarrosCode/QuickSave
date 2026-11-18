@@ -27,7 +27,7 @@ use std::sync::{
 
 use noland_state_core::native_layout::{
     logical_root_map, native_root_layout_mappings, native_root_layouts,
-    validate_native_root_mappings, NativeRootLayouts,
+    validate_native_restore_names, validate_native_root_mappings, NativeRootLayouts,
 };
 use noland_state_core::{
     AppId, BundleManifest, LogicalRootMap, ManifestFile, RestoreMode, Result, StateError,
@@ -42,7 +42,6 @@ use self::journal::{
 
 pub const MAX_NATIVE_RESTORE_METADATA: usize = 512 * 1024 * 1024;
 const MAX_ENTRIES: usize = 250_000;
-const MAX_PATH: usize = 32_768;
 #[cfg(unix)]
 const NATIVE_CONTROL_VERSION: u32 = 1;
 #[cfg(windows)]
@@ -352,6 +351,7 @@ impl NativeRestorePreview {
         conflict_mode: NativeConflictMode,
         mode: RestoreMode,
     ) -> Result<Self> {
+        validate_native_restore_names(manifest)?;
         #[cfg(windows)]
         if manifest
             .files
@@ -460,7 +460,7 @@ impl NativeRestorePreview {
             if !crate::include_file(mode, file) {
                 continue;
             }
-            let (logical_root, destination_path) = crate::resolve_destination(roots, file)?;
+            let (logical_root, destination_path) = resolve_destination(roots, file)?;
             if !logical_root.starts_with(destination) || logical_root == destination {
                 return Err(StateError::UnsafePath(
                     "native logical root is outside the approved destination".into(),
@@ -564,7 +564,8 @@ impl NativeRestorePreview {
                     "native tombstone is outside its approved destination".into(),
                 ));
             }
-            let path = noland_state_core::join_validated(&logical_root, &tombstone.relative_path)?;
+            let path =
+                noland_state_core::join_native_relative(&logical_root, &tombstone.relative_path)?;
             let relative = relative_to(destination, &path)?;
             if !seen.insert(relative.clone()) {
                 return Err(StateError::Integrity(
@@ -741,6 +742,7 @@ impl NativeRestorePreview {
                         "legacy native preview lacks an exact root mapping".into(),
                     )
                 })?;
+            validate_relative(base)?;
             let mapped = self.destination.join(base);
             if roots
                 .insert(entry.logical_root.clone(), mapped.clone())
@@ -820,7 +822,7 @@ impl NativeRestorePreview {
             }
             validate_relative(&entry.relative_path)?;
             validate_relative(&entry.destination_relative)?;
-            let expected = noland_state_core::join_validated(
+            let expected = noland_state_core::join_native_relative(
                 mappings.get(&entry.logical_root).ok_or_else(|| {
                     StateError::Integrity("native preview root mapping missing".into())
                 })?,
@@ -858,6 +860,7 @@ impl NativeRestorePreview {
             ));
         }
         for entry in &self.root_entries {
+            validate_relative(&entry.destination_relative)?;
             if entry.is_scaffold_root()
                 && !self
                     .entries
@@ -903,7 +906,6 @@ impl NativeRestorePreview {
                     "native root-directory metadata widened its mapping".into(),
                 ));
             }
-            validate_relative(&entry.destination_relative)?;
         }
         for entry in self
             .entries
@@ -1255,6 +1257,9 @@ impl NativeRestoreControl {
     }
 
     pub fn validate_payload(&self, manifest: &BundleManifest, mode: RestoreMode) -> Result<()> {
+        // This must precede journal/scaffold writes even on resumed execution.
+        // Target compatibility is independent of the signed source platform.
+        validate_native_restore_names(manifest)?;
         if manifest.app.app_id != self.preview.app_id
             || manifest.bundle_id != self.preview.bundle_id
             || mode != self.preview.mode
@@ -1300,7 +1305,7 @@ impl NativeRestoreControl {
             let destination = if entry.relative_path.is_empty() {
                 base
             } else {
-                noland_state_core::join_validated(&base, &entry.relative_path)?
+                noland_state_core::join_native_relative(&base, &entry.relative_path)?
             };
             let current = root.observe_if_present(&entry.destination_relative)?;
             let expected = self.expected(entry)?;
@@ -3198,24 +3203,30 @@ pub(super) fn is_native_workspace(workspace: &Path) -> bool {
 }
 
 pub(super) fn validate_relative(relative: &str) -> Result<()> {
-    noland_state_core::validate_relative_path(relative)?;
-    if relative.is_empty()
-        || relative.len() > MAX_PATH
-        || relative.contains(['\\', '\0'])
-        || relative.split('/').count() > 128
-        || relative
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == ".." || part.len() > 255)
-    {
-        return Err(StateError::UnsafePath(
-            "noncanonical native restore relative path".into(),
-        ));
-    }
+    noland_state_core::validate_native_relative_path(relative)?;
     #[cfg(windows)]
     for part in relative.split('/') {
         crate::windows::validate_component(part)?;
     }
     Ok(())
+}
+
+/// Native dataset names never pass through the legacy backslash-normalizing
+/// constructor/join. Check target compatibility before invoking Path on them.
+pub(super) fn resolve_destination(
+    roots: &LogicalRootMap,
+    file: &ManifestFile,
+) -> Result<(PathBuf, PathBuf)> {
+    validate_relative(&file.relative_path)?;
+    let logical = file
+        .logical_root_parsed()
+        .ok_or_else(|| StateError::UnsafePath(file.logical_root.clone()))?;
+    let root = roots
+        .resolve(&logical)
+        .ok_or_else(|| StateError::NotFound(format!("logical root {}", file.logical_root)))?;
+    let root = crate::canonicalize_root_if_present(root)?;
+    let destination = noland_state_core::join_native_relative(&root, &file.relative_path)?;
+    Ok((root, destination))
 }
 
 fn path_text(path: &Path) -> Result<String> {

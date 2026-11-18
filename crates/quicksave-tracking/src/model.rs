@@ -36,6 +36,8 @@ pub struct TrackingPolicy {
     pub supports_metadata_snapshots: bool,
     pub max_file_bytes: u64,
     pub(crate) clock: Option<Arc<dyn TrackingClock>>,
+    #[cfg(test)]
+    pub(crate) faults: crate::diagnostics::Faults,
 }
 
 impl TrackingPolicy {
@@ -49,6 +51,8 @@ impl TrackingPolicy {
             supports_metadata_snapshots: false,
             max_file_bytes: 1024 * 1024 * 1024 * 1024,
             clock: None,
+            #[cfg(test)]
+            faults: crate::diagnostics::Faults::default(),
         }
     }
 
@@ -734,6 +738,9 @@ impl TrackedSoftware {
             "unknownGeneration": self.unknown_generation,
             "lastConfirmedUploadedGeneration": self.last_confirmed_uploaded_generation,
             "appRunning": self.app_running,
+            "payloadReadability": "not_established",
+            "fullScopeCaptureBlocked": self.auto_enrollment.as_ref()
+                .is_some_and(crate::bundle::AutoEnrollment::has_failed_roots),
             "bundle": self.bundle_index_source.as_ref().map(|source| source.sanitized())
         })
     }
@@ -789,7 +796,9 @@ pub(crate) fn validate_relative(path: &str) -> Result<()> {
         !path.is_empty() && path.len() <= 32_768,
         "invalid relative path length"
     );
-    ensure!(!path.contains(['\\', '\0', ':']), "invalid relative path");
+    ensure!(!path.contains('\0'), "invalid relative path");
+    #[cfg(not(unix))]
+    ensure!(!path.contains(['\\', ':']), "invalid Windows relative path");
     ensure!(
         path.split('/').count() <= 128,
         "relative path exceeds depth bound"
@@ -814,8 +823,13 @@ pub(crate) fn validate_link_target(relative: &str, target: &str) -> Result<()> {
         !target.is_empty()
             && target.len() <= 32_768
             && !target.starts_with('/')
-            && !target.contains(['\\', '\0', ':']),
+            && !target.contains('\0'),
         "invalid confined relative link target"
+    );
+    #[cfg(not(unix))]
+    ensure!(
+        !target.contains(['\\', ':']),
+        "invalid Windows relative link target"
     );
     let mut depth = relative.split('/').count() - 1;
     for (index, component) in target.split('/').enumerate() {
@@ -939,4 +953,54 @@ pub(crate) fn serialized_size<T: Serialize + ?Sized>(value: &T, max: u64) -> Res
     let mut counter = Counter { written: 0, max };
     serde_json::to_writer(&mut counter, value)?;
     Ok(counter.written)
+}
+
+#[cfg(test)]
+mod relative_path_tests {
+    use super::*;
+
+    #[test]
+    fn native_relative_paths_still_reject_traversal_and_invalid_components() {
+        for bad in [
+            "",
+            "/absolute",
+            "../up",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a/",
+            "a\0b",
+            "a\nb",
+        ] {
+            assert!(validate_relative(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(validate_link_target("link", "/absolute").is_err());
+        assert!(validate_link_target("link", "../outside").is_err());
+        assert!(validate_link_target("dir/link", "../../outside").is_err());
+        assert!(validate_link_target("dir/link", "../inside").is_ok());
+    }
+
+    #[test]
+    fn native_punctuation_is_not_normalized_into_other_logical_paths() {
+        for path in ["literal:leaf", "literal\\leaf", "dir:one/literal\\leaf"] {
+            #[cfg(unix)]
+            {
+                assert!(validate_relative(path).is_ok(), "{path}");
+                assert!(validate_link_target("dir/link", path).is_ok(), "{path}");
+            }
+            #[cfg(not(unix))]
+            {
+                assert!(validate_relative(path).is_err(), "{path}");
+                assert!(validate_link_target("dir/link", path).is_err(), "{path}");
+            }
+        }
+        assert_ne!(
+            file_id("root", "literal\\leaf"),
+            file_id("root", "literal/leaf")
+        );
+        assert_ne!(
+            file_id("root", "literal:leaf"),
+            file_id("root", "literal/leaf")
+        );
+    }
 }

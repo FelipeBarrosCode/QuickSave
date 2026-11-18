@@ -312,13 +312,7 @@ fn completion_inspection_retains_plaintext_links_foreign_slots_and_tampered_jour
 #[test]
 fn native_preview_rejects_absolute_linux_links_and_escaping_relative_targets() {
     let fixture = Fixture::new();
-    for target in [
-        "/usr/lib/libc.so",
-        "../outside",
-        "C:/outside",
-        r"..\outside",
-        "child/../outside",
-    ] {
+    for target in ["/usr/lib/libc.so", "../outside", "child/../outside"] {
         let mut link = file("link", b"");
         link.file_type = "symlink".into();
         link.chunks.clear();
@@ -337,6 +331,107 @@ fn native_preview_rejects_absolute_linux_links_and_escaping_relative_targets() {
             "{target}"
         );
     }
+}
+
+#[test]
+fn native_preview_preserves_unix_filename_and_link_bytes_in_json_and_mac_input() {
+    let fixture = Fixture::new();
+    let mut literal = file(r"a\b", b"literal");
+    let nested = file("a/b", b"nested");
+    let mut directory = file("a", b"");
+    directory.file_type = "directory".into();
+    directory.file_hash.clear();
+    directory.chunks.clear();
+    let mut link = file(r"link:one\literal", b"");
+    link.file_type = "symlink".into();
+    link.chunks.clear();
+    link.symlink_target = Some(r"a\b".into());
+    let plan = fixture.plan(vec![literal.clone(), directory, nested, link]);
+    let preview = NativeRestorePreview::prepare(
+        Uuid::new_v4(),
+        &plan.manifest,
+        &fixture.roots,
+        &fixture.destination,
+        filesystem::file_id(&fs::metadata(&fixture.destination).unwrap()),
+        NativeConflictMode::CreateOnly,
+    )
+    .unwrap();
+    let exact = preview
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == r"a\b")
+        .unwrap();
+    assert_eq!(exact.destination_relative, r"application-data/a\b");
+    assert!(preview
+        .entries
+        .iter()
+        .any(|entry| entry.destination_relative == "application-data/a/b"));
+    let bytes = serde_json::to_vec(&preview).unwrap();
+    let decoded: NativeRestorePreview = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, preview);
+    decoded.validate_shape().unwrap();
+    let authority = TestAuthority([73; 32]);
+    let mac = authority.mac(&bytes).unwrap();
+    assert_eq!(
+        authority
+            .mac(&serde_json::to_vec(&decoded).unwrap())
+            .unwrap(),
+        mac
+    );
+    let mut rewritten = decoded;
+    rewritten
+        .entries
+        .iter_mut()
+        .find(|entry| entry.relative_path == r"a\b")
+        .unwrap()
+        .relative_path = "a/b".into();
+    assert_ne!(
+        authority
+            .mac(&serde_json::to_vec(&rewritten).unwrap())
+            .unwrap(),
+        mac
+    );
+    assert!(
+        rewritten.validate_shape().is_err(),
+        "normalizing would alias a distinct selected entry"
+    );
+    let digest = payload_digest(&plan.manifest, plan.mode).unwrap();
+    let mut rewritten_manifest = plan.manifest.clone();
+    literal.relative_path = "a/b".into();
+    rewritten_manifest.files[0] = literal;
+    assert_ne!(
+        payload_digest(&rewritten_manifest, plan.mode).unwrap(),
+        digest
+    );
+    assert!(native_layout::validate_windows_restore_names(&plan.manifest).is_err());
+    assert!(fs::read_dir(&fixture.destination).unwrap().next().is_none());
+}
+
+#[test]
+fn native_preview_target_rules_do_not_treat_unix_drive_looking_names_as_windows_paths() {
+    let fixture = Fixture::new();
+    for target in ["C:/relative-directory", r"..\one-literal-leaf"] {
+        let mut link = file("link", b"");
+        link.file_type = "symlink".into();
+        link.chunks.clear();
+        link.symlink_target = Some(target.into());
+        let plan = fixture.plan(vec![link]);
+        native_layout::validate_native_restore_names(&plan.manifest).unwrap();
+        assert!(native_layout::validate_windows_restore_names(&plan.manifest).is_err());
+        fixture.control(&plan, NativeConflictMode::CreateOnly);
+    }
+    // A bad final entry cannot start publication/scaffolding for earlier names.
+    let plan = fixture.plan(vec![file("first-safe-entry", b""), file("../outside", b"")]);
+    assert!(NativeRestorePreview::prepare(
+        Uuid::new_v4(),
+        &plan.manifest,
+        &fixture.roots,
+        &fixture.destination,
+        filesystem::file_id(&fs::metadata(&fixture.destination).unwrap()),
+        NativeConflictMode::CreateOnly,
+    )
+    .is_err());
+    assert!(fs::read_dir(&fixture.destination).unwrap().next().is_none());
 }
 
 #[test]

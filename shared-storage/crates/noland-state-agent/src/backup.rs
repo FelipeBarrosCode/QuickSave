@@ -509,6 +509,7 @@ fn hash_one_file(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_symlink(
     app_id: &AppId,
     path: &Path,
@@ -516,6 +517,7 @@ fn capture_symlink(
     association: &PathAssociation,
     logical: &LogicalPath,
     before: &SourceMetadata,
+    native: bool,
 ) -> Result<(ManifestFile, FileStateRecord)> {
     let anchored = SourcePath::new(path)?;
     let target = anchored.read_link()?;
@@ -525,7 +527,11 @@ fn capture_symlink(
         .to_owned();
     let after = anchored.metadata()?;
     // Share restore's bounded link-text contract; never follow the destination.
-    validate_symlink_target_within_root(&logical.relative_path, &target)?;
+    if native {
+        validate_relative_symlink_target_within_root(&logical.relative_path, &target)?;
+    } else {
+        validate_symlink_target_within_root(&logical.relative_path, &target)?;
+    }
     if !before.is_symlink() || !noland_snapshot::same_file_identity(before, &after) {
         return Err(StateError::Invalid(
             "symlink changed while capturing".into(),
@@ -1614,6 +1620,7 @@ async fn run_backup_inner(
                 &association,
                 &logical,
                 &metadata,
+                agent.config.native_host,
             )?;
             if agent.config.native_host {
                 let after = source.metadata()?;
@@ -3674,6 +3681,7 @@ mod tests {
             &association,
             &logical,
             &SourceMetadata::from(&std::fs::symlink_metadata(&path).unwrap()),
+            false,
         )
         .unwrap();
         let mut roots = LogicalRootMap::from_home(&agent.config.home);

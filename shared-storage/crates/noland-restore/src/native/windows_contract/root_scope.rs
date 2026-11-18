@@ -93,7 +93,7 @@ fn leaves(value: &Value) -> Result<BTreeSet<&str>> {
         let path = row
             .as_str()
             .ok_or_else(|| invalid("manual leaf path is not a string"))?;
-        super::super::validate_relative(path)?;
+        noland_state_core::validate_windows_relative_path(path)?;
         bytes = bytes
             .checked_add(path.len())
             .filter(|bytes| *bytes <= 32 * 1024 * 1024)

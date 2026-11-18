@@ -4,6 +4,69 @@ This is **not a completion/acceptance record**. The binding scope remains
 [FULL-SHARED-STORAGE-CONTRACT.md](FULL-SHARED-STORAGE-CONTRACT.md), including the
 original optimizations. The older workspace-v2/folder preview is not parity.
 
+## Normal-mode macOS follow-up
+
+### Directory-approval correction
+
+A subsequent user refresh localized failures to `approve_directory_identity`.
+That approval had reused strict capture metadata enumeration for overlap checks
+against protected roots. It could reject an unrelated selected app because of
+protected-side file/link metadata or regular-file churn.
+
+The replacement overlap check uses bounded, no-follow directory-identity censuses,
+not payload opens or link-target reads. It still checks shared descendants and
+fails on inaccessible/replaced directories or exhausted limits; disjoint checks
+still inspect both directory trees. This is not an OS-level topology lock or a
+new capture capability. Capture's stricter traversal remains unchanged.
+
+Candidate identities are pinned before root normalization; only retained roots
+receive full anti-alias audits before indexing/grants. Omitted container scaffolding
+remains explicitly partial rather than following links into unrelated home data.
+Final typed failure-side integration passed **297 tests** (67 platform, 116
+service, 114 tracking). Windows platform tests cross-compile; 103 Python tests
+and repository verification also pass. Desktop rebuild passed and the updated
+normal-mode process is PID 75326, with a PID-bound visible-window receipt in
+`artifacts/native-normal-window.json`. The prior exact process received only a
+normal quit request. No permissions, settings or tracking/provider operations
+were changed by the relaunch; live refresh acceptance remains pending.
+
+Real user interaction subsequently reported OS permission denials, a rejected
+native filename in iMovie, and unresolved installation identities. The checkpoint
+below predates this follow-up; these reports are not native workflow acceptance.
+Development investigates them only with isolated synthetic fixtures.
+
+- Metadata-only indexing was requesting payload read access. A new native
+  `SafeRoot::file_metadata` observes full identities/timestamps without payload
+  access; actual capture still requires real readable native handles.
+- POSIX filename handling needs exact native names rather than blanket Windows
+  portability rules or backslash-to-slash normalization. Cross-platform restore
+  must reject incompatible target names before mutation.
+- No Land/QuickSave are now excluded by canonical macOS bundle ID before
+  executable/app-data enrollment. Unresolved apps retain their concrete native
+  reason in the diagnostic projection.
+- Platform regression tests passed **56 tests**; Windows platform tests
+  cross-compile. Integrations passed **52 tests**. The combined follow-up passed
+  **304 tests** (115 service, 108 tracking, 81 state), including five actual-source
+  interoperability cases. Source core/snapshot/restore passed **187 tests** and
+  the optimized pipeline passed **21 regressions**, including exact native-name
+  backup/restore, reuse and additive history. Frontend tests passed **156** and
+  Python tests **103**.
+- Failed scans retain existing baseline/index authority. Initial enrollment may
+  retain complete independently verified roots with explicitly partial coverage;
+  it never omits unknown descendants inside a claimed complete root. Partial
+  coverage cannot advance complete-application heads.
+- Native root diagnostics now survive the service/UI projection with bounded
+  friendly names, failure stage and approved path. The updated desktop build
+  passed and was relaunched in normal mode (PID-bound visible-window receipt:
+  `artifacts/native-normal-window.json`). Only the prior exact QuickSave process
+  received a normal quit request; no force termination, settings reset or
+  permission repair was used. Tests/window visibility are not live-app permission
+  acceptance.
+
+See [macOS tracking diagnostics](MACOS-TRACKING-TROUBLESHOOTING.md). No source
+permission repair, `sudo`, real-app repro, automatic upload, or vault probe is
+part of this investigation.
+
 ## Current validated checkpoint
 
 - **620 Rust workspace tests passed**, two opt-in tests ignored.
