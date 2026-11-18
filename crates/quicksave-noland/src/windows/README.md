@@ -38,7 +38,7 @@ Public engine methods retain the original Unix bridge signatures:
 `upload_guarded`, `retry_guarded`, `verify_capture_completion`,
 `preview_restore`, `restore_preview_scope`, `download_guarded`,
 `restore_recovery_scope`, `restore_recovery_available`, `recover_restore_local`,
-`retry_restore_guarded`, `preview_delete`, `delete`, `status`, `recent`, `cancel`,
+`retry_restore_guarded`, `preview_delete`, `delete`, `delete_guarded`, `status`, `recent`, `cancel`,
 `retry`, `reattach`. Unguarded `download` explicitly rejects missing frozen
 preview/consent instead of using a separate create-only fallback.
 `shutdown` additionally drains and joins native work.
@@ -236,6 +236,21 @@ that actual permission failure rather than inventing a safe concurrent restore.
   requires explicit reconciliation, not a Saved fallback. This method never
   calls `mark_saved`; confirming older immutable bytes cannot clean newer local
   mutations. A cached proof still requires fresh current grant/revocation checks.
+* `preview_delete` projects the actual frozen Source `FullDeletionPlan` through
+  shared `deletion_projection` with the original selection. `dependentBundles`
+  is an exact `{id,appId,commitId}` array, `affectedBundles` contains the original
+  shared target identities, and `planDigest` binds the complete Source plan.
+  More than 256 affected targets fails explicit native review, never truncates.
+  Service's native ticket binds that exact preview and the separate dependency
+  acknowledgement. `delete_guarded(access, selection, PublishGuard)` checks its
+  native guard before consuming the preview/admitting work; expiry, original
+  provider/account/root/repository key/revision and identities/digest must match.
+  Spend only reprojects the retained plan; it never recomputes a larger closure.
+  The same guard goes through `Some(guard)` into the existing owned session and
+  `CheckedProvider` mutation checks. Unguarded `delete` and unguarded deletion
+  retry/worker entry fail; global provider write policy is not deletion consent.
+  Execution is still `execute_full_deletion_observed` with its original fresh
+  inventory validation, not a new deletion algorithm or automatic retirement.
 * A nonblocking native `LockFileEx` owner and scoped repository admission fence
   join all actual work before shutdown. Prepared plans have both No Land envelope
   authentication and a separate workspace device-HMAC receipt.
@@ -285,6 +300,10 @@ authenticated pending plans, unknown versus device-bound requested scope,
 revision changes, paging and aggregate cache bounds. `restore_tests.rs` adds exact
 acknowledgement/ticket/digest/full-ID tests and a helper/provider/key-free local
 scope/recovery fixture, including missing existing device authority.
+`deletion_tests.rs` builds a real shared-pack dependency plan with Source APIs
+over isolated LocalStorage and checks exact identity/digest/ack projection,
+provider/key/revision changes, expiry, review bounds and fail-closed unguarded
+admission/retry. It never runs deletion or a helper; these fixtures are unexecuted.
 Disk fixtures cover existing/missing descendants, real volume identity, existing
 file parents, aggregate same-volume requests and invalid/remote path rejection.
 The reparse fixture is explicitly ignored unless native symlink privilege /

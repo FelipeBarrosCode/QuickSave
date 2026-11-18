@@ -31,7 +31,9 @@ pub(super) fn projection(
     requested: &[DeletionSelection],
 ) -> Result<FrozenFullDeletionPlan> {
     let frozen = catalog_control::deletion_projection(plan, Some(requested))?;
-    let dependencies = frozen.dependencies.as_ref()
+    let dependencies = frozen
+        .dependencies
+        .as_ref()
         .context("original deletion dependency identities are unavailable")?;
     ensure!(
         frozen.targets.len() <= MAX_REVIEW_TARGETS && dependencies.len() <= MAX_REVIEW_TARGETS,
@@ -41,11 +43,16 @@ pub(super) fn projection(
 }
 
 fn dependency_items(frozen: &FrozenFullDeletionPlan) -> Result<Value> {
-    let dependencies = frozen.dependencies.as_ref()
+    let dependencies = frozen
+        .dependencies
+        .as_ref()
         .context("original deletion dependency identities are unavailable")?;
-    Ok(json!(dependencies.iter().map(|target| json!({
-        "id":target.bundle_id,"appId":target.app_id,"commitId":target.commit_id,
-    })).collect::<Vec<_>>()))
+    Ok(json!(dependencies
+        .iter()
+        .map(|target| json!({
+            "id":target.bundle_id,"appId":target.app_id,"commitId":target.commit_id,
+        }))
+        .collect::<Vec<_>>()))
 }
 
 pub(super) fn summary(
@@ -77,35 +84,58 @@ pub(super) fn check_preview(
         preview.created.elapsed() < Duration::from_secs(600)
             && preview.provider == access.provider
             && preview.storage == storage_binding(access)?
-            && selection["previewId"].as_str().and_then(|id| Uuid::parse_str(id).ok())
+            && selection["previewId"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
                 == Some(preview.plan.plan_id),
         "deletion preview expired or provider/account/root/key/authority changed"
     );
-    let requested = preview.frozen.requested.as_ref()
+    let requested = preview
+        .frozen
+        .requested
+        .as_ref()
         .context("original native deletion selection is unavailable")?
-        .iter().map(|target| DeletionSelection {
-            app_id:target.app_id.clone(),bundle_id:target.bundle_id.clone(),
-        }).collect::<Vec<_>>();
+        .iter()
+        .map(|target| DeletionSelection {
+            app_id: target.app_id.clone(),
+            bundle_id: target.bundle_id.clone(),
+        })
+        .collect::<Vec<_>>();
     // Pure projection of the SAME held Source plan, never a new inventory or
     // dependency-closure computation after native approval.
     ensure!(
-        projection(&preview.plan,&requested)? == preview.frozen,
+        projection(&preview.plan, &requested)? == preview.frozen,
         "original frozen deletion identities/digest changed; preview again"
     );
     ensure!(
-        selection.get("providerId").is_none_or(|value| value == &json!(preview.provider))
-            && selection.get("planDigest").is_none_or(|value| value == &json!(preview.frozen.digest))
-            && selection.get("affectedBundles").is_none_or(|value| value == &json!(preview.frozen.targets))
-            && selection.get("dependentBundles").is_none_or(|value|
-                dependency_items(&preview.frozen).is_ok_and(|expected| *value == expected)),
+        selection
+            .get("providerId")
+            .is_none_or(|value| value == &json!(preview.provider))
+            && selection
+                .get("planDigest")
+                .is_none_or(|value| value == &json!(preview.frozen.digest))
+            && selection
+                .get("affectedBundles")
+                .is_none_or(|value| value == &json!(preview.frozen.targets))
+            && selection
+                .get("dependentBundles")
+                .is_none_or(|value| dependency_items(&preview.frozen)
+                    .is_ok_and(|expected| *value == expected)),
         "incoming deletion acknowledgement differs from the exact original native preview"
     );
     let ack = match selection.get("acknowledgeDependencies") {
         None => false,
-        Some(value) => value.as_bool().context("dependency acknowledgement must be a boolean")?,
+        Some(value) => value
+            .as_bool()
+            .context("dependency acknowledgement must be a boolean")?,
     };
     ensure!(
-        preview.frozen.dependencies.as_ref().is_some_and(|dependencies| dependencies.is_empty()) || ack,
+        preview
+            .frozen
+            .dependencies
+            .as_ref()
+            .is_some_and(|dependencies| dependencies.is_empty())
+            || ack,
         "dependent backups require separate explicit acknowledgement of the original native plan"
     );
     // Consent itself is the caller's native PublishGuard/NativeTicket, NOT this

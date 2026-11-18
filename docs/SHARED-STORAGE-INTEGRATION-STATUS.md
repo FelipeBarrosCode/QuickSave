@@ -8,9 +8,12 @@ original optimizations. The older workspace-v2/folder preview is not parity.
 
 - **620 Rust workspace tests passed**, two opt-in tests ignored.
   Log: `artifacts/native-workspace-tests.log`.
-- **449 shared-library tests passed**: 32 CAS, 12 pack, 132 restore,
+- **449 tests passed in the combined shared-library run**: 32 CAS, 12 pack, 132 restore,
   8 snapshot, 40 core and 225 storage; eight opt-in tests ignored.
   Log: `artifacts/native-shared-libraries-tests.log`.
+  The subsequent restore rerun passed **133 tests**, including the exact
+  three-namespace Windows manual-leaf metadata contract, with three opt-in
+  workloads ignored (`artifacts/native-restore-tests.log`).
 - **20 actual-source pipeline regressions passed**; the separate bounded
   64 MiB / 1,000-file benchmark also passed. The latest raw receipt is
   `artifacts/native-shared-storage-benchmark-latest.json`.
@@ -27,6 +30,8 @@ original optimizations. The older workspace-v2/folder preview is not parity.
   `cargo check -p quicksave-service -p quicksave-noland --tests --target x86_64-pc-windows-gnu`.
   This is not native Windows test execution. Linux integration/control target
   compilation also passed; full Linux/native workflow acceptance is separate.
+  A full Linux service target check stopped at bundled SQLite because this host
+  lacks `x86_64-linux-gnu-gcc`; no toolchain download/install was attempted.
 - Repository verification passed: **227 immutable upstream files**, 242 active-
   fork files, 116 recorded deltas, 33 manifests and 13 workspace members. Original
   notices are preserved; owner/license review remains required before distribution.

@@ -984,12 +984,7 @@ impl NativeEngine {
         }];
         let frozen = deletion::projection(&plan, &requested)?;
         let result = deletion::summary(&private.provider, &plan, &frozen)?;
-        catalog::remember_requested(
-            &self.inner,
-            &private,
-            &plan,
-            requested,
-        )?;
+        catalog::remember_requested(&self.inner, &private, &plan, requested)?;
         let storage = deletion::storage_binding(&private)?;
         let mut previews = self.inner.previews.lock().map_err(poison)?;
         previews.clear();
@@ -1031,7 +1026,7 @@ impl NativeEngine {
                 })
             })
             .collect::<Vec<_>>();
-        let mut page = indexed_page(&targets, params, &revision)?;
+        let mut page = indexed_page(&targets, params, revision)?;
         let object = page.as_object_mut().unwrap();
         let targets = object.remove("files").unwrap();
         object.insert("targets".into(), targets);
@@ -1062,29 +1057,39 @@ impl NativeEngine {
         let id = parse_uuid(&selection, "previewId")?;
         {
             let previews = self.inner.previews.lock().map_err(poison)?;
-            let preview = previews.get(&id)
+            let preview = previews
+                .get(&id)
                 .context("deletion preview is unavailable; preview again")?;
-            ensure!(preview.provider == access.provider_id
-                && preview.created.elapsed() < Duration::from_secs(600),
-                "deletion preview expired or provider changed");
+            ensure!(
+                preview.provider == access.provider_id
+                    && preview.created.elapsed() < Duration::from_secs(600),
+                "deletion preview expired or provider changed"
+            );
         }
         let private = self.private_access(&access, Some(id))?;
         let ack = {
             let previews = self.inner.previews.lock().map_err(poison)?;
-            let preview = previews.get(&id)
+            let preview = previews
+                .get(&id)
                 .context("deletion preview is unavailable; preview again")?;
             deletion::check_preview(preview, &private, &selection)?
         };
         // No preview is consumed before the fresh native guard and exact
         // original dependency/digest/provider checks have all succeeded.
         guard()?;
-        let preview = self
-            .inner
-            .previews
-            .lock()
-            .map_err(poison)?
-            .remove(&id)
-            .context("deletion preview is unavailable; preview again")?;
+        let preview = {
+            let mut previews = self.inner.previews.lock().map_err(poison)?;
+            let current = previews
+                .get(&id)
+                .context("deletion preview is unavailable; preview again")?;
+            ensure!(
+                current.created.elapsed() < Duration::from_secs(600),
+                "deletion preview expired before native admission"
+            );
+            previews
+                .remove(&id)
+                .context("deletion preview is unavailable; preview again")?
+        };
         self.submit(
             FrozenPlan {
                 version: 1,

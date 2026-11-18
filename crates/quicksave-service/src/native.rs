@@ -961,7 +961,7 @@ impl ServiceEngine for EngineAdapter {
     fn shutdown<'a>(&'a self) -> NativeFuture<'a, ()> {
         Box::pin(async move { self.0.shutdown().await })
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn delete_guarded<'a>(
         &'a self,
         access: ProviderAccess,
@@ -1029,9 +1029,12 @@ impl ServiceEngine for EngineAdapter {
                 }
                 "catalog" => {
                     #[cfg(windows)]
-                    return self.0.catalog_projection(
-                        &access.ok_or_else(|| anyhow!("Native provider access is required"))?,
-                    ).await;
+                    return self
+                        .0
+                        .catalog_projection(
+                            &access.ok_or_else(|| anyhow!("Native provider access is required"))?,
+                        )
+                        .await;
                     #[cfg(not(windows))]
                     self.0
                         .catalog(
