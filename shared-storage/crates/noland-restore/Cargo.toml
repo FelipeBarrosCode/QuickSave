@@ -1,0 +1,30 @@
+[package]
+name = "noland-restore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+libc = "0.2"
+# Bounded event parsing uses plist's explicitly unstable API. Declare its feature
+# here (not via workspace feature unification), and pin the audited API version.
+plist = { version = "=1.10.4", default-features = false, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
+noland-cas.workspace = true
+noland-crypto.workspace = true
+noland-pack.workspace = true
+noland-rclone-adapter.workspace = true
+noland-snapshot.workspace = true
+noland-state-core.workspace = true
+noland-state-db.workspace = true
+noland-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true

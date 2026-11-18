@@ -152,6 +152,13 @@ impl AppState {
         self.stopping.store(true, Ordering::Release);
         false
     }
+
+    /// A native workspace may discover a just-enqueued autosave while joining
+    /// its own workers. If its shutdown is refused, reopen IPC admission rather
+    /// than leaving a running application permanently stuck in "closing".
+    pub fn resume_after_failed_shutdown(&self) {
+        self.stopping.store(false, Ordering::Release);
+    }
 }
 
 fn manager_path() -> Result<PathBuf, String> {
@@ -232,6 +239,25 @@ where
     .map_err(|_| "Native worker did not finish; no automatic retry was started".to_owned())?
 }
 
+/// Async counterpart for native storage/provider work. The admitted task owns
+/// its lane even when the original IPC future is canceled or the webview reloads.
+pub async fn asynchronous<T>(
+    state: Arc<AppState>,
+    lane: Lane,
+    work: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    let ticket = WorkTicket::acquire(state, lane)?;
+    tokio::spawn(async move {
+        let _ticket = ticket;
+        work.await
+    })
+    .await
+    .map_err(|_| "Native task did not finish; no automatic retry was started".to_owned())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +317,48 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(state.active_workers.load(Ordering::Acquire), 0);
+        assert!(WorkTicket::acquire(state, Lane::Read).is_ok());
+    }
+
+    #[test]
+    fn canceled_async_ipc_keeps_its_lane_until_the_owned_task_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let state = Arc::new(AppState::new());
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let call = tokio::spawn(asynchronous(
+                Arc::clone(&state),
+                Lane::Mutation,
+                async move {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    done_tx.send(()).unwrap();
+                    Ok(())
+                },
+            ));
+            started_rx.await.unwrap();
+            call.abort();
+            assert!(state.prevent_shutdown());
+            assert!(WorkTicket::acquire(Arc::clone(&state), Lane::Mutation).is_err());
+            finish_tx.send(()).unwrap();
+            done_rx.await.unwrap();
+            // This current-thread runtime completes the admitted task and drops
+            // its ticket before waking this receiver.
+            assert_eq!(state.active_workers.load(Ordering::Acquire), 0);
+            assert!(WorkTicket::acquire(state, Lane::Mutation).is_ok());
+        });
+    }
+
+    #[test]
+    fn refused_workspace_shutdown_can_reopen_native_admission() {
+        let state = Arc::new(AppState::new());
+        assert!(!state.prevent_shutdown());
+        assert!(WorkTicket::acquire(Arc::clone(&state), Lane::Read).is_err());
+        state.resume_after_failed_shutdown();
         assert!(WorkTicket::acquire(state, Lane::Read).is_ok());
     }
 }

@@ -6,28 +6,39 @@ QuickSave is a new, standalone native desktop application for Windows, macOS,
 and Linux. It is being extracted from No Land's Shared Storage engine, with
 native platform adapters instead of SSH and remote Linux provisioning.
 
-> **Development preview, not a production release.** The first implemented flow
-> is explicit local-folder backup into a separate encrypted local repository,
-> immutable version history, and verified restore into an empty folder.
-> Cloud transfer, automatic complete-application coverage, overwrite recovery,
-> native credential-vault integration, and a standalone background service must
-> pass their own implementation and acceptance gates before being enabled.
+> **Development preview, not a production release.** The software/provider
+> workspace revision uses **Overview, Backup and Restore**, non-secret
+> `state.json` settings, native vault references and a separate No Land library
+> fork. The binding requirement is the
+> [whole optimized Shared Storage contract](docs/FULL-SHARED-STORAGE-CONTRACT.md).
+> See [current integration status](docs/SHARED-STORAGE-INTEGRATION-STATUS.md) and
+> [optimization evidence](docs/OPTIMIZATIONS-PARITY.md) for measured results and
+> unresolved gates. The older workspace-v2 acceptance record is historical;
+> source integration or provider definitions do not establish full feature parity.
+>
+> The earlier explicit local-folder CLI remains a separate implementation with
+> a **different QuickSave repository/envelope format** and external recovery-key
+> files. Its successful tests do not establish No Land bundle interoperability.
 
-See [the actual implementation status](docs/IMPLEMENTATION-STATUS.md) and
-[the remaining porting plan](docs/PORTING-PLAN.md). A populated capability model
-is not a completed integration.
+The [initial local-engine status](docs/IMPLEMENTATION-STATUS.md) and
+[original porting plan](docs/PORTING-PLAN.md) remain historical context, not
+acceptance of the new workspace revision.
 
 ## Independence and safety
 
 - No Land remains in its original repository and directory. Nothing is moved.
 - `upstream/no-land/` is an attributed, unmodified source reference pinned to
   `e81238a7536aae201540956ce76981364fd36595`.
+- `shared-storage/` is the separate active, provenance-tracked library fork;
+  no provisioning, remote-agent deployment or lifecycle execution is authorized.
 - QuickSave never implicitly connects to existing No Land cloud storage or loads
   No Land credentials, runtime databases, or application state.
-- No source deletion, cloud deletion, automatic version pruning, or arbitrary
-  executable restore hooks are exposed.
-- Native capability reporting distinguishes implemented functionality from
-  planned integrations and unsupported operations.
+- No automatic source deletion, cloud retirement or version pruning is allowed.
+  Workspace-v2 explicit cloud deletion requires a fresh frozen preview, native
+  confirmation and separate dependent-backup acknowledgement.
+- No Land import is an explicit native-consented, read-only source import into
+  QuickSave's own vault. Development/tests never use actual No Land state or
+  live credential stores.
 - A file copy is **not** advertised as an application-consistent snapshot.
 
 ## Repository
@@ -41,6 +52,12 @@ crates/quicksave-engine/      Encrypted repository, snapshot, backup and restore
 crates/quicksave-content/     Bounded chunking, hashing and authenticated encryption
 crates/quicksave-platform/    Native paths, identity and confined filesystem IO
 crates/quicksave-integrations/Read-only discovery and integration capability models
+crates/quicksave-state/       Workspace settings, provider references and native vault boundary
+crates/quicksave-tracking/    Approved software roots, reconciliation and opt-in autosave
+crates/quicksave-observation/ Scoped native process/file-use evidence and uncertainty
+crates/quicksave-noland/      Private native Shared Storage library bridge
+crates/quicksave-service/     Software/provider workspace orchestration
+shared-storage/              Active library fork; no remote deployment
 upstream/                    Pinned source provenance; not a runtime deployment
 docs/                        Architecture, porting plan, support matrix and threats
 scripts/                     Isolated verification and smoke checks
@@ -70,7 +87,15 @@ Linux desktop builds additionally need the documented WebKitGTK/GTK development
 packages. Cross-compilation or a successful macOS test run is not native Windows
 or Linux acceptance.
 
+The desktop exposes only `workspace_query`, `workspace_prepare` and
+`workspace_execute`. Legacy local-repository/discovery commands are not a UI
+fallback; selected filesystem/provider operations require exact native tickets.
+
 ## Explicit CLI workflow
+
+This is the **legacy local format**, not the provider workspace/No Land bundle
+flow. Its external key-file requirement does not describe the normal workspace
+UI, where secret keys remain native.
 
 Use dedicated test directories to begin with. The repository and recovery-key
 parent folders must exist. Paths must not traverse symlinks. On macOS, use
@@ -78,10 +103,10 @@ resolved `/private/...` temporary paths rather than the `/tmp` alias.
 
 On macOS/Linux, an existing repository folder must already be owned by you with
 mode `0700` and without extended ACLs. QuickSave does not change existing folder
-permissions. The CLI can create a missing private repository directory; for the
-GUI, prepare an empty private folder first (for example, `mkdir -m 700
-/absolute/test-repository`). Key files require `0600`, one hard link, and native
-ACL verification. Windows writes remain explicitly unavailable in this preview.
+permissions. The CLI can create a missing private repository directory. Key files
+require `0600`, one hard link, and native ACL verification. These are local CLI
+rules, not a repository/key-file setup form for workspace v2. Windows writes in
+this local engine remain explicitly unavailable in this preview.
 
 ```sh
 quicksave capabilities

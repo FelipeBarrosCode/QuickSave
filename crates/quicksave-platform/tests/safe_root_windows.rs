@@ -2,10 +2,10 @@
 #![cfg(windows)]
 
 use anyhow::Result;
-use quicksave_platform::{ensure_private_directory, SafeRoot};
+use quicksave_platform::{ensure_private_directory, EntryKind, PrivateDirectory, SafeRoot};
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -35,34 +35,202 @@ fn native_handle_reads_and_repeatable_tree_walks() -> Result<()> {
 }
 
 #[test]
-fn unsupported_durable_writes_are_explicit_and_never_run_callback() -> Result<()> {
+fn real_native_directory_handles_revalidate_full_ids_and_pin_names() -> Result<()> {
+    use std::{
+        mem::{size_of, MaybeUninit},
+        os::windows::io::AsRawHandle,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+    fn native_id(file: &std::fs::File) -> Result<FILE_ID_INFO> {
+        let mut info = MaybeUninit::<FILE_ID_INFO>::uninit();
+        anyhow::ensure!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileIdInfo,
+                    info.as_mut_ptr().cast(),
+                    size_of::<FILE_ID_INFO>() as u32,
+                )
+            } != 0,
+            "query real 128-bit directory identity: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(unsafe { info.assume_init() })
+    }
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-directory-")
+        .tempdir()?;
+    fs::create_dir_all(temp.path().join("parent/child"))?;
+    let root = SafeRoot::open(temp.path())?;
+    let directory = root.open_directory("parent/child")?;
+    let before = native_id(&directory)?;
+    let second = native_id(&root.open_directory("parent/child")?)?;
+    assert_eq!(before.VolumeSerialNumber, second.VolumeSerialNumber);
+    assert_eq!(before.FileId.Identifier, second.FileId.Identifier);
+    assert!(fs::rename(
+        temp.path().join("parent/child"),
+        temp.path().join("parent/replaced")
+    )
+    .is_err());
+    assert!(root.open_directory("").is_err());
+    assert!(root.open_directory(".").is_err());
+    let root_handle = native_id(&root.clone_root_directory_handle()?)?;
+    let approved = root.identity()?;
+    assert_eq!(root_handle.VolumeSerialNumber, approved.device);
+    assert_eq!(
+        root_handle.FileId.Identifier[..8],
+        approved.file_id[0].to_le_bytes()
+    );
+    assert_eq!(
+        root_handle.FileId.Identifier[8..],
+        approved.file_id[1].to_le_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn durable_writes_use_a_real_barrier_or_fail_before_the_writer() -> Result<()> {
     let temp = tempfile::Builder::new()
         .prefix("quicksave-platform-")
         .tempdir()?;
     let root = SafeRoot::open(temp.path())?;
     let called = AtomicBool::new(false);
-    assert!(root
-        .write_new("target", |_| {
-            called.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-        .is_err());
-    assert!(!called.load(Ordering::SeqCst));
-    assert!(root.create_dir("directory").is_err());
-    assert!(ensure_private_directory(&temp.path().join("private")).is_err());
-    assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+    let result = root.write_new("target", |file| {
+        called.store(true, Ordering::SeqCst);
+        file.write_all(b"durable native bytes")?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            assert!(called.load(Ordering::SeqCst));
+            assert_eq!(
+                fs::read(temp.path().join("target"))?,
+                b"durable native bytes"
+            );
+            let (file, _) = root.read_file("target")?;
+            quicksave_platform::verify_private_file(&file)?;
+            root.create_dir("directory")?;
+            ensure_private_directory(&temp.path().join("private"))?;
+        }
+        Err(error) => {
+            // A non-elevated Windows runner usually cannot open the real volume
+            // flush handle. Do not mistake that for an implemented flush.
+            assert!(
+                format!("{error:#}").contains("volume flush permission required"),
+                "{error:#}"
+            );
+            assert!(!called.load(Ordering::SeqCst));
+            assert!(fs::symlink_metadata(temp.path().join("target")).is_err());
+            assert_eq!(fs::read_dir(temp.path())?.count(), 0);
+        }
+    }
     assert_eq!(
         quicksave_platform::capabilities()["filesystem"]["durable_create_new"],
-        false
+        true
     );
     assert_eq!(
         quicksave_platform::capabilities()["filesystem"]["private_directory_creation"],
-        false
+        true
     );
     assert_eq!(
         quicksave_platform::capabilities()["filesystem"]["private_file_verification"],
-        false
+        true
     );
+    Ok(())
+}
+
+#[test]
+fn confined_symlinks_are_metadata_and_never_read_through() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-links-")
+        .tempdir()?;
+    fs::write(temp.path().join("target"), b"do not read through")?;
+    let path = temp.path().join("link");
+    match std::os::windows::fs::symlink_file("target", &path) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            // Native privilege denial is explicit and no fixture was created.
+            assert!(fs::symlink_metadata(path).is_err());
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let root = SafeRoot::open(temp.path())?;
+    let link = root.read_link("link")?;
+    assert_eq!(link.target, "target");
+    assert_eq!(link.target_is_directory, Some(false));
+    assert!(root.read_file("link").is_err());
+    assert!(root.entries().is_err());
+    assert_eq!(
+        root.metadata_entries()?
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Symlink)
+            .count(),
+        1
+    );
+    root.verify_link("link", &link)?;
+    fs::remove_file(&path)?;
+    std::os::windows::fs::symlink_file("missing", &path)?;
+    assert!(root.verify_link("link", &link).is_err());
+    Ok(())
+}
+
+#[test]
+fn native_symlink_ancestors_are_not_traversed() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-reparse-")
+        .tempdir()?;
+    fs::create_dir(temp.path().join("actual"))?;
+    fs::write(temp.path().join("actual/file"), b"unapproved traversal")?;
+    match std::os::windows::fs::symlink_dir("actual", temp.path().join("alias")) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(1314) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let root = SafeRoot::open(temp.path())?;
+    assert!(root.read_file("alias/file").is_err());
+    assert!(root.create_dir("alias/new").is_err());
+    assert!(SafeRoot::open(&temp.path().join("alias")).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "native Windows NTFS/ReFS acceptance: requires actual volume flush permission"]
+fn private_state_lock_compare_replace_and_no_overwrite_are_durable() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-config-")
+        .tempdir()?;
+    let path = temp.path().join("private");
+    let private = PrivateDirectory::open(&path)?;
+    let lock = private.lock("state.lock")?;
+    assert!(private.read("state.json", 1024)?.is_none());
+    private.replace("state.json", b"first", None)?;
+    let (bytes, before) = private.read("state.json", 1024)?.unwrap();
+    assert_eq!(bytes, b"first");
+    assert!(private.replace("state.json", b"stale", None).is_err());
+    private.replace("state.json", b"second", Some(&before))?;
+    assert!(private
+        .replace("state.json", b"stale", Some(&before))
+        .is_err());
+    lock.check()?;
+    assert!(fs::rename(path.join("state.lock"), path.join("moved-lock")).is_err());
+    let root = SafeRoot::open(&path)?;
+    assert!(root
+        .write_new("state.json", |_| panic!(
+            "existing target cannot run writer"
+        ))
+        .is_err());
+    assert!(root
+        .write_new("raced", |file| {
+            file.write_all(b"loser")?;
+            fs::write(path.join("raced"), b"winner")?;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(fs::read(path.join("raced"))?, b"winner");
+    private.flush()?;
     Ok(())
 }
 
@@ -81,6 +249,23 @@ fn native_open_handles_pin_source_names_against_replacement() -> Result<()> {
     fs::rename(&source, temp.path().join("moved"))?;
     fs::write(&source, b"replacement")?;
     assert!(root.verify_file("source", &before).is_err());
+    Ok(())
+}
+
+#[test]
+fn ordinary_live_writers_are_not_treated_as_stable_timestamp_proofs() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("quicksave-writer-")
+        .tempdir()?;
+    let path = temp.path().join("source");
+    fs::write(&path, b"mutable")?;
+    let writer = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+    let root = SafeRoot::open(temp.path())?;
+    assert!(root.read_file("source").is_err());
+    // A metadata-only index is not a content-capture receipt.
+    assert_eq!(root.metadata_entries()?.len(), 1);
+    drop(writer);
+    let (_file, _stamp) = root.read_file("source")?;
     Ok(())
 }
 

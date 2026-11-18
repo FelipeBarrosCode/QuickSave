@@ -1,98 +1,144 @@
-# QuickSave desktop interface
+# QuickSave desktop workspace
 
-Original GPL-3.0-only React 18 / TypeScript / Vite 7 frontend. This app is separate
-from No Land and does not load its state or support its repository format.
+Original GPL-3.0-only React / TypeScript frontend. The normal interface has only
+**Overview, Backup, Restore**. Its sage/cream theme is retained without capability
+pages, repository/key-file setup, or large help panels.
 
-## Local commands
-
-Requires Node 20.19+ or 22.12+ and npm. Dependencies are exactly pinned in
-`package.json` and `package-lock.json`.
+## Local checks
 
 ```sh
-npm ci
 npm run typecheck
 npm test
 npm run build
 ```
 
-`npm run dev` serves **only a browser preview** on `127.0.0.1:1420`, with a strict
-port. It does not mock native commands, repositories, keys, or snapshot history.
-To run the desktop app with the parent-owned Rust backend, use `npm run dev:native`
-(or `npm run tauri -- dev`) after installing the relevant Tauri prerequisites.
-`npm run build:native` builds native artifacts; this alone does not establish
-signing, installer, filesystem, or cross-platform acceptance.
+`npm run dev` is a browser-only preview on `127.0.0.1:1420`: native actions are
+disabled, with no mock data or browser storage/network fallback. `dev:native` and
+`build:native` belong to native integration; frontend checks do not establish
+packaging, signing, filesystem safety, or Windows/Linux acceptance.
 
-## Native integration
+## Native interface
 
-- Tauri 2 `@tauri-apps/plugin-dialog` provides folder selection and recovery-key
-  open/save dialogs. No filesystem plugin, key import into JavaScript, network,
-  local-storage persistence, or web upload fallback is used.
-- Base command names and camelCase path fields follow `docs/IMPLEMENTATION-CONTRACT.md`:
-  `get_capabilities`, `get_directories`, `initialize_repository`,
-  `backup_folder`, `list_snapshots`, `restore_snapshot`, `operation_status`.
-  The native-authorization extension below is now required before all four
-  filesystem commands.
-- **Native authorization is mandatory for each filesystem request.** The four
-  wrappers first invoke `authorize_operation` with the exact scope shown below.
-  Rust displays the authoritative native confirmation, pins root proofs, and
-  returns an opaque approval string. Native cancellation/rejection or a malformed
-  approval prevents the filesystem invoke. The UI preview and its complete path
-  summary remain a separate, non-authoritative confirmation.
+`docs/WORKSPACE-V2-CONTRACT.md` defines the camelCase DTOs and three commands:
 
-  | Wrapper | Authorization scope | Filesystem invoke after approval |
-  | --- | --- | --- |
-  | `api.initialize` | `{kind: "initialize", repository, keyFile}` | `initialize_repository({repository, keyFile, approvalId})` |
-  | `api.backup` | `{kind: "backup", repository, keyFile, source}` | `backup_folder({repository, keyFile, source, approvalId})` |
-  | `api.snapshots` | `{kind: "list", repository, keyFile}` | `list_snapshots({repository, keyFile, approvalId})` |
-  | `api.restore` | `{kind: "restore", repository, keyFile, snapshotId, destination}` | `restore_snapshot({repository, keyFile, snapshotId, destination, approvalId})` |
+1. `workspace_query({query, params})` reads sanitized metadata.
+2. `workspace_prepare({action, params})` obtains exact native consent.
+3. `workspace_execute({ticketId})` consumes that one-use ticket only.
 
-  Each call captures only its explicit scope fields before awaiting authorization.
-  Caller mutation or an injected `approvalId` cannot change the approved scope.
-  Approvals must be nonblank strings bounded to 4,096 characters and 4,096 UTF-8
-  bytes, are never exposed in UI state/logs/storage, and are used only once by
-  that call. They are not cached, shared across scopes, or retried. Rust enforces
-  single use, the ten-minute expiry, and its maximum of 32 outstanding approvals.
-  Every subsequent request requires fresh native consent, including the automatic
-  snapshot refresh after a successful backup; the UI does not dismiss native
-  dialogs. Cancelling that refresh does not mark the successful backup failed.
-  Passive `get_capabilities`, `get_directories`, `operation_history`, and
-  `operation_status` calls are unchanged.
-- The parent backend's `operation_history` extension is read on launch. Active
-  jobs resume tracking; interrupted jobs are displayed and never retried
-  automatically. If native history cannot be checked, mutations fail closed until
-  an explicit successful retry.
-- Snapshot responses accept either an array or `{ snapshots: [...] }`, with
-  `snapshotId` / `id`, `createdAt`, `totalFiles` / `files`, and `logicalBytes`.
-  Missing counts display as unknown, not zero. At most 10,000 snapshots are
-  accepted; restore history is paginated.
-- Writes require the native report to confirm local folder backups and safe,
-  durable file/directory and private-directory creation. Unsupported Windows
-  durable writes remain disabled. Read capability is evaluated separately.
-- Backup, restore, and repository creation require confirmation. Native
-  validation remains authoritative for path confinement, identity, external-key
-  placement, repository compatibility, destination emptiness, and overwrite
-  refusal.
-- One mutation is owned at a time, including paused tracking. Polls do not
-  overlap, run every 1.5 seconds, and stop after 600 requests, three consecutive
-  errors, terminal status, or component unmount. Pausing never means a native job
-  was cancelled or failed. The interval is cleared on unmount; late responses
-  cannot update the unmounted UI. Tracking can be explicitly resumed.
-- The interface displays actual running, completed, failed, or interrupted
-  receipts. There is no percentage progress, speculative success, automatic
-  deletion, remote machine control, key reset, or in-place rollback.
+Parameters are captured before consent. Execute cannot replace a root, selected
+file list, destination, provider, or deletion acknowledgement. Tickets are never
+cached, logged, shared, or automatically retried. The backend remains authoritative
+for filesystem identities, confinement, provider verification and all safety.
 
-## Layout and validation boundaries
+- Provider definitions load dynamically when the connection sheet opens.
+  Native definitions are the No Land array (`kind`, `label`, `isOauth`,
+  `credentialType`, fields with `key`, `fieldType`, `required`, `credential`).
+  Manual credentials use its exact `{type, value}` shape; bucket/prefix remain
+  top-level and OAuth client fields are passed to the native OAuth action.
+  Credential fields are private, transient, cleared when submitting, and never
+  stored by the frontend. OAuth is a native action; tokens/keys never return to JS.
+- Import first prepares/executes `discover_noland_import {}`. Its bounded
+  `{candidates:[{id,label,path,modifiedAt?,profileCount?}],selectedId?}` response
+  auto-imports one candidate (or a native-selected ID) using
+  `import_noland {sourceId}`. Only unresolved multiple candidates need a chooser;
+  none is an explicit error. A JSON picker remains under **Advanced import** as
+  `import_noland {stateFile}`. JS never searches or reads the source filesystem.
+- Read-only connections expose a distinct `authorize_provider_writes` action with
+  `{providerId}`. Selecting a provider or enabling autosave never updates the UI
+  optimistically; only returned/refreshed native state can do that.
+- Existing connected/error profiles offer `reauthorize_provider`. OAuth sends
+  only `{providerId}` and reuses the native registered client/browser flow;
+  no token/client replacement fields are exposed. Static providers use only
+  credential fields from that existing kind's native definition, as
+  `{providerId,credentials:{type,value}}`. Bucket, prefix, kind, root, key and
+  client edits are not part of reauthorization. Transient fields are cleared at
+  submission and native errors cannot reflect credentials back into the UI.
+  Imported profiles remain read-only; old autosave approvals are not assumed valid.
+- `export_recovery_key {providerId,destination}` uses the native **Save** dialog
+  to choose a new external private file, followed by a separate native ticket.
+  No key bytes enter the UI. Only a `{written:true,keyMaterialReturned:false}`
+  receipt produces an export notice; existing-file/native failures never cause
+  an overwrite fallback. Export remains available for disconnected profiles.
+- App tracking is opt-in via native consent for `enable_app_tracking` with
+  `{enabled:true,defaultProviderId?,roles:['installation','save','config','runtime']}`.
+  `app_tracking` supplies `{enabled,scanning,completedApps,totalApps,diagnostics?}`;
+  `refresh_app_tracking {}` requests native exact-scope reconciliation. The
+  existing `Software` DTO is retained, with optional actual `roots[]`
+  (`id,path,role?,roles?,fileCount?,logicalBytes?`). Only tracked native inventory
+  renders as rows; untracked metadata and diagnostics never become fake bundles.
+  Expanding a row lazily loads native `software_files`, including actual root
+  IDs/roles. Counts remain unknown when not supplied by native code.
+- Individual transfer IDs never derive from arbitrary path inputs. File pages
+  contain at most 100 rows; replacing pages keeps the DOM bounded. A selection is
+  limited to 512 IDs; discovered software renders 20 rows per page.
+- All-app and selected-app uploads first prepare/execute
+  `preview_upload_all {providerId,softwareIds?}`. **All** omits `softwareIds`:
+  the backend chooses all actual approved instances bound to that provider,
+  irrespective of the UI's filter/page. Selected apps retain at most 512 exact
+  software IDs across display pages. The response requires
+  `{planSetId,providerId,softwareCount,summary?}`; bounded native `sampleNames`,
+  `jobCount`, `selection`, and optional file/byte totals are displayed when known.
+  File/byte totals remain unknown otherwise: roots/identities are frozen, while
+  each original child's metadata capture occurs when it starts. A separate
+  **Upload frozen app set** confirmation sends only `upload_all {planSetId}`.
+  No wildcard, per-row fallback, automatic submission or automatic retry exists.
+- Cloud pages retain original `appId`, bundle/commit/parent/source-instance IDs,
+  `mode`, `completeness`, `captureScopeLabel`, current/per-mode head flags,
+  `readiness`, incremental bytes and deletion-state counts. A complete-mode head,
+  mode label or file count never upgrades partial/unknown coverage into a whole
+  application. Unknown catalog freshness and reconstruction readiness are explicit.
+  **View app history** queries `history {providerId,appId,cursor?,limit:100}`;
+  pending summaries load only when opened through
+  `pending_deletions {providerId,cursor?,limit:100}`. Names/summary counts are not
+  deletion authority, and unknown dependencies stay unknown. Both lists replace
+  pages rather than append; stale-cursor refresh starts from page one. No
+  pending-plan execution/retry capability is invented.
+- Cloud deletion requires an authenticated frozen preview, a separate dependent
+  backup checkbox when needed, then fresh native prepare/execute. A submitted
+  preview cannot be reused from the dialog, even after failure.
+  Service previews use `previewId`, `providerId`, `bundleId`, `appId`,
+  `dependentBundleCount`, bounded `dependentBundles[]`, `items`, `logicalBytes`,
+  `physicalBytes`, and `packCount`. Dependency counts and selected scope are
+  validated before displaying a usable preview.
+- Restore first prepares `preview_restore` with the exact
+  `{providerId,bundleId,appId,destination,fileIds?,mode}` plan; `mode` is
+  `create_new`, `merge`, or `replace`. A usable native response requires
+  `{previewId,files,bytes,conflicts:[{path,reason?}],requiresOverwriteAcknowledgement}`.
+  Optional total `conflictCount` is distinct from the bounded conflict sample;
+  native `blockingConflicts` cannot be resolved by checking overwrite approval.
+  The final `download` contains only
+  `{restorePreviewId,overwriteAcknowledgement}`, through a fresh native ticket.
+  Missing/unsupported preview APIs never fall back to direct downloads. Submitted
+  previews are not reused after failures. `recover_restore` and `retry` send only
+  an original `operationId`, and controls require actual `canRecover`/`canRetry`
+  flags. Historical bundle IDs and optional `sourceBundleId`/`sourceAppId` are
+  preserved, not collapsed into a latest-only row.
+- Activity uses actual native metrics only. Two-second polls are serial and stop
+  after 600 requests or three consecutive failures, with explicit resumption.
+  App-tracking polls are similarly bounded, serial, and stop on native completion.
+  Pausing UI checks never claims that native work stopped.
+- Batch status uses `batch_status {planSetId}` after a native accepted
+  `operationId`, or a native Activity `planSetId` for restart reattachment. Its
+  actual response is an Activity envelope with `operationId`, `planSetId`,
+  capability flags and nullable `batch` containing `softwareCount`, `jobCount`,
+  per-state counts, phase/unit `progress`, and `closeBlocked`. Initial null totals
+  are unknown, not zero. Checks are finite/serial, stop only after native drain,
+  and never query remote catalogs or rebuild selections. Cancel/retry require
+  explicit clicks and send the original native-returned `operationId`.
+  Local `recover_restore` rollback reports are not converted into completed
+  replacement downloads.
 
-Designed for the native window at **1320 × 900** and **880 × 680** minimum.
-Responsive layouts cover roughly 360px through wide desktop widths; keyboard
-navigation, focus-visible controls, a skip link, labelled native pickers,
-screen-reader status/error regions, modal focus trapping, Escape/cancel, and
-reduced-motion preferences are supported.
+The fixed shell has one main vertical scroll with `min-height: 0`; the provider
+sheet has its own stable-gutter content scroll and focus trap. Long paths/names
+truncate within bounded flex/grid cells. Layout supports an 880×680 desktop window
+and a 360px browser viewport without an overall horizontal scroll.
 
-Tests run against isolated in-memory native responses only. They exercise invoke
-arguments and native authorization order/scope/cancellation/token bounds, parsers
-and bounds, capability gating, status polling and cleanup,
-mutation exclusion, interrupted-history recovery, native open/save selection,
-confirmation dialogs, and safe error rendering. They do **not** validate native
-dialogs, native filesystem safety, installers, or Windows/Linux execution.
-Frontend checks do not replace those acceptance tests.
+Tests mock the native gateway; one inventory fixture indexes only newly created,
+isolated temporary roots, never installed apps or user data. They verify command sequence,
+scope capture, malformed/cancelled authorization, privacy, dynamic fields, import,
+read-only grants, non-optimistic autosave, transfer subsets, lazy pagination,
+restore/deletion acknowledgements, finite app tracking, activity polling and scroll CSS. They do not access
+provider accounts, real No Land state, actual vault entries or user file data.
+Source-only cross-boundary tests read the actual synthetic Rust catalog fixtures
+and native projection field names. They do not execute Rust serialization or
+native IPC and do not establish whole-feature, provider, packaging or OS acceptance.

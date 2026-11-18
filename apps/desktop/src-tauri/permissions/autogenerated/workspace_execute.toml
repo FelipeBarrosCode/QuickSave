@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workspace-execute"
+description = "Enables the workspace_execute command without any pre-configured scope."
+commands.allow = ["workspace_execute"]
+
+[[permission]]
+identifier = "deny-workspace-execute"
+description = "Denies the workspace_execute command without any pre-configured scope."
+commands.deny = ["workspace_execute"]

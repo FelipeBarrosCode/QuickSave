@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "QuickSave",
+        "incognito": true,
         "width": 1320,
         "height": 900,
         "minWidth": 880,
@@ -32,7 +33,7 @@
     "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
     "category": "Utility",
     "shortDescription": "Encrypted, versioned backups for your own computer",
-    "longDescription": "QuickSave development preview. Local encrypted folder snapshots and safe empty-destination restore. Cloud integrations and complete installed-application restore are not enabled.",
+    "longDescription": "QuickSave development workspace for tracked software, cloud bundles and opt-in autosave. Native platform, provider and packaging acceptance is incomplete; see the workspace acceptance notes.",
     "createUpdaterArtifacts": false,
     "macOS": {
       "minimumSystemVersion": "11.0"

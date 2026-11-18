@@ -1,5 +1,10 @@
 # Initial implementation status — November 17, 2026
 
+> Historical checkpoint for the first local-backup preview. The software/provider
+> desktop revision has separate implementation and acceptance evidence in
+> [WORKSPACE-V2-ACCEPTANCE.md](WORKSPACE-V2-ACCEPTANCE.md). Do not treat the
+> local-only feature list or old test counts below as the current workspace API.
+
 QuickSave is a separate local Git repository. The No Land desktop, Android,
 iOS and source worktree were not moved, edited, reset, merged or released.
 No production machine, cloud repository, credential store or backup was used.

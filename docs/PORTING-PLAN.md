@@ -1,5 +1,11 @@
 # QuickSave port plan
 
+> **Historical first-slice plan.** Its deliberately reduced local-folder scope
+> is not the user's requested final product. The binding current scope is
+> [FULL-SHARED-STORAGE-CONTRACT.md](FULL-SHARED-STORAGE-CONTRACT.md): the whole
+> native, optimized No Land Shared Storage feature, without discovered-app
+> placeholders or a mandatory manual No Land state-file picker.
+
 This is the durable handoff for a **new, separate** desktop backup application.
 The reference is the local, read-only No Land snapshot recorded in
 [`upstream/SOURCE.json`](../upstream/SOURCE.json), not a running service or an

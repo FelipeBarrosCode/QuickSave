@@ -22,7 +22,9 @@ const paths = {
   file: <><path d="M14 2H4v20h16V8l-6-6Z" /><path d="M14 2v6h6M8 13h8m-8 4h5" /></>,
   lock: <><rect x="4" y="10" width="16" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" /></>,
   sprout: <><path d="M12 21v-9M12 15C4 15 3 9 3 5c7 0 9 4 9 10Zm0-4c0-5 3-8 9-8 0 6-3 9-9 9" /></>,
-  cloud: <><path d="M7 18a5 5 0 1 1 1-9 6 6 0 0 1 12 2 3.5 3.5 0 0 1-1.5 7H7Z" /><path d="m3 3 18 18" /></>,
+  cloud: <path d="M7 18a5 5 0 1 1 1-9 6 6 0 0 1 12 2 3.5 3.5 0 0 1-1.5 7H7Z" />,
+  download: <><path d="M4 16v5h16v-5M12 3v13m-5-5 5 5 5-5" /></>,
+  trash: <><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" /></>,
   external: <><path d="M13 3h8v8m0-8L10 14m-1-9H3v16h16v-6" /></>,
 } satisfies Record<string, React.ReactNode>
 

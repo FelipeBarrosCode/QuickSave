@@ -12,6 +12,7 @@ uuid.workspace = true
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 quicksave-client.workspace = true
 quicksave-platform.workspace = true
+zeroize = "1.8"
 
 [dev-dependencies]
 tempfile.workspace = true

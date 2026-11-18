@@ -8,6 +8,7 @@
 
 pub mod approval;
 pub mod runtime;
+pub mod workspace;
 
 fn message(error: anyhow::Error) -> String {
     format!("{error:#}")

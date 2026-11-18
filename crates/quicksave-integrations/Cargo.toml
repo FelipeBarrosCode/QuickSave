@@ -10,6 +10,7 @@ description = "Read-only application discovery and truthful QuickSave integratio
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+quicksave-platform = { path = "../quicksave-platform" }
 # The bounded event API is upstream's explicitly unstable surface. Restrict its
 # minor version, as recommended by plist, rather than allow silent API changes.
 plist = { version = "~1.10.4", default-features = false, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workspace-query"
+description = "Enables the workspace_query command without any pre-configured scope."
+commands.allow = ["workspace_query"]
+
+[[permission]]
+identifier = "deny-workspace-query"
+description = "Denies the workspace_query command without any pre-configured scope."
+commands.deny = ["workspace_query"]

@@ -1,0 +1,1264 @@
+//! Noland remote state agent: always-on tracking, backup, restore, seal.
+
+pub mod backup;
+mod backup_policy;
+pub mod checkpoint;
+mod cloud_catalog;
+mod collector;
+mod deletion;
+#[cfg(test)]
+mod index_test_support;
+pub mod native_capture;
+mod native_deletion;
+pub mod native_host;
+pub mod observer;
+mod operation_diagnostics;
+pub mod operation_manager;
+pub mod reconcile;
+mod repository;
+pub mod restore;
+pub mod rpc_handler;
+pub mod seal;
+mod session_storage;
+mod storage_scope;
+mod transfer_workload;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::Duration;
+
+use noland_baseline::current_image_id;
+use noland_discovery::{derive_owned_install_root, discover_all, SteamDiscovery};
+use noland_observer::ObserverHub;
+use noland_state_core::metrics::Metrics;
+use noland_state_core::*;
+use noland_state_db::StateDb;
+use parking_lot::Mutex;
+use uuid::Uuid;
+
+pub struct AgentConfig {
+    pub instance_id: Uuid,
+    pub image_id: String,
+    pub paths: AgentPaths,
+    pub home: PathBuf,
+    pub user: String,
+    /// Upstream policy is retained by default. QuickSave explicitly disables
+    /// automatic history convergence; explicit frozen deletion is unchanged.
+    pub converge_complete_backups: bool,
+    /// Explicit approved-root mode: no inferred Linux home/app ownership.
+    pub native_host: bool,
+    pub capture_exclusions: Vec<PathBuf>,
+}
+
+impl AgentConfig {
+    pub fn from_env() -> Self {
+        let state_root = std::env::var("NOLAND_STATE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(constants::STATE_ROOT));
+        let run_root = std::env::var("NOLAND_RUN_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(constants::RUN_ROOT));
+        let home = std::env::var("NOLAND_HOME")
+            .or_else(|_| std::env::var("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/home/gamer"));
+        let instance_id = std::env::var("NOLAND_INSTANCE_ID")
+            .ok()
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        Self {
+            instance_id,
+            image_id: current_image_id(),
+            paths: AgentPaths::from_roots(state_root, run_root),
+            home,
+            user: std::env::var("USER").unwrap_or_else(|_| "gamer".into()),
+            converge_complete_backups: true,
+            native_host: false,
+            capture_exclusions: Vec::new(),
+        }
+    }
+
+    pub fn isolated(root: PathBuf) -> Self {
+        Self {
+            instance_id: Uuid::new_v4(),
+            image_id: "test-image".into(),
+            paths: AgentPaths::from_roots(root.join("state"), root.join("run")),
+            home: root.join("home"),
+            user: "gamer".into(),
+            converge_complete_backups: true,
+            native_host: false,
+            capture_exclusions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct LiveProcessRecovery {
+    pub processes_seen: usize,
+    pub sessions_pruned: usize,
+    pub sessions_recovered: usize,
+    pub open_files_recovered: usize,
+}
+
+pub struct StateAgent {
+    pub config: AgentConfig,
+    pub db: StateDb,
+    pub hub: Arc<ObserverHub>,
+    pub metrics: Arc<Metrics>,
+    pub observer: observer::ObserverSupervisor,
+    pub operations: operation_manager::OperationManager,
+    pub roots: Mutex<LogicalRootMap>,
+    pub steam: Mutex<Option<SteamDiscovery>>,
+    pub master_key: Mutex<Option<noland_crypto::MasterKey>>,
+    pub(crate) native_bindings: Mutex<native_host::NativeBindings>,
+    pub(crate) deletion_plan: Mutex<Option<deletion::DeletionPlan>>,
+    pub(crate) catalog: cloud_catalog::CatalogRefreshes,
+    /// Serializes every collector, including synchronous capture/RefreshIndex
+    /// flushes, and retains only proof-bearing pending attribution facts.
+    pub(crate) collector: Mutex<collector::CollectorState>,
+    pub(crate) collector_started: std::sync::atomic::AtomicBool,
+    /// Fixture-local coalescing age; None retains the real one-second deadline.
+    #[cfg(test)]
+    pub(crate) streaming_partial_builder_age: Option<Duration>,
+}
+
+impl StateAgent {
+    pub fn boot(config: AgentConfig) -> Result<Self> {
+        config.paths.ensure_dirs()?;
+        let db = if config.native_host {
+            StateDb::open_native(&config.paths.db_path)?
+        } else {
+            StateDb::open(&config.paths.db_path)?
+        };
+        let metrics = Metrics::shared();
+        let hub = Arc::new(ObserverHub::new(metrics.clone()));
+        let roots = if config.native_host {
+            LogicalRootMap::default()
+        } else {
+            LogicalRootMap::from_home(&config.home)
+        };
+        Ok(Self {
+            config,
+            db,
+            hub,
+            metrics,
+            observer: observer::ObserverSupervisor::new(),
+            operations: operation_manager::OperationManager::default(),
+            roots: Mutex::new(roots),
+            steam: Mutex::new(None),
+            master_key: Mutex::new(None),
+            native_bindings: Mutex::new(native_host::NativeBindings::default()),
+            deletion_plan: Mutex::new(None),
+            catalog: cloud_catalog::CatalogRefreshes::default(),
+            collector: Mutex::new(collector::CollectorState::default()),
+            collector_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            streaming_partial_builder_age: None,
+        })
+    }
+
+    pub fn recover(&self) -> Result<()> {
+        let integrity = self.db.integrity_check()?;
+        if integrity != "ok" {
+            return Err(StateError::Database(integrity));
+        }
+        // QuickSave native startup must not derive destructive authority from
+        // untrusted crash artifacts. Live guards clean only their pinned session
+        // directory; legacy startup sweeping is not a native recovery protocol.
+        if !self.config.native_host {
+            noland_storage::shred_all_ephemeral_sessions(&self.config.paths.run_root)?;
+        }
+        // A native workspace's unsigned legacy journal is not filesystem
+        // authority. Never replay its allowed_roots/created_paths on boot,
+        // including journals without any corresponding operation record.
+        let restore_recovery = if self.config.native_host {
+            noland_restore::RestoreRecoveryReport::default()
+        } else {
+            noland_restore::recover_interrupted_restores(&self.config.paths)?
+        };
+        for failure in &restore_recovery.failures {
+            tracing::error!(
+                workspace = %failure.workspace.display(),
+                error = %failure.error,
+                "interrupted restore rollback failed; retaining recovery artifacts"
+            );
+        }
+        if !restore_recovery.failures.is_empty() {
+            return Err(StateError::Invalid(format!(
+                "{} interrupted restore(s) could not be recovered; refusing new operations and retaining recovery artifacts",
+                restore_recovery.failures.len()
+            )));
+        }
+        for mut op in self.db.unfinished_operations()? {
+            let journal = self.db.sync_journal_summary(op.operation_id)?;
+            let native_restore = self.config.native_host && op.kind == "restore";
+            let has_retry =
+                matches!(op.kind.as_str(), "backup" | "restore" | "seal") && !native_restore;
+            let resume_mode = if native_restore {
+                "NATIVE_RESTORE_CLEANUP_REQUIRED"
+            } else if journal.completed_items > 0 && op.kind == "backup" {
+                "UPLOAD_JOURNAL"
+            } else {
+                "NEEDS_CLIENT_RESUBMIT"
+            };
+            tracing::warn!(
+                operation_id = %op.operation_id,
+                kind = %op.kind,
+                state = %op.state,
+                resume_mode,
+                completed_journal_items = journal.completed_items,
+                retry_available = has_retry,
+                "unfinished operation after restart; preserving it for retry"
+            );
+            op.state = "INTERRUPTED".into();
+            op.updated_at = chrono::Utc::now();
+            op.last_error = Some(if native_restore {
+                "native restore interrupted; outputs and recovery artifacts are retained; automatic rollback and retry require unsupported identity-verified cleanup".into()
+            } else {
+                "operation interrupted by state-agent restart; retry with a new session or resubmit the original request".into()
+            });
+            crate::operation_diagnostics::retain(self, &mut op)?;
+            if !op.detail_json.is_object() {
+                op.detail_json = serde_json::json!({});
+            }
+            if let Some(fields) = op.detail_json.as_object_mut() {
+                if native_restore {
+                    fields.insert("native_restore_cleanup_required".into(), true.into());
+                }
+                fields.insert(
+                    "resume".into(),
+                    serde_json::json!({
+                        "reason": "agent_restart",
+                        "mode": resume_mode,
+                        "completed_journal_items": journal.completed_items,
+                        "retry_available": has_retry,
+                    }),
+                );
+            }
+            self.db.upsert_operation(&op)?;
+        }
+        self.collector.lock().require_generation_proofs();
+        if !self.config.native_host {
+            for event in noland_observer::bootstrap_from_procfs() {
+                self.hub.inject_process(event);
+            }
+        }
+        // Changes made while the observer was offline cannot be inferred from a
+        // clean dirty-app list or metadata alone (same-size rewrites can occur).
+        for app in self.db.list_apps()? {
+            self.db.mark_dirty(&app.app_id, None, true)?;
+        }
+        Ok(())
+    }
+
+    fn attribution_engine(&self) -> noland_attribution::AttributionEngine<'_> {
+        let roots = self.roots.lock().clone();
+        let steam = self.steam.lock().clone();
+        noland_attribution::AttributionEngine::new(&self.db, roots, self.config.paths.clone())
+            .with_steam_discovery(steam)
+    }
+
+    pub fn discover(&self) -> Result<()> {
+        let _collector = self.collector.lock();
+        self.discover_collected()
+    }
+
+    fn discover_collected(&self) -> Result<()> {
+        if self.config.native_host {
+            // Native registration, not executable basename or Linux discovery,
+            // is the sole source of capture authority.
+            return self.native_validate_all();
+        }
+        let scan = discover_all(&self.config.home);
+        for app in &scan.apps {
+            self.db.upsert_app(app)?;
+            if let Some(root) = derive_owned_install_root(&self.config.home, app) {
+                self.db
+                    .add_known_root(&app.app_id, "install", &root.to_string_lossy())?;
+            }
+            Metrics::inc(&self.metrics.apps_discovered_total);
+        }
+        // Process observation sees paths inside the runtime's mount namespace.
+        // Repair indexed identities without changing their IDs or prior backup history.
+        for mut app in self.db.list_apps()? {
+            if let Some(executable) = app.canonical_executable.as_deref() {
+                if let Some(host_path) =
+                    noland_discovery::resolve_runtime_executable(&self.config.home, executable)
+                {
+                    app.canonical_executable = Some(host_path);
+                    self.db.upsert_app(&app)?;
+                }
+            }
+            if let Some(root) = derive_owned_install_root(&self.config.home, &app) {
+                self.db
+                    .add_known_root(&app.app_id, "install", &root.to_string_lossy())?;
+            }
+        }
+        // Registrations survive process exit. Preserve existing AppIds through
+        // exact source matching; basename normalization cannot authorize a
+        // runtime's private HOME or writable workspace.
+        let existing = self.db.list_apps()?;
+        match noland_discovery::registered_runtime_identities(&self.config.home, &existing) {
+            Ok(apps) => {
+                for app in apps {
+                    self.db.upsert_app(&app)?;
+                    if let Some(source) = app.canonical_executable.as_deref() {
+                        self.db
+                            .require_runtime_binding(&app.app_id, &source.to_string_lossy())?;
+                    }
+                    if let Some(root) = derive_owned_install_root(&self.config.home, &app) {
+                        self.db
+                            .add_known_root(&app.app_id, "install", &root.to_string_lossy())?;
+                    }
+                    Metrics::inc(&self.metrics.apps_discovered_total);
+                }
+            }
+            Err(_) => {
+                // One malformed registration must not stop the observer/RPC
+                // service. Complete capture independently revalidates the
+                // binding and fails closed instead of backing up originals only.
+                tracing::warn!("runtime registration discovery unavailable; private backup bindings require validation");
+            }
+        }
+        *self.steam.lock() = scan.steam.clone();
+        if let Some(steam) = &scan.steam {
+            let mut roots = self.roots.lock();
+            roots.steam_root = Some(steam.root.clone());
+            roots.steam_userdata = Some(steam.root.join("userdata"));
+            for (id, lib) in &steam.libraries {
+                roots.steam_libraries.insert(id.clone(), lib.clone());
+            }
+            for app in &steam.apps {
+                self.db.add_known_root(
+                    &AppId::steam(app.app_id),
+                    "install",
+                    &app.install_dir.to_string_lossy(),
+                )?;
+                if let Some(prefix) = &app.prefix {
+                    // Keep the portable mapping available for explicitly selected saves/config,
+                    // but do not register the generated Proton prefix as an app-wide scan root.
+                    roots.proton_prefixes.insert(app.app_id, prefix.clone());
+                }
+            }
+        }
+        if let Some(steam) = &scan.steam {
+            self.reconcile_completed_steam_installers(steam)?;
+        }
+        for prefix in scan.wine_prefixes {
+            let path = std::fs::canonicalize(&prefix.path).unwrap_or(prefix.path);
+            if let Some(app_id) = &prefix.associated_app {
+                self.db
+                    .add_known_root(app_id, "install", &path.to_string_lossy())?;
+            }
+            self.roots.lock().wine_prefixes.insert(prefix.id, path);
+        }
+        for bottle in scan.bottles {
+            let path = std::fs::canonicalize(&bottle.path).unwrap_or(bottle.path);
+            if let Some(app_id) = &bottle.associated_app {
+                self.db
+                    .add_known_root(app_id, "install", &path.to_string_lossy())?;
+            }
+            self.roots.lock().bottles_prefixes.insert(bottle.id, path);
+        }
+        Ok(())
+    }
+
+    fn reconcile_completed_steam_installers(&self, steam: &SteamDiscovery) -> Result<()> {
+        for transaction in self.db.open_installers()? {
+            if !matches!(
+                transaction.transaction_type,
+                InstallTransactionType::LauncherInstall | InstallTransactionType::LauncherUpdate
+            ) {
+                continue;
+            }
+            let Some(app) = steam
+                .apps
+                .iter()
+                .find(|app| AppId::steam(app.app_id) == transaction.app_id)
+            else {
+                continue;
+            };
+            let staging_roots = transaction
+                .candidate_roots
+                .iter()
+                .filter(|root| {
+                    noland_discovery::classify_observed_path(root).disposition
+                        == noland_discovery::PathDisposition::InstallStagingFile
+                })
+                .collect::<Vec<_>>();
+            let staging_complete = !staging_roots.is_empty()
+                && staging_roots
+                    .into_iter()
+                    .all(|root| staging_root_is_inactive(root));
+            if !app.install_dir.exists() || !staging_complete {
+                continue;
+            }
+
+            self.db.mark_dirty(&transaction.app_id, None, true)?;
+            self.db.mark_dirty_root(
+                &transaction.app_id,
+                &app.install_dir.to_string_lossy(),
+                None,
+                true,
+            )?;
+            let indexed = crate::reconcile::reconcile_install_roots(self, &transaction.app_id)?;
+            noland_attribution::finish_installer(&self.db, &transaction)?;
+            tracing::info!(
+                app_id = %transaction.app_id,
+                transaction_id = %transaction.transaction_id,
+                indexed,
+                "completed launcher install and rebuilt final application index"
+            );
+        }
+        Ok(())
+    }
+
+    /// Rebuilds sessions for live processes missed by the kernel event stream and
+    /// recovers dependency evidence from their currently open regular files.
+    pub fn reconcile_live_processes(&self) -> Result<LiveProcessRecovery> {
+        self.reconcile_live_processes_with_event_count()
+            .map(|(_, recovery)| recovery)
+    }
+
+    pub(crate) fn reconcile_live_processes_with_event_count(
+        &self,
+    ) -> Result<(usize, LiveProcessRecovery)> {
+        // Explicit recovery may take a full watermark. Never let a newer procfs
+        // PID mapping overtake an older queued filesystem/process suffix.
+        let mut collector = self.collector.lock();
+        let processed =
+            collector::process_events_collected(self, &mut collector, usize::MAX, true)?;
+        let recovery = self.reconcile_live_processes_collected(&mut collector)?;
+        Ok((processed, recovery))
+    }
+
+    fn reconcile_live_processes_collected(
+        &self,
+        collector: &mut collector::CollectorState,
+    ) -> Result<LiveProcessRecovery> {
+        let events = noland_observer::bootstrap_from_procfs();
+        let mut recovery = LiveProcessRecovery {
+            processes_seen: events.len(),
+            sessions_pruned: self.prune_stale_sessions()?,
+            ..LiveProcessRecovery::default()
+        };
+        collector.with_engine(self.attribution_engine(), |engine| {
+            for event in events {
+                let previous_session = self
+                    .db
+                    .session_for_pid(event.pid)?
+                    .map(|session| session.session_id);
+                let proof = noland_observer::ProcessGenerationProof::for_process(&event);
+                let Some(session) = engine.ingest_recovered_process(&event, proof.as_ref())? else {
+                    continue;
+                };
+                if previous_session == Some(session.session_id) {
+                    continue;
+                }
+                recovery.sessions_recovered = recovery.sessions_recovered.saturating_add(1);
+                let open_files = noland_observer::recover_open_files_from_procfs(event.pid);
+                if open_files.requires_reconciliation {
+                    engine.mark_filesystem_gap(event.pid)?;
+                }
+                for path in open_files.paths {
+                    let fact = FilesystemEvent {
+                        kind: FsEventKind::Open,
+                        pid: event.pid,
+                        path,
+                        dest_path: None,
+                        at: chrono::Utc::now(),
+                        sampled: false,
+                    };
+                    let proof =
+                        noland_observer::ProcessGenerationProof::for_filesystem(fact.pid, fact.at);
+                    if engine.ingest_observed_fs(&fact, proof.as_ref())?.is_some() {
+                        recovery.open_files_recovered =
+                            recovery.open_files_recovered.saturating_add(1);
+                    }
+                }
+            }
+            Ok(recovery)
+        })
+    }
+
+    fn prune_stale_sessions(&self) -> Result<usize> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Ok(0);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut pruned = 0usize;
+            for session in self.db.open_sessions()? {
+                let pids = self.db.session_pids(session.session_id)?;
+                let mut has_live_pid = false;
+                for pid in pids {
+                    if PathBuf::from(format!("/proc/{pid}")).exists() {
+                        has_live_pid = true;
+                    } else {
+                        self.db.detach_pid(pid)?;
+                    }
+                }
+                if !has_live_pid {
+                    self.db.end_session(session.session_id)?;
+                    pruned = pruned.saturating_add(1);
+                }
+            }
+            Ok(pruned)
+        }
+    }
+
+    pub fn process_events(&self) -> Result<usize> {
+        // Keep this synchronous: managed transfers own and join their entire
+        // blocking future, so cancellation cannot detach a capture preflight.
+        collector::process_events(self, usize::MAX, true)
+    }
+
+    pub fn start_observer(&self) {
+        self.observer.start(Arc::clone(&self.hub));
+    }
+
+    pub fn spawn_background(self: &Arc<Self>) {
+        collector::spawn_background(self);
+    }
+
+    pub async fn serve_rpc(self: &Arc<Self>) -> Result<()> {
+        let listener = noland_rpc::bind_socket(&self.config.paths.rpc_socket).await?;
+        tracing::info!(socket = %self.config.paths.rpc_socket.display(), "rpc listening");
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let agent = Arc::clone(self);
+            tokio::spawn(async move {
+                let handler = crate::rpc_handler::AgentRpc(agent);
+                if let Err(err) = noland_rpc::serve_connection(stream, handler).await {
+                    tracing::warn!(error = %err, "rpc connection ended");
+                }
+            });
+        }
+    }
+
+    pub fn install_master_key(&self, key: noland_crypto::MasterKey) {
+        *self.master_key.lock() = Some(key);
+    }
+
+    pub fn take_master_key(&self) -> Option<noland_crypto::MasterKey> {
+        self.master_key.lock().take()
+    }
+}
+
+fn staging_root_is_inactive(root: &std::path::Path) -> bool {
+    if !root.exists() {
+        return true;
+    }
+    root.is_dir()
+        && std::fs::read_dir(root)
+            .ok()
+            .is_some_and(|mut entries| entries.next().is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use noland_restore::{RestorePlan, RestoreTarget, RestoreTransaction};
+    use noland_state_core::{ContentObjectKind, SyncDirection, SyncJournalEntry, SyncJournalState};
+
+    fn test_root(label: &str) -> PathBuf {
+        std::env::current_dir()
+            .expect("test working directory should be available")
+            .join("target/noland-state-agent-tests")
+            .join(format!("{label}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn queue_loss_invalidation_keeps_barriers_constant_across_file_counts_and_batches() {
+        for files in [0, 1, 128] {
+            for known_root_count in [0, 2] {
+                let root =
+                    std::env::temp_dir().join(format!("noland-queue-loss-{}", Uuid::new_v4()));
+                std::fs::create_dir_all(&root).unwrap();
+                let root = std::fs::canonicalize(root).unwrap();
+                let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+                std::fs::create_dir_all(&agent.config.home).unwrap();
+                let app = AppId::desktop("queue-gap-fixture");
+                agent
+                    .db
+                    .upsert_app(&AppIdentity::new(app.clone(), "Queue Gap Fixture"))
+                    .unwrap();
+                let known_roots = [
+                    agent.config.home.join("Games/QueueGapFixture"),
+                    agent.config.home.join(".config/QueueGapFixture"),
+                ];
+                for (kind, path) in ["install", "state"]
+                    .into_iter()
+                    .zip(&known_roots)
+                    .take(known_root_count)
+                {
+                    agent
+                        .db
+                        .add_known_root(&app, kind, path.to_str().unwrap())
+                        .unwrap();
+                }
+                let expected_roots = if known_root_count == 0 {
+                    vec![agent.config.home.clone()]
+                } else {
+                    known_roots.to_vec()
+                };
+                let states = (0..files)
+                    .map(|index| {
+                        let relative = format!("Games/QueueGapFixture/state-{index:04}.sav");
+                        FileStateRecord {
+                            app_id: app.clone(),
+                            logical_root: "$HOME".into(),
+                            canonical_path: Some(
+                                agent.config.home.join(&relative).to_str().unwrap().into(),
+                            ),
+                            relative_path: relative,
+                            file_type: FileType::File,
+                            size: 1,
+                            mtime_ns: 1,
+                            inode: None,
+                            mount_id: None,
+                            mode: Some(0o600),
+                            content_hash: Some("fixture-hash".into()),
+                            trust: FileStateTrust::Trusted,
+                            last_seen_at: Utc::now(),
+                            last_hashed_at: Some(Utc::now()),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                agent.db.upsert_file_states(&states).unwrap();
+                for batch in 0..3 {
+                    if batch == 2 {
+                        agent.db.upsert_file_states(&states).unwrap();
+                    }
+                    // Linux recovery prunes this deliberately absent PID after
+                    // invalidation. Reattach a fixture session for each loss.
+                    agent
+                        .db
+                        .insert_session(&AppSession::new(
+                            app.clone(),
+                            i32::MAX - 1,
+                            SessionSource::ExecutableDiscovery,
+                        ))
+                        .unwrap();
+                    let before = agent.db.capture_generation(&app).unwrap();
+                    agent.hub.queue.report_loss(1);
+                    assert_eq!(agent.process_events().unwrap(), 0);
+                    assert_eq!(
+                        agent.db.capture_generation(&app).unwrap() - before,
+                        1 + expected_roots.len() as i64,
+                        "files={files}, roots={known_root_count}, batch={batch}"
+                    );
+                    let indexed = agent.db.list_file_states(&app, None).unwrap();
+                    assert_eq!(indexed.len(), files);
+                    assert!(indexed.iter().all(|state| {
+                        state.trust == FileStateTrust::VerifyRequired
+                            && state.content_hash.as_deref() == Some("fixture-hash")
+                    }));
+                    assert!(agent
+                        .db
+                        .list_dirty_apps()
+                        .unwrap()
+                        .iter()
+                        .any(|dirty| { dirty.app_id == app && dirty.requires_reconciliation }));
+                    let dirty_roots = agent.db.list_dirty_roots(Some(&app)).unwrap();
+                    assert_eq!(dirty_roots.len(), expected_roots.len());
+                    for path in &expected_roots {
+                        assert!(dirty_roots.iter().any(|dirty| {
+                            dirty.canonical_root == path.to_str().unwrap()
+                                && dirty.requires_reconciliation
+                                && dirty.mutation_count == batch + 1
+                        }));
+                    }
+                    assert_eq!(agent.observer.loss_generation(), batch + 1);
+                    assert!(
+                        agent
+                            .observer
+                            .status(agent.hub.queue.dropped())
+                            .reconciliation_required
+                    );
+                    assert!(!agent.hub.queue.take_loss_flag());
+                }
+                drop(agent);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn recover_refuses_corrupt_restore_journal_without_deleting_it() {
+        let root = test_root("recover-corrupt-restore");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let workspace = agent.config.paths.restore_dir(&Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&workspace).unwrap();
+        let journal = workspace.join("restore-transaction.json");
+        let malformed = b"{preserve-this-corrupt-journal";
+        std::fs::write(&journal, malformed).unwrap();
+        assert!(agent.recover().is_err());
+        assert_eq!(std::fs::read(journal).unwrap(), malformed);
+        drop(agent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recover_preserves_unfinished_operations_as_interrupted() {
+        let root = test_root("recover");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let operation_id = Uuid::new_v4();
+        agent
+            .db
+            .upsert_operation(&OperationRecord {
+                operation_id,
+                kind: "backup".into(),
+                app_id: Some(AppId::desktop("game")),
+                state: BackupState::Uploading.as_str().into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_error: None,
+                detail_json: serde_json::json!({
+                    "app_id": "desktop:game",
+                    "mode": "personal_state",
+                    "performance_mode": "balanced"
+                }),
+            })
+            .unwrap();
+        let mut entry = SyncJournalEntry::pending(
+            operation_id,
+            "packs/ab/pack.pack",
+            ContentObjectKind::Pack,
+            SyncDirection::Upload,
+        );
+        entry.state = SyncJournalState::Completed;
+        agent.db.upsert_sync_journal_entry(&entry).unwrap();
+        let mut progress = OperationProgress::new("uploading", 7);
+        progress.message = Some("uploading packs".into());
+        agent
+            .db
+            .set_operation_progress(operation_id, Some(&progress))
+            .unwrap();
+
+        agent.recover().unwrap();
+
+        let recovered = agent.db.get_operation(operation_id).unwrap().unwrap();
+        assert_eq!(recovered.state, "INTERRUPTED");
+        assert_eq!(
+            recovered.detail_json["resume"]["mode"],
+            serde_json::json!("UPLOAD_JOURNAL")
+        );
+        assert_eq!(
+            recovered.detail_json["resume"]["retry_available"],
+            serde_json::json!(true)
+        );
+        let recovered_progress = agent
+            .db
+            .get_operation_progress(operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_progress.phase, "uploading");
+        assert_eq!(recovered_progress.completed_units, 7);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recover_rolls_back_crashed_restore_before_marking_operation_interrupted() {
+        let root = test_root("crashed-restore-recover");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let operation_id = Uuid::new_v4();
+        agent
+            .db
+            .upsert_operation(&OperationRecord {
+                operation_id,
+                kind: "restore".into(),
+                app_id: Some(AppId::desktop("game")),
+                state: RestoreState::Applying.as_str().into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_error: None,
+                detail_json: serde_json::json!({"mode": "personal_state"}),
+            })
+            .unwrap();
+
+        let payload = b"new-save";
+        let hash = noland_cas::blake3_hex(payload);
+        let mut manifest = BundleManifest::new(
+            ManifestApp {
+                app_id: AppId::desktop("game"),
+                display_name: "Game".into(),
+                aliases: Vec::new(),
+                desktop_entry_id: None,
+                steam_app_id: None,
+                launcher: None,
+                canonical_executable: None,
+                icon_path: None,
+            },
+            ManifestSource {
+                instance_id: Uuid::new_v4(),
+                image_id: "test".into(),
+                captured_at: Utc::now(),
+            },
+            BackupMode::PersonalState,
+        );
+        manifest.files.push(ManifestFile {
+            logical_root: "$XDG_DATA_HOME".into(),
+            relative_path: "game/save.dat".into(),
+            source_path_hint: None,
+            file_type: "file".into(),
+            size: payload.len() as u64,
+            file_hash: hash.clone(),
+            chunks: vec![ChunkRef {
+                hash: hash.clone(),
+                size: payload.len() as u64,
+            }],
+            mode: None,
+            mtime_ns: None,
+            uid: None,
+            gid: None,
+            symlink_target: None,
+            persistence_class: PersistenceClass::PersistentState,
+            semantic_role: SemanticRole::UserState,
+            association_confidence: 1.0,
+            shared_app_ids: Vec::new(),
+        });
+        let restore_id = Uuid::new_v4();
+        let staging = agent.config.paths.restore_dir(&restore_id.to_string());
+        for child in ["packs", "materialized/.chunks", "pre_restore"] {
+            std::fs::create_dir_all(staging.join(child)).unwrap();
+        }
+        std::fs::write(
+            staging
+                .join("materialized/.chunks")
+                .join(hash.trim_start_matches("blake3:")),
+            payload,
+        )
+        .unwrap();
+        let plan = RestorePlan {
+            restore_id,
+            staging: staging.clone(),
+            pack_cache: agent.config.paths.cache.join("restore-packs"),
+            manifest,
+            mode: RestoreMode::PersonalState,
+        };
+        let roots = LogicalRootMap::from_home(&agent.config.home);
+        let destination = agent.config.home.join(".local/share/game/save.dat");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, b"old-save").unwrap();
+        let mut transaction = RestoreTransaction::new(&plan, &roots, None);
+        transaction.publish_to(RestoreTarget::Complete).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        std::mem::forget(transaction);
+
+        agent.recover().unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old-save");
+        assert!(!staging.exists());
+        let operation = agent.db.get_operation(operation_id).unwrap().unwrap();
+        assert_eq!(operation.state, "INTERRUPTED");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_is_available_to_attribution_engines() {
+        let root = test_root("steam-discovery");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let steamapps = agent.config.home.join(".local/share/Steam/steamapps");
+        let install_root = steamapps.join("common/Discovered Game");
+        let executable = install_root.join("discovered-game");
+        std::fs::create_dir_all(&install_root).unwrap();
+        std::fs::write(&executable, b"game").unwrap();
+        std::fs::write(
+            steamapps.join("appmanifest_6060.acf"),
+            r#"
+            "AppState"
+            {
+                "appid" "6060"
+                "name" "Discovered Game"
+                "installdir" "Discovered Game"
+            }
+            "#,
+        )
+        .unwrap();
+
+        agent.discover().unwrap();
+        let engine = agent.attribution_engine();
+        assert!(engine
+            .steam
+            .as_ref()
+            .is_some_and(|steam| steam.apps.iter().any(|app| app.app_id == 6060)));
+        drop(engine);
+
+        agent.hub.inject_process(ProcessEvent {
+            kind: ProcessEventKind::Exec,
+            pid: 6060,
+            ppid: 1,
+            uid: 1000,
+            gid: 1000,
+            cgroup: None,
+            executable: Some(executable),
+            argv_hash: None,
+            comm: Some("discovered-game".into()),
+            at: Utc::now(),
+        });
+        assert_eq!(agent.process_events().unwrap(), 1);
+        assert_eq!(
+            agent.db.session_for_pid(6060).unwrap().unwrap().app_id,
+            AppId::steam(6060)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_repairs_runtime_identity_and_reconciles_its_game_files() {
+        let root = test_root("runtime-owned-root");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let game = agent
+            .config
+            .home
+            .join(".local/share/noland-runtime/app-data/private-app/Games/Hookshot");
+        std::fs::create_dir_all(game.join("bin")).unwrap();
+        std::fs::write(game.join("bin/hookshot"), b"executable").unwrap();
+        std::fs::write(game.join("game.data"), b"assets").unwrap();
+        let identity = noland_discovery::fallback_exe_identity(std::path::Path::new(
+            "/home/runtime/Games/Hookshot/bin/hookshot",
+        ));
+        agent.db.upsert_app(&identity).unwrap();
+        agent.discover().unwrap();
+        let repaired = agent.db.get_app(&identity.app_id).unwrap().unwrap();
+        assert_eq!(
+            repaired.canonical_executable,
+            Some(std::fs::canonicalize(game.join("bin/hookshot")).unwrap())
+        );
+        assert!(agent
+            .db
+            .known_roots(Some(&identity.app_id))
+            .unwrap()
+            .iter()
+            .any(|(_, kind, path)| kind == "install"
+                && PathBuf::from(path) == std::fs::canonicalize(&game).unwrap()));
+        reconcile::reconcile_app_for_complete_backup(&agent, &identity.app_id).unwrap();
+        let files = agent.db.associations_for_app(&identity.app_id).unwrap();
+        assert!(files
+            .iter()
+            .any(|(path, _)| PathBuf::from(&path.canonical_path) == game.join("game.data")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn runtime_registration_fixture() -> (PathBuf, StateAgent, AppIdentity, PathBuf) {
+        let root = test_root("runtime-registration-discovery");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let runtime = agent.config.home.join(".local/share/noland-runtime");
+        let source = runtime.join("app-data/source/Games/Registered/game");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let mut elf = [0u8; 20];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[18] = 62;
+        std::fs::write(&source, elf).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::create_dir_all(runtime.join("apps")).unwrap();
+        std::fs::create_dir_all(runtime.join("app-data/current-runtime")).unwrap();
+        let registration = runtime.join("apps/current-runtime.json");
+        std::fs::write(
+            &registration,
+            serde_json::to_vec(&serde_json::json!({
+                "id":"current-runtime","file":source,"profile":"ubuntu24-x86_64",
+                "appimage":false,"writableApp":false,"writablePaths":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut app = AppIdentity::new(AppId::desktop("existing-runtime-id"), "Registered");
+        app.canonical_executable = Some(source);
+        app.launcher = Some(LauncherKind::Native);
+        agent.db.upsert_app(&app).unwrap();
+        (root, agent, app, registration)
+    }
+
+    #[test]
+    fn registration_discovery_preserves_exact_existing_ids_without_live_processes() {
+        let (root, agent, app, _) = runtime_registration_fixture();
+        for _ in 0..2 {
+            agent.discover().unwrap();
+            let indexed = agent.db.get_app(&app.app_id).unwrap().unwrap();
+            assert_eq!(indexed.canonical_executable, app.canonical_executable);
+            assert!(agent
+                .db
+                .get_app(&AppId::launcher("runtime", "current-runtime"))
+                .unwrap()
+                .is_none());
+            assert!(agent.db.known_roots(Some(&app.app_id)).unwrap().iter().any(
+                |(_, kind, path)| kind == "install"
+                    && std::path::Path::new(path)
+                        == app.canonical_executable.as_ref().unwrap().parent().unwrap()
+            ));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_registration_does_not_stop_discovery_or_authorize_original_only_capture() {
+        let (root, agent, app, registration) = runtime_registration_fixture();
+        std::fs::write(&registration, b"{invalid-registration").unwrap();
+        agent.discover().unwrap();
+        assert!(agent.db.get_app(&app.app_id).unwrap().is_some());
+        assert!(reconcile::reconcile_app_for_complete_backup(&agent, &app.app_id).is_err());
+        assert_eq!(
+            std::fs::read(&registration).unwrap(),
+            b"{invalid-registration"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_refresh_scans_runtime_host_root_despite_stale_dirty_paths() {
+        let root = test_root("runtime-manual-refresh");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let game = agent
+            .config
+            .home
+            .join(".local/share/noland-runtime/app-data/private-app/Games/Hookshot");
+        let nested = game.join("romfs/a/b/c/d/e/f/g/asset.bin");
+        let save = game.join("user/save/slot_00/progress.sav");
+        for path in [&nested, &save, &game.join("bin/hookshot")] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"preserve").unwrap();
+        }
+        let identity = noland_discovery::fallback_exe_identity(std::path::Path::new(
+            "/home/runtime/Games/Hookshot/bin/hookshot",
+        ));
+        agent.db.upsert_app(&identity).unwrap();
+        agent.discover().unwrap();
+        agent
+            .db
+            .mark_dirty_root(
+                &identity.app_id,
+                "/home/runtime/Games/Hookshot/user/save",
+                None,
+                true,
+            )
+            .unwrap();
+        agent.db.mark_dirty(&identity.app_id, None, true).unwrap();
+        assert!(reconcile::reconcile_app_for_refresh(&agent, &identity.app_id).unwrap() >= 3);
+        let files = agent.db.associations_for_app(&identity.app_id).unwrap();
+        for expected in [&nested, &save] {
+            let (record, _) = files
+                .iter()
+                .find(|(record, _)| {
+                    std::path::Path::new(&record.canonical_path) == expected.as_path()
+                })
+                .expect("refresh must inventory deep assets and saves at durable host paths");
+            assert_eq!(record.size, Some(8));
+            assert!(record.last_scanned_at.is_some());
+            assert_eq!(std::fs::read(expected).unwrap(), b"preserve");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_persists_owned_roots_for_non_steam_apps() {
+        let root = test_root("owned-roots");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let home = &agent.config.home;
+
+        let native_executable = home.join("Applications/Native Game/bin/game");
+        let portable_executable = home.join("Downloads/Portable.AppImage");
+        let shared_executable = home.join(".local/share/applications/shared-helper");
+        let applications = home.join(".local/share/applications");
+        std::fs::create_dir_all(native_executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(portable_executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&applications).unwrap();
+        std::fs::write(&native_executable, b"native").unwrap();
+        std::fs::write(&portable_executable, b"portable").unwrap();
+        std::fs::write(&shared_executable, b"shared").unwrap();
+        std::fs::write(
+            applications.join("native-game.desktop"),
+            format!(
+                "[Desktop Entry]\nName=Native Game\nExec=\"{}\"\nType=Application\n",
+                native_executable.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            applications.join("shared-helper.desktop"),
+            format!(
+                "[Desktop Entry]\nName=Shared Helper\nExec={}\nType=Application\n",
+                shared_executable.display()
+            ),
+        )
+        .unwrap();
+
+        let wine_prefix = home.join(".wine");
+        let bottle_prefix = home.join(".local/share/bottles/bottles/arcade");
+        std::fs::create_dir_all(wine_prefix.join("drive_c")).unwrap();
+        std::fs::create_dir_all(&bottle_prefix).unwrap();
+
+        agent.discover().unwrap();
+
+        let wine_id = AppId::launcher("wine", "default");
+        let bottle_id = AppId::launcher("bottles", "arcade");
+        assert_eq!(
+            agent.db.get_app(&wine_id).unwrap().unwrap().launcher,
+            Some(LauncherKind::Wine)
+        );
+        assert_eq!(
+            agent.db.get_app(&bottle_id).unwrap().unwrap().launcher,
+            Some(LauncherKind::Bottles)
+        );
+        assert_eq!(
+            agent
+                .db
+                .get_app(&AppId::desktop("portable"))
+                .unwrap()
+                .unwrap()
+                .launcher,
+            Some(LauncherKind::AppImage)
+        );
+
+        let known_roots = agent.db.known_roots(None).unwrap();
+        for (app_id, expected) in [
+            (wine_id, wine_prefix),
+            (bottle_id, bottle_prefix),
+            (
+                AppId::desktop("native-game"),
+                home.join("Applications/Native Game"),
+            ),
+            (AppId::desktop("portable"), portable_executable),
+        ]
+        .map(|(app_id, path)| (app_id, std::fs::canonicalize(path).unwrap()))
+        {
+            assert!(
+                known_roots.iter().any(|(root_app_id, kind, path)| {
+                    root_app_id == &app_id && kind == "install" && PathBuf::from(path) == expected
+                }),
+                "missing durable root for {app_id}"
+            );
+        }
+        assert!(!known_roots
+            .iter()
+            .any(|(app_id, _, _)| { app_id == &AppId::desktop("shared-helper") }));
+        assert!(known_roots.iter().all(|(_, _, path)| {
+            let path = PathBuf::from(path);
+            path != *home && !path.starts_with("/usr") && !path.starts_with("/opt")
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovery_finishes_steam_transaction_after_scanning_only_final_content() {
+        let root = test_root("install-complete");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let steamapps = agent.config.home.join(".local/share/Steam/steamapps");
+        let final_root = steamapps.join("common/Completed Game");
+        let final_file = final_root.join("content/deep/asset.pak");
+        let staging_root = steamapps.join("downloading/7070");
+        std::fs::create_dir_all(final_file.parent().unwrap()).unwrap();
+        std::fs::write(&final_file, b"complete asset").unwrap();
+        std::fs::write(
+            steamapps.join("appmanifest_7070.acf"),
+            r#"
+            "AppState"
+            {
+                "appid" "7070"
+                "name" "Completed Game"
+                "installdir" "Completed Game"
+            }
+            "#,
+        )
+        .unwrap();
+        noland_attribution::start_installer(
+            &agent.db,
+            AppId::steam(7070),
+            None,
+            vec![staging_root.clone()],
+            InstallTransactionType::LauncherInstall,
+        )
+        .unwrap();
+
+        agent.discover().unwrap();
+
+        assert!(agent.db.open_installers().unwrap().is_empty());
+        assert!(agent
+            .db
+            .known_roots(Some(&AppId::steam(7070)))
+            .unwrap()
+            .iter()
+            .all(|(_, _, path)| PathBuf::from(path) != staging_root));
+        let record = agent
+            .db
+            .get_path_by_canonical(&final_file.to_string_lossy())
+            .unwrap()
+            .expect("completed install should be indexed");
+        let association = agent
+            .db
+            .associations_for_path(record.path_id)
+            .unwrap()
+            .into_iter()
+            .find(|association| association.app_id == AppId::steam(7070))
+            .expect("completed install should belong to its Steam app");
+        assert_eq!(
+            association.persistence_class,
+            PersistenceClass::ReconstructableApp
+        );
+        assert_eq!(association.semantic_role, SemanticRole::AppContent);
+        assert!(
+            !agent
+                .db
+                .list_dirty_apps()
+                .unwrap()
+                .into_iter()
+                .find(|dirty| dirty.app_id == AppId::steam(7070))
+                .unwrap()
+                .requires_reconciliation
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_reconciliation_prunes_only_sessions_without_live_pids() {
+        let root = test_root("session-prune");
+        let agent = StateAgent::boot(AgentConfig::isolated(root.clone())).unwrap();
+        let live_app = AppIdentity::new(AppId::desktop("live-app"), "Live App");
+        let stale_app = AppIdentity::new(AppId::desktop("stale-app"), "Stale App");
+        agent.db.upsert_app(&live_app).unwrap();
+        agent.db.upsert_app(&stale_app).unwrap();
+
+        let live_session = AppSession::new(
+            live_app.app_id,
+            std::process::id() as i32,
+            SessionSource::ExecutableDiscovery,
+        );
+        let stale_session = AppSession::new(
+            stale_app.app_id,
+            i32::MAX,
+            SessionSource::ExecutableDiscovery,
+        );
+        agent.db.insert_session(&live_session).unwrap();
+        agent.db.insert_session(&stale_session).unwrap();
+
+        assert_eq!(agent.prune_stale_sessions().unwrap(), 1);
+        assert!(agent
+            .db
+            .open_session_for_app(&live_session.app_id)
+            .unwrap()
+            .is_some());
+        assert!(agent
+            .db
+            .open_session_for_app(&stale_session.app_id)
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

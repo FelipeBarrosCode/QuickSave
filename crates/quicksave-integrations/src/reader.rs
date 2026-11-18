@@ -6,7 +6,9 @@
 
 use anyhow::{ensure, Context, Result};
 use std::ffi::{CStr, CString};
-use std::fs::{self, File, Metadata};
+#[cfg(test)]
+use std::fs;
+use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
@@ -26,14 +28,22 @@ pub(crate) struct Listing {
 }
 
 impl Directory {
+    /// Wrap an owned directory handle obtained from a retained native SafeRoot.
+    /// This never opens `path`; it is display/relative-routing metadata only.
+    pub(crate) fn from_pinned(file: File, path: PathBuf) -> Result<Self> {
+        validate_absolute(&path)?;
+        ensure!(
+            file.metadata()?.is_dir(),
+            "pinned metadata handle is not a directory"
+        );
+        Ok(Self { file, path })
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         validate_absolute(path)?;
-        // Explicit lstat rejection as well as race-safe O_NOFOLLOW opening.
-        let metadata = fs::symlink_metadata(path)?;
-        ensure!(
-            !metadata.file_type().is_symlink() && metadata.is_dir(),
-            "not a real directory"
-        );
+        // Start at the real root and inspect every component relative to a
+        // pinned parent. A path-based lstat here would still follow symlinked
+        // ancestors before we had a chance to reject them.
         let file = open_at(libc::AT_FDCWD, c"/", DIRECTORY_FLAGS)?;
         let mut directory = Self {
             file,
@@ -55,15 +65,15 @@ impl Directory {
     pub fn child(&self, name: &str) -> Result<Self> {
         let name_c = component(name)?;
         let path = self.path.join(name);
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = stat_at(self.file.as_raw_fd(), &name_c)?;
         ensure!(
-            !metadata.file_type().is_symlink() && metadata.is_dir(),
+            metadata.st_mode & libc::S_IFMT == libc::S_IFDIR,
             "not a real directory"
         );
         let file = open_at(self.file.as_raw_fd(), &name_c, DIRECTORY_FLAGS)?;
         let opened = file.metadata()?;
         ensure!(
-            metadata.dev() == opened.dev() && metadata.ino() == opened.ino(),
+            metadata.st_dev as u64 == opened.dev() && metadata.st_ino as u64 == opened.ino(),
             "discovery directory changed during opening"
         );
         Ok(Self { file, path })
@@ -71,6 +81,23 @@ impl Directory {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn metadata(&self) -> Result<Metadata> {
+        Ok(self.file.metadata()?)
+    }
+
+    /// Inspect a real regular-file handle without reading its contents.
+    pub fn regular_file_metadata(&self, name: &str) -> Result<Metadata> {
+        let name = component(name)?;
+        let file = open_at(
+            self.file.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )?;
+        let metadata = file.metadata()?;
+        ensure!(metadata.is_file(), "native identity is not a regular file");
+        Ok(metadata)
     }
 
     pub fn entries(&self, max_entries: usize) -> Result<Listing> {
@@ -119,6 +146,14 @@ impl Directory {
     }
 
     pub fn read_file(&self, name: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        Ok(self.read_file_with_metadata(name, max_bytes)?.0)
+    }
+
+    pub fn read_file_with_metadata(
+        &self,
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Metadata)> {
         let name = component(name)?;
         // O_NONBLOCK prevents a malicious FIFO from blocking before fstat.
         let mut file = open_at(
@@ -128,6 +163,10 @@ impl Directory {
         )?;
         let before = file.metadata()?;
         ensure!(before.is_file(), "discovery metadata is not a regular file");
+        ensure!(
+            before.nlink() == 1,
+            "multiply linked metadata cannot establish scoped ownership"
+        );
         ensure!(
             before.len() <= max_bytes as u64,
             "discovery metadata exceeds size limit"
@@ -145,7 +184,14 @@ impl Directory {
             same_stamp(&before, &after) && bytes.len() as u64 == after.len(),
             "discovery metadata changed while being read"
         );
-        Ok(bytes)
+        let named = stat_at(self.file.as_raw_fd(), &name)?;
+        ensure!(
+            named.st_dev as u64 == after.dev()
+                && named.st_ino as u64 == after.ino()
+                && named.st_mode & libc::S_IFMT == libc::S_IFREG,
+            "discovery metadata filename changed while being read"
+        );
+        Ok((bytes, after))
     }
 }
 
@@ -195,6 +241,25 @@ fn open_at(parent: i32, name: &CStr, flags: i32) -> Result<File> {
         return Err(io::Error::last_os_error().into());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn stat_at(parent: i32, name: &CStr) -> Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent is a live pinned descriptor; name is NUL-terminated and
+    // fstatat initializes the entire stat on success. No ancestor or final link
+    // is traversed by this handle-relative metadata lookup.
+    if unsafe {
+        libc::fstatat(
+            parent,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(unsafe { metadata.assume_init() })
 }
 
 struct DirectoryStream(*mut libc::DIR);

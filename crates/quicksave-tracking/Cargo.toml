@@ -1,0 +1,27 @@
+[package]
+name = "quicksave-tracking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+quicksave-platform.workspace = true
+notify = "8.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# Safe native handle/metadata primitives from the user-authorized audited fork;
+# no snapshot-copy, provisioning, lifecycle, or remote operation is invoked.
+noland-snapshot = { path = "../../shared-storage/crates/noland-snapshot" }
+
+[dev-dependencies]
+tempfile.workspace = true

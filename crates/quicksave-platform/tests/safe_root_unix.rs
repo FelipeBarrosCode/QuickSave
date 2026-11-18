@@ -179,6 +179,7 @@ fn all_traversal_and_invalid_paths_fail_before_callbacks() -> Result<()> {
     ];
     for path in invalid.drain(..) {
         assert!(root.read_file(&path).is_err(), "{path:?}");
+        assert!(root.open_directory(&path).is_err(), "{path:?}");
         assert!(root.create_dir(&path).is_err(), "{path:?}");
         let called = AtomicBool::new(false);
         assert!(root
@@ -190,6 +191,98 @@ fn all_traversal_and_invalid_paths_fail_before_callbacks() -> Result<()> {
         assert!(!called.load(Ordering::SeqCst));
     }
     assert!(children(temp.path()).is_empty());
+    Ok(())
+}
+
+#[test]
+fn native_relative_directory_handles_are_readable_bounded_and_never_follow_links() -> Result<()> {
+    use std::{
+        ffi::CStr,
+        os::fd::{AsRawFd, IntoRawFd},
+        os::unix::fs::MetadataExt,
+    };
+    let temp = isolated();
+    fs::create_dir_all(temp.path().join("approved/nested"))?;
+    fs::create_dir(temp.path().join("outside"))?;
+    fs::write(temp.path().join("approved/nested/file"), b"approved")?;
+    fs::write(temp.path().join("outside/secret"), b"outside")?;
+    symlink("../../outside", temp.path().join("approved/nested/link"))?;
+    let root = SafeRoot::open(temp.path())?;
+    let directory = root.open_directory("approved/nested")?;
+    let before = directory.metadata()?;
+    assert!(before.is_dir());
+    assert_eq!(
+        unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+        libc::O_RDONLY
+    );
+    let second = root.open_directory("approved/nested")?.metadata()?;
+    assert_eq!((before.dev(), before.ino()), (second.dev(), second.ino()));
+    assert!(root.open_directory("approved/nested/link").is_err());
+    assert!(root.open_directory("approved/nested/file").is_err());
+    let stream = unsafe { libc::fdopendir(directory.into_raw_fd()) };
+    assert!(
+        !stream.is_null(),
+        "real readable directory descriptor required"
+    );
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = Stream(stream);
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_str()?
+            .to_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        assert!(
+            names.len() < 16,
+            "one-level enumeration must remain bounded"
+        );
+        names.push(name);
+    }
+    names.sort();
+    assert_eq!(names, ["file", "link"]);
+    let cloned_root = root.clone_root_directory_handle()?.metadata()?;
+    let identity = root.identity()?;
+    assert_eq!(
+        (cloned_root.dev(), cloned_root.ino()),
+        (identity.device, identity.file_id[0])
+    );
+    Ok(())
+}
+
+#[test]
+fn relative_directory_and_root_namespace_replacements_are_detected() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let temp = isolated();
+    fs::create_dir_all(temp.path().join("selected/child/nested"))?;
+    fs::create_dir_all(temp.path().join("outside/nested"))?;
+    let root = SafeRoot::open(&temp.path().join("selected"))?;
+    let held = root.open_directory("child/nested")?;
+    let before = held.metadata()?;
+    fs::rename(
+        temp.path().join("selected/child"),
+        temp.path().join("selected/detached"),
+    )?;
+    symlink("../outside", temp.path().join("selected/child"))?;
+    assert!(root.open_directory("child/nested").is_err());
+    assert_eq!(held.metadata()?.ino(), before.ino());
+    fs::rename(
+        temp.path().join("selected"),
+        temp.path().join("old-selected"),
+    )?;
+    fs::create_dir(temp.path().join("selected"))?;
+    assert!(root.clone_root_directory_handle().is_err());
+    assert!(root.open_directory("child").is_err());
     Ok(())
 }
 

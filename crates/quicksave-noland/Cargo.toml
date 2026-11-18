@@ -1,0 +1,49 @@
+[package]
+name = "quicksave-noland"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+quicksave-state = { path = "../quicksave-state" }
+quicksave-platform.workspace = true
+
+[target.'cfg(any(unix, windows))'.dependencies]
+blake3.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio = { version = "1.41", features = ["sync", "rt-multi-thread", "time", "process", "io-util", "macros"] }
+noland-state-core = { path = "../../shared-storage/crates/noland-state-core" }
+noland-crypto = { path = "../../shared-storage/crates/noland-crypto" }
+noland-storage = { path = "../../shared-storage/crates/noland-storage" }
+noland-restore = { path = "../../shared-storage/crates/noland-restore" }
+noland-rclone-adapter = { path = "../../shared-storage/crates/noland-rclone-adapter" }
+noland-snapshot = { path = "../../shared-storage/crates/noland-snapshot" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+noland-state-agent = { path = "../../shared-storage/crates/noland-state-agent", features = ["native-host"] }
+noland-rpc = { path = "../../shared-storage/crates/noland-rpc" }
+
+[target.'cfg(windows)'.dependencies]
+async-trait = "0.1"
+bytes = "1.7"
+hmac = "0.12"
+sha2 = "0.10"
+noland-state-db = { path = "../../shared-storage/crates/noland-state-db" }
+noland-cas = { path = "../../shared-storage/crates/noland-cas" }
+noland-pack = { path = "../../shared-storage/crates/noland-pack" }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+quicksave-tracking = { path = "../quicksave-tracking" }

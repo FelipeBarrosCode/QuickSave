@@ -12,6 +12,9 @@ use tauri::{Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use uuid::Uuid;
 
+mod workspace;
+use workspace::{workspace_execute, workspace_prepare, workspace_query, WorkspaceHost};
+
 fn message(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
@@ -283,41 +286,73 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(AppState::new()))
+        .manage(Arc::new(WorkspaceHost::default()))
+        .setup(|app| {
+            #[cfg(debug_assertions)]
+            if std::env::var_os("QUICKSAVE_DEV_WORKSPACE").is_some() {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.set_title("QuickSave — isolated development")?;
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            get_capabilities,
-            get_directories,
-            discover_applications,
-            authorize_operation,
-            initialize_repository,
-            backup_folder,
-            list_snapshots,
-            restore_snapshot,
-            operation_status,
-            operation_history
+            // The desktop has one native authority boundary. The older local-
+            // repository commands remain separate CLI/library code, not a
+            // fallback or unconsented discovery path reachable from this UI.
+            workspace_query,
+            workspace_prepare,
+            workspace_execute
         ])
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     let state = window.state::<Arc<AppState>>();
-                    if state.prevent_shutdown() {
-                        api.prevent_close();
+                    let workspace = window.state::<Arc<WorkspaceHost>>();
+                    if workspace.shutdown_complete() {
+                        return;
+                    }
+                    api.prevent_close();
+                    if workspace.background_enabled() {
+                        // Closing a window is not quitting an opted-in autosave
+                        // worker. Dock activation reopens this same window.
+                        let _ = window.hide();
+                    } else if workspace.shutdown_blocked() || state.prevent_shutdown() {
                         let _ = window.set_focus();
+                    } else {
+                        Arc::clone(workspace.inner())
+                            .begin_shutdown(window.app_handle().clone(), Arc::clone(state.inner()));
                     }
                 }
             }
         })
         .build(tauri::generate_context!())
         .expect("QuickSave could not start")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
                 let state = app.state::<Arc<AppState>>();
-                if state.prevent_shutdown() {
-                    api.prevent_exit();
+                let workspace = app.state::<Arc<WorkspaceHost>>();
+                if workspace.shutdown_complete() {
+                    return;
+                }
+                api.prevent_exit();
+                if workspace.shutdown_blocked() || state.prevent_shutdown() {
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.set_focus();
                     }
+                } else {
+                    Arc::clone(workspace.inner())
+                        .begin_shutdown(app.clone(), Arc::clone(state.inner()));
                 }
             }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            _ => {}
         });
 }

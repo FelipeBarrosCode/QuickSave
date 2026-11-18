@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-only
+[package]
+name = "quicksave-oauth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+sha2 = "0.10"
+subtle = "2"
+zeroize = "1"
+url = "2"
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "stream"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+static_assertions = "1"

@@ -15,6 +15,7 @@ pub const MAX_EXPANDED_PLIST_BYTES: usize = 4 * 1024 * 1024;
 pub struct BundleMetadata {
     pub bundle_identifier: String,
     pub display_name: Option<String>,
+    pub executable_name: Option<String>,
 }
 
 pub fn parse_info_plist(bytes: &[u8]) -> Result<BundleMetadata> {
@@ -30,15 +31,7 @@ pub fn parse_info_plist(bytes: &[u8]) -> Result<BundleMetadata> {
         .get("CFBundleIdentifier")
         .and_then(plist::Value::as_string)
         .context("Info.plist has no string CFBundleIdentifier")?;
-    ensure!(
-        !id.is_empty()
-            && id.len() <= 255
-            && id.split('.').all(|part| !part.is_empty())
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte)),
-        "invalid bundle identifier"
-    );
+    validate_identifier(id)?;
     let name = dictionary
         .get("CFBundleDisplayName")
         .or_else(|| dictionary.get("CFBundleName"))
@@ -49,13 +42,82 @@ pub fn parse_info_plist(bytes: &[u8]) -> Result<BundleMetadata> {
             "invalid bundle display name"
         );
     }
+    let executable_name = dictionary
+        .get("CFBundleExecutable")
+        .map(|value| {
+            let name = value
+                .as_string()
+                .context("CFBundleExecutable is not a string")?;
+            crate::profiles::validate_segment(name)?;
+            Ok::<_, anyhow::Error>(name.to_owned())
+        })
+        .transpose()?;
     Ok(BundleMetadata {
         bundle_identifier: id.to_owned(),
         display_name: name.filter(|name| !name.is_empty()).map(str::to_owned),
+        executable_name,
     })
 }
 
-fn bounded_value(bytes: &[u8]) -> Result<plist::Value> {
+pub fn validate_identifier(id: &str) -> Result<()> {
+    ensure!(
+        !id.is_empty()
+            && id.len() <= 255
+            && id
+                .split('.')
+                .all(|part| !part.is_empty() && part != "-" && part != "_")
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte)),
+        "invalid platform identifier"
+    );
+    Ok(())
+}
+
+/// Only the exact container-manager identifier is evidence. The directory's
+/// basename is deliberately not a fallback.
+pub fn parse_container_identifier(bytes: &[u8]) -> Result<String> {
+    let value = bounded_value(bytes)?;
+    let id = value
+        .as_dictionary()
+        .context("container metadata is not a dictionary")?
+        .get("MCMMetadataIdentifier")
+        .and_then(plist::Value::as_string)
+        .context("container metadata lacks MCMMetadataIdentifier")?;
+    validate_identifier(id)?;
+    Ok(id.to_owned())
+}
+
+/// Pure signed-entitlement fixture parser. Calling this parser does NOT validate
+/// a signature; native validation belongs to the Security backend.
+pub fn parse_application_groups(bytes: &[u8]) -> Result<Vec<String>> {
+    let value = bounded_value(bytes)?;
+    let dictionary = value
+        .as_dictionary()
+        .context("entitlements are not a dictionary")?;
+    let Some(groups) = dictionary.get("com.apple.security.application-groups") else {
+        return Ok(Vec::new());
+    };
+    let array = groups
+        .as_array()
+        .context("application groups are not an array")?;
+    ensure!(array.len() <= 64, "too many signed application groups");
+    let mut result = BTreeSet::new();
+    for item in array {
+        let id = item
+            .as_string()
+            .context("application group is not a string")?;
+        validate_identifier(id)?;
+        ensure!(result.insert(id.to_owned()), "duplicate application group");
+    }
+    Ok(result.into_iter().collect())
+}
+
+pub(crate) fn bounded_value(bytes: &[u8]) -> Result<plist::Value> {
+    ensure!(
+        bytes.len() <= MAX_PLIST_BYTES,
+        "plist exceeds the input limit"
+    );
     let mut events = Vec::new();
     let mut depth = 0usize;
     let mut expanded_bytes = 0usize;

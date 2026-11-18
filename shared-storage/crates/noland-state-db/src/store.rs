@@ -1,0 +1,2038 @@
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::{TimeZone, Utc};
+use noland_state_core::*;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use uuid::Uuid;
+
+#[path = "contention.rs"]
+mod contention;
+#[cfg(any(unix, windows))]
+#[cfg_attr(unix, path = "native.rs")]
+#[cfg_attr(windows, path = "windows.rs")]
+mod native;
+pub use contention::DbContentionSnapshot;
+use contention::DbLockTimings;
+
+use crate::schema::{
+    MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4, MIGRATION_V5, MIGRATION_V6,
+    MIGRATION_V7,
+};
+use crate::SCHEMA_VERSION;
+
+// Persist a validation obligation, never authority over private data. Legacy
+// readers see at most the already selected source executable, not a broad root.
+const RUNTIME_BINDING_REQUIRED: &str = "runtime-binding-required";
+
+#[derive(Clone)]
+pub struct StateDb {
+    conn: Arc<Mutex<Connection>>,
+    // Only small display/health SELECTs use this WAL reader. Admission, capture,
+    // checkpointing and every mutation retain the original serialized writer.
+    browse_reader: Option<Arc<Mutex<Connection>>>,
+    lock_timings: Arc<DbLockTimings>,
+    #[cfg(any(unix, windows))]
+    native_files: Option<Arc<native::NativeDbFiles>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoredPathAssociationInput {
+    pub canonical_path: String,
+    pub persistence_class: PersistenceClass,
+    pub semantic_role: SemanticRole,
+}
+
+impl StateDb {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path).map_err(db_err)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_err)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(db_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(db_err)?;
+        let mut db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            browse_reader: None,
+            lock_timings: Arc::default(),
+            #[cfg(any(unix, windows))]
+            native_files: None,
+        };
+        db.migrate()?;
+        let reader_path = db
+            .lock()?
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned);
+        if let Some(reader_path) = reader_path {
+            let reader = Connection::open_with_flags(reader_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(db_err)?;
+            reader
+                .pragma_update(None, "query_only", true)
+                .map_err(db_err)?;
+            reader
+                .busy_timeout(std::time::Duration::from_millis(250))
+                .map_err(db_err)?;
+            db.browse_reader = Some(Arc::new(Mutex::new(reader)));
+        }
+        Ok(db)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().map_err(db_err)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(db_err)?;
+        let db = Self {
+            conn: Arc::new(Mutex::new(conn)),
+            browse_reader: None,
+            lock_timings: Arc::default(),
+            #[cfg(any(unix, windows))]
+            native_files: None,
+        };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    pub(crate) fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        #[cfg(any(unix, windows))]
+        if let Some(files) = &self.native_files {
+            files.check()?;
+        }
+        let started = std::time::Instant::now();
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| StateError::Database("sqlite mutex poisoned".into()))?;
+        #[cfg(any(unix, windows))]
+        if let Some(files) = &self.native_files {
+            files.check()?;
+        }
+        self.lock_timings.record_writer(started.elapsed());
+        Ok(guard)
+    }
+
+    pub(crate) fn browse_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        #[cfg(any(unix, windows))]
+        if let Some(files) = &self.native_files {
+            files.check()?;
+        }
+        // A separate read path must not advertise a healthy writer after a
+        // panic. Ordinary in-memory fixtures keep the existing single connection.
+        if self.conn.is_poisoned() {
+            return Err(StateError::Database("sqlite mutex poisoned".into()));
+        }
+        let started = std::time::Instant::now();
+        let reader = self
+            .browse_reader
+            .as_ref()
+            .unwrap_or(&self.conn)
+            .lock()
+            .map_err(|_| StateError::Database("sqlite browse mutex poisoned".into()))?;
+        #[cfg(any(unix, windows))]
+        if let Some(files) = &self.native_files {
+            files.check()?;
+        }
+        if self.conn.is_poisoned() {
+            return Err(StateError::Database("sqlite mutex poisoned".into()));
+        }
+        self.lock_timings.record_monitoring(started.elapsed());
+        Ok(reader)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub fn open_native(_: &Path) -> Result<Self> {
+        Err(StateError::Invalid(
+            "native private SQLite file confinement is unsupported on this platform".into(),
+        ))
+    }
+
+    /// Agent-cumulative, independently sampled diagnostics. These are neither
+    /// operation wall times nor admission, capture or health authority.
+    pub fn contention_snapshot(&self) -> DbContentionSnapshot {
+        self.lock_timings.snapshot()
+    }
+
+    pub fn integrity_check(&self) -> Result<String> {
+        self.lock()?
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(db_err)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(db_err)?;
+        tx.execute_batch(MIGRATION_V1).map_err(db_err)?;
+        tx.execute_batch(MIGRATION_V2).map_err(db_err)?;
+        tx.execute_batch(MIGRATION_V3).map_err(db_err)?;
+        let has_v4: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=4)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if !has_v4 {
+            // Seed the latest-reference projection only once. Its triggers and
+            // the persisted generation become visible in the same transaction.
+            tx.execute_batch(MIGRATION_V4).map_err(db_err)?;
+        }
+        tx.execute_batch(MIGRATION_V5).map_err(db_err)?;
+        tx.execute_batch(MIGRATION_V6).map_err(db_err)?;
+        tx.execute_batch(MIGRATION_V7).map_err(db_err)?;
+        for version in 1..=SCHEMA_VERSION {
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+                params![version, now_secs()],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    pub fn upsert_app(&self, identity: &AppIdentity) -> Result<()> {
+        let now = now_secs();
+        let aliases = serde_json::to_string(&identity.aliases)?;
+        self.lock()?
+            .execute(
+                r#"
+                INSERT INTO apps (
+                    app_id, display_name, canonical_executable, desktop_entry_id,
+                    steam_app_id, launcher_kind, aliases_json, identity_confidence,
+                    icon_path, created_at, updated_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)
+                ON CONFLICT(app_id) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    canonical_executable=COALESCE(excluded.canonical_executable, apps.canonical_executable),
+                    desktop_entry_id=COALESCE(excluded.desktop_entry_id, apps.desktop_entry_id),
+                    steam_app_id=COALESCE(excluded.steam_app_id, apps.steam_app_id),
+                    launcher_kind=COALESCE(excluded.launcher_kind, apps.launcher_kind),
+                    aliases_json=excluded.aliases_json,
+                    identity_confidence=MAX(apps.identity_confidence, excluded.identity_confidence),
+                    icon_path=COALESCE(excluded.icon_path, apps.icon_path),
+                    updated_at=excluded.updated_at
+                "#,
+                params![
+                    identity.app_id.as_str(),
+                    identity.display_name,
+                    identity
+                        .canonical_executable
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    identity.desktop_entry_id,
+                    identity.steam_app_id.map(|v| v as i64),
+                    identity.launcher.map(|l| l.as_str().to_string()),
+                    aliases,
+                    identity.identity_confidence,
+                    identity
+                        .icon_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    now,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn get_app(&self, app_id: &AppId) -> Result<Option<AppIdentity>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT app_id, display_name, canonical_executable, desktop_entry_id,
+                          steam_app_id, launcher_kind, aliases_json, identity_confidence, icon_path
+                   FROM apps WHERE app_id=?1"#,
+                params![app_id.as_str()],
+                row_to_identity,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn list_apps(&self) -> Result<Vec<AppIdentity>> {
+        let conn = self.lock()?;
+        Self::query_apps(&conn)
+    }
+
+    /// Last committed index data for display, never execution/root authority.
+    /// Observer/checkpoint work cannot hold this connection's Rust mutex.
+    pub fn indexed_apps_for_browse(&self) -> Result<Vec<AppIdentity>> {
+        let conn = self.browse_lock()?;
+        Self::query_apps(&conn)
+    }
+
+    fn query_apps(conn: &Connection) -> Result<Vec<AppIdentity>> {
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT app_id, display_name, canonical_executable, desktop_entry_id,
+                          steam_app_id, launcher_kind, aliases_json, identity_confidence, icon_path
+                   FROM apps ORDER BY display_name"#,
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], row_to_identity)
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn insert_session(&self, session: &AppSession) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"INSERT INTO app_sessions (
+                    session_id, app_id, root_pid, cgroup_path, source,
+                    started_at, ended_at, identity_confidence
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"#,
+                params![
+                    session.session_id.to_string(),
+                    session.app_id.as_str(),
+                    session.root_pid,
+                    session.cgroup_path,
+                    session.source.as_str(),
+                    session.started_at.timestamp(),
+                    session.ended_at.map(|t| t.timestamp()),
+                    session.identity_confidence,
+                ],
+            )
+            .map_err(db_err)?;
+        self.attach_pid(session.session_id, session.root_pid, None, None)?;
+        Ok(())
+    }
+
+    pub fn attach_pid(
+        &self,
+        session_id: Uuid,
+        pid: i32,
+        ppid: Option<i32>,
+        executable: Option<&str>,
+    ) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"INSERT INTO session_pids (pid, session_id, ppid, executable, attached_at)
+                   VALUES (?1,?2,?3,?4,?5)
+                   ON CONFLICT(pid) DO UPDATE SET session_id=excluded.session_id"#,
+                params![pid, session_id.to_string(), ppid, executable, now_secs()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn detach_pid(&self, pid: i32) -> Result<()> {
+        self.lock()?
+            .execute("DELETE FROM session_pids WHERE pid=?1", params![pid])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn session_for_pid(&self, pid: i32) -> Result<Option<AppSession>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT s.session_id, s.app_id, s.root_pid, s.cgroup_path, s.source,
+                          s.started_at, s.ended_at, s.identity_confidence
+                   FROM session_pids p
+                   JOIN app_sessions s ON s.session_id = p.session_id
+                   WHERE p.pid=?1"#,
+                params![pid],
+                row_to_session,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn open_session_app_ids(&self) -> Result<Vec<AppId>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT app_id FROM app_sessions WHERE ended_at IS NULL")
+            .map_err(db_err)?;
+        let app_ids = stmt
+            .query_map([], |row| row.get::<_, String>(0).map(AppId))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(app_ids)
+    }
+
+    pub fn open_sessions(&self) -> Result<Vec<AppSession>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT session_id, app_id, root_pid, cgroup_path, source,
+                          started_at, ended_at, identity_confidence
+                   FROM app_sessions WHERE ended_at IS NULL
+                   ORDER BY started_at"#,
+            )
+            .map_err(db_err)?;
+        let sessions = stmt
+            .query_map([], row_to_session)
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(sessions)
+    }
+
+    pub fn session_pids(&self, session_id: Uuid) -> Result<Vec<i32>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT pid FROM session_pids WHERE session_id=?1 ORDER BY pid")
+            .map_err(db_err)?;
+        let pids = stmt
+            .query_map(params![session_id.to_string()], |row| row.get(0))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(pids)
+    }
+
+    pub fn open_session_for_app(&self, app_id: &AppId) -> Result<Option<AppSession>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT session_id, app_id, root_pid, cgroup_path, source,
+                          started_at, ended_at, identity_confidence
+                   FROM app_sessions WHERE app_id=?1 AND ended_at IS NULL
+                   ORDER BY started_at DESC LIMIT 1"#,
+                params![app_id.as_str()],
+                row_to_session,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn end_session(&self, session_id: Uuid) -> Result<()> {
+        self.lock()?
+            .execute(
+                "UPDATE app_sessions SET ended_at=?1 WHERE session_id=?2",
+                params![now_secs(), session_id.to_string()],
+            )
+            .map_err(db_err)?;
+        self.lock()?
+            .execute(
+                "DELETE FROM session_pids WHERE session_id=?1",
+                params![session_id.to_string()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn upsert_path(&self, canonical: &str) -> Result<i64> {
+        self.lock()?
+            .execute(
+                "INSERT INTO paths (canonical_path) VALUES (?1) ON CONFLICT(canonical_path) DO NOTHING",
+                params![canonical],
+            )
+            .map_err(db_err)?;
+        self.lock()?
+            .query_row(
+                "SELECT path_id FROM paths WHERE canonical_path=?1",
+                params![canonical],
+                |row| row.get(0),
+            )
+            .map_err(db_err)
+    }
+
+    pub fn update_path_meta(&self, path_id: i64, record: &PathRecord) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"UPDATE paths SET logical_root=?2, relative_path=?3, file_type=?4,
+                       inode=?5, size=?6, mtime_ns=?7, mode=?8, uid=?9, gid=?10,
+                       content_hash=?11, last_scanned_at=?12
+                   WHERE path_id=?1"#,
+                params![
+                    path_id,
+                    record.logical_root,
+                    record.relative_path,
+                    record.file_type,
+                    record.inode,
+                    record.size,
+                    record.mtime_ns,
+                    record.mode,
+                    record.uid,
+                    record.gid,
+                    record.content_hash,
+                    record.last_scanned_at,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Bounded scan writes. The optional association is the pass's original
+    /// snapshot: a concurrent observer update must win over scan classification.
+    /// Filesystem access and classification happen before this short transaction.
+    pub fn upsert_scanned_paths(
+        &self,
+        entries: &[(PathRecord, PathAssociation, Option<PathAssociation>)],
+    ) -> Result<()> {
+        for batch in entries.chunks(512) {
+            let serialized = batch
+                .iter()
+                .map(|(_, association, previous)| {
+                    Ok((
+                        serde_json::to_string(&association.evidence)?,
+                        previous
+                            .as_ref()
+                            .map(|old| serde_json::to_string(&old.evidence))
+                            .transpose()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut conn = self.lock()?;
+            let tx = conn.transaction().map_err(db_err)?;
+            {
+                let mut path_stmt = tx.prepare(
+                    r#"INSERT INTO paths (canonical_path, logical_root, relative_path, file_type,
+                           inode, mount_id, size, mtime_ns, mode, uid, gid, content_hash, last_scanned_at)
+                       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                       ON CONFLICT(canonical_path) DO UPDATE SET
+                           logical_root=excluded.logical_root, relative_path=excluded.relative_path,
+                           file_type=excluded.file_type, inode=excluded.inode, mount_id=excluded.mount_id,
+                           size=excluded.size, mtime_ns=excluded.mtime_ns, mode=excluded.mode,
+                           uid=excluded.uid, gid=excluded.gid, content_hash=excluded.content_hash,
+                           last_scanned_at=excluded.last_scanned_at
+                       RETURNING path_id"#,
+                ).map_err(db_err)?;
+                let mut assoc_stmt = tx.prepare(
+                    r#"INSERT INTO path_associations (path_id, app_id, confidence, persistence_class,
+                           semantic_role, evidence_json, first_seen_at, last_seen_at)
+                       VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                       ON CONFLICT(path_id, app_id) DO UPDATE SET
+                           confidence=excluded.confidence, persistence_class=excluded.persistence_class,
+                           semantic_role=excluded.semantic_role, evidence_json=excluded.evidence_json,
+                           last_seen_at=excluded.last_seen_at
+                       WHERE path_associations.confidence=?9 AND path_associations.evidence_json=?10
+                           AND path_associations.last_seen_at=?11
+                           AND path_associations.persistence_class=?12 AND path_associations.semantic_role=?13"#,
+                ).map_err(db_err)?;
+                for ((record, association, previous), (evidence, old_evidence)) in
+                    batch.iter().zip(&serialized)
+                {
+                    let path_id: i64 = path_stmt
+                        .query_row(
+                            params![
+                                record.canonical_path,
+                                record.logical_root,
+                                record.relative_path,
+                                record.file_type,
+                                record.inode,
+                                record.mount_id,
+                                record.size,
+                                record.mtime_ns,
+                                record.mode,
+                                record.uid,
+                                record.gid,
+                                record.content_hash,
+                                record.last_scanned_at,
+                            ],
+                            |row| row.get(0),
+                        )
+                        .map_err(db_err)?;
+                    assoc_stmt
+                        .execute(params![
+                            path_id,
+                            association.app_id.as_str(),
+                            association.confidence,
+                            association.persistence_class.as_str(),
+                            association.semantic_role.as_str(),
+                            evidence,
+                            association.first_seen_at.timestamp(),
+                            association.last_seen_at.timestamp(),
+                            previous.as_ref().map(|old| old.confidence),
+                            old_evidence,
+                            previous.as_ref().map(|old| old.last_seen_at.timestamp()),
+                            previous.as_ref().map(|old| old.persistence_class.as_str()),
+                            previous.as_ref().map(|old| old.semantic_role.as_str()),
+                        ])
+                        .map_err(db_err)?;
+                }
+            }
+            tx.commit().map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot the relevant baseline/package, ownership count and exact policy
+    /// in bounded queries, instead of several SQLite calls per classified path.
+    pub fn classification_inputs(
+        &self,
+        app_id: &AppId,
+        image_id: &str,
+        path_ids: &[i64],
+    ) -> Result<HashMap<i64, (Option<(Option<i64>, Option<String>)>, usize, Option<String>)>> {
+        let mut result = HashMap::new();
+        for ids in path_ids.chunks(800) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT p.path_id, b.canonical_path, b.size, b.package_owner,
+                       (SELECT COUNT(*) FROM path_associations a
+                        WHERE a.path_id=p.path_id AND a.confidence>=?3),
+                       COALESCE((SELECT policy FROM path_policies WHERE canonical_path=p.canonical_path AND app_id=?1),
+                                (SELECT policy FROM path_policies WHERE canonical_path=p.canonical_path AND app_id IS NULL))
+                   FROM paths p LEFT JOIN image_baseline b ON b.canonical_path=p.canonical_path AND b.image_id=?2
+                   WHERE p.path_id IN ({placeholders})"#
+            );
+            let mut values = vec![
+                rusqlite::types::Value::Text(app_id.as_str().to_owned()),
+                rusqlite::types::Value::Text(image_id.to_owned()),
+                rusqlite::types::Value::Real(OWNERSHIP_CANDIDATE_MIN as f64),
+            ];
+            values.extend(ids.iter().copied().map(rusqlite::types::Value::Integer));
+            let conn = self.lock()?;
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values), |row| {
+                    let baseline_path: Option<String> = row.get(1)?;
+                    let baseline = if baseline_path.is_some() {
+                        Some((
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        (baseline, row.get::<_, i64>(4)? as usize, row.get(5)?),
+                    ))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                let (id, inputs) = row.map_err(db_err)?;
+                result.insert(id, inputs);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Only change the labels computed from this snapshot, never overwrite live
+    /// observer evidence or confidence with a cached association.
+    pub fn update_classifications(
+        &self,
+        updates: &[(PathAssociation, PersistenceClass, SemanticRole)],
+    ) -> Result<usize> {
+        let mut changed = 0;
+        for batch in updates.chunks(512) {
+            let evidence = batch
+                .iter()
+                .map(|(old, _, _)| serde_json::to_string(&old.evidence))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut conn = self.lock()?;
+            let tx = conn.transaction().map_err(db_err)?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        r#"UPDATE path_associations SET persistence_class=?3, semantic_role=?4
+                       WHERE app_id=?1 AND path_id=?2 AND confidence=?5 AND evidence_json=?6
+                           AND last_seen_at=?7 AND persistence_class=?8 AND semantic_role=?9"#,
+                    )
+                    .map_err(db_err)?;
+                for ((old, class, role), evidence) in batch.iter().zip(&evidence) {
+                    changed += stmt
+                        .execute(params![
+                            old.app_id.as_str(),
+                            old.path_id,
+                            class.as_str(),
+                            role.as_str(),
+                            old.confidence,
+                            evidence,
+                            old.last_seen_at.timestamp(),
+                            old.persistence_class.as_str(),
+                            old.semantic_role.as_str()
+                        ])
+                        .map_err(db_err)?;
+                }
+            }
+            tx.commit().map_err(db_err)?;
+        }
+        Ok(changed)
+    }
+
+    /// Acknowledge a successful scan only if observation has not advanced. A
+    /// selective install scan clears just its roots; it cannot clear unrelated
+    /// dirty-root requirements. Dirty paths/mutations still require a backup.
+    pub fn finish_reconciliation(
+        &self,
+        app_id: &AppId,
+        captured_generation: i64,
+        scanned_roots: Option<&[String]>,
+    ) -> Result<bool> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        let generation: i64 = tx
+            .query_row(
+                "SELECT generation FROM capture_generations WHERE app_id=?1",
+                [app_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(0);
+        if generation != captured_generation {
+            tx.execute(
+                "UPDATE file_state_index SET trust_state='VERIFY_REQUIRED' WHERE app_id=?1",
+                [app_id.as_str()],
+            )
+            .map_err(db_err)?;
+            tx.commit().map_err(db_err)?;
+            return Ok(false);
+        }
+        if let Some(roots) = scanned_roots {
+            let mut stmt = tx
+                .prepare("DELETE FROM dirty_roots WHERE app_id=?1 AND canonical_root=?2")
+                .map_err(db_err)?;
+            for root in roots {
+                stmt.execute(params![app_id.as_str(), root])
+                    .map_err(db_err)?;
+            }
+        } else {
+            tx.execute("DELETE FROM dirty_roots WHERE app_id=?1", [app_id.as_str()])
+                .map_err(db_err)?;
+        }
+        tx.execute(
+            "UPDATE dirty_apps SET requires_reconciliation=0 WHERE app_id=?1 AND NOT EXISTS (SELECT 1 FROM dirty_roots WHERE app_id=?1 AND requires_reconciliation=1)",
+            [app_id.as_str()],
+        ).map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(true)
+    }
+
+    pub fn get_path_by_id(&self, path_id: i64) -> Result<Option<PathRecord>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT path_id, canonical_path, logical_root, relative_path, file_type,
+                          inode, mount_id, size, mtime_ns, mode, uid, gid, content_hash, last_scanned_at
+                   FROM paths WHERE path_id=?1"#,
+                params![path_id],
+                row_to_path,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn get_path_by_canonical(&self, canonical: &str) -> Result<Option<PathRecord>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT path_id, canonical_path, logical_root, relative_path, file_type,
+                          inode, mount_id, size, mtime_ns, mode, uid, gid, content_hash, last_scanned_at
+                   FROM paths WHERE canonical_path=?1"#,
+                params![canonical],
+                row_to_path,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn upsert_association(&self, assoc: &PathAssociation) -> Result<()> {
+        let evidence = serde_json::to_string(&assoc.evidence)?;
+        self.lock()?
+            .execute(
+                r#"
+                INSERT INTO path_associations (
+                    path_id, app_id, confidence, persistence_class, semantic_role,
+                    evidence_json, first_seen_at, last_seen_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                ON CONFLICT(path_id, app_id) DO UPDATE SET
+                    confidence=excluded.confidence,
+                    persistence_class=excluded.persistence_class,
+                    semantic_role=excluded.semantic_role,
+                    evidence_json=excluded.evidence_json,
+                    last_seen_at=excluded.last_seen_at
+                "#,
+                params![
+                    assoc.path_id,
+                    assoc.app_id.as_str(),
+                    assoc.confidence,
+                    assoc.persistence_class.as_str(),
+                    assoc.semantic_role.as_str(),
+                    evidence,
+                    assoc.first_seen_at.timestamp(),
+                    assoc.last_seen_at.timestamp(),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn upsert_restored_path_associations(
+        &self,
+        app_id: &AppId,
+        entries: &[RestoredPathAssociationInput],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let evidence = serde_json::to_string(&vec![Evidence::new(
+            EvidenceKind::RestoredFromCommittedBundle,
+        )])?;
+        let now = now_secs();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        {
+            let mut insert_path = tx
+                .prepare(
+                    "INSERT INTO paths (canonical_path) VALUES (?1) \
+                     ON CONFLICT(canonical_path) DO NOTHING",
+                )
+                .map_err(db_err)?;
+            let mut select_path = tx
+                .prepare("SELECT path_id FROM paths WHERE canonical_path=?1")
+                .map_err(db_err)?;
+            let mut upsert_association = tx
+                .prepare(
+                    r#"
+                    INSERT INTO path_associations (
+                        path_id, app_id, confidence, persistence_class, semantic_role,
+                        evidence_json, first_seen_at, last_seen_at
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                    ON CONFLICT(path_id, app_id) DO UPDATE SET
+                        confidence=excluded.confidence,
+                        persistence_class=excluded.persistence_class,
+                        semantic_role=excluded.semantic_role,
+                        evidence_json=excluded.evidence_json,
+                        last_seen_at=excluded.last_seen_at
+                    "#,
+                )
+                .map_err(db_err)?;
+
+            for entry in entries {
+                insert_path
+                    .execute(params![entry.canonical_path])
+                    .map_err(db_err)?;
+                let path_id = select_path
+                    .query_row(params![entry.canonical_path], |row| row.get::<_, i64>(0))
+                    .map_err(db_err)?;
+                upsert_association
+                    .execute(params![
+                        path_id,
+                        app_id.as_str(),
+                        CONF_EXPLICIT,
+                        entry.persistence_class.as_str(),
+                        entry.semantic_role.as_str(),
+                        evidence,
+                        now,
+                        now,
+                    ])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    pub fn associations_for_app(
+        &self,
+        app_id: &AppId,
+    ) -> Result<Vec<(PathRecord, PathAssociation)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT p.path_id, p.canonical_path, p.logical_root, p.relative_path, p.file_type,
+                          p.inode, p.mount_id, p.size, p.mtime_ns, p.mode, p.uid, p.gid,
+                          p.content_hash, p.last_scanned_at,
+                          a.path_id, a.app_id, a.confidence, a.persistence_class, a.semantic_role,
+                          a.evidence_json, a.first_seen_at, a.last_seen_at
+                   FROM path_associations a
+                   JOIN paths p ON p.path_id = a.path_id
+                   WHERE a.app_id=?1
+                   ORDER BY a.confidence DESC"#,
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![app_id.as_str()], |row| {
+                Ok((row_to_path(row)?, row_to_assoc_from(row, 14)?))
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn likely_backup_associations(
+        &self,
+        app_id: &AppId,
+    ) -> Result<Vec<(PathRecord, PathAssociation)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT p.path_id, p.canonical_path, p.logical_root, p.relative_path, p.file_type,
+                          p.inode, p.mount_id, p.size, p.mtime_ns, p.mode, p.uid, p.gid,
+                          p.content_hash, p.last_scanned_at,
+                          a.path_id, a.app_id, a.confidence, a.persistence_class, a.semantic_role,
+                          a.evidence_json, a.first_seen_at, a.last_seen_at
+                   FROM path_associations a
+                   JOIN paths p ON p.path_id = a.path_id
+                   WHERE a.app_id=?1 AND (
+                       a.persistence_class IN ('PERSISTENT_STATE','SHARED_STATE')
+                       OR a.semantic_role IN ('USER_STATE','SECRET')
+                       OR a.confidence >= 0.70
+                       OR EXISTS (
+                           SELECT 1 FROM path_policies policy
+                           WHERE policy.canonical_path=p.canonical_path
+                             AND (policy.app_id IS NULL OR policy.app_id=a.app_id)
+                             AND policy.policy IN ('include','shared','secret','force-persistent')
+                       )
+                   )
+                   ORDER BY p.canonical_path"#,
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![app_id.as_str()], |row| {
+                Ok((row_to_path(row)?, row_to_assoc_from(row, 14)?))
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn associations_for_paths(
+        &self,
+        path_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<PathAssociation>>> {
+        let mut associations = HashMap::new();
+        for ids in path_ids.chunks(900) {
+            if ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT path_id, app_id, confidence, persistence_class, semantic_role, \
+                 evidence_json, first_seen_at, last_seen_at FROM path_associations \
+                 WHERE path_id IN ({placeholders})"
+            );
+            let conn = self.lock()?;
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+                    row_to_assoc_from(row, 0)
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                let association = row.map_err(db_err)?;
+                associations
+                    .entry(association.path_id)
+                    .or_insert_with(Vec::new)
+                    .push(association);
+            }
+        }
+        Ok(associations)
+    }
+
+    pub fn associations_for_path(&self, path_id: i64) -> Result<Vec<PathAssociation>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT path_id, app_id, confidence, persistence_class, semantic_role,
+                          evidence_json, first_seen_at, last_seen_at
+                   FROM path_associations WHERE path_id=?1"#,
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![path_id], |row| row_to_assoc_from(row, 0))
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn mark_dirty(
+        &self,
+        app_id: &AppId,
+        path_id: Option<i64>,
+        requires_reconciliation: bool,
+    ) -> Result<()> {
+        let now = now_secs();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        tx
+            .execute(
+                r#"
+                INSERT INTO dirty_apps (app_id, first_dirty_at, last_dirty_at, requires_reconciliation)
+                VALUES (?1,?2,?2,?3)
+                ON CONFLICT(app_id) DO UPDATE SET
+                    last_dirty_at=excluded.last_dirty_at,
+                    requires_reconciliation=MAX(dirty_apps.requires_reconciliation, excluded.requires_reconciliation)
+                "#,
+                params![app_id.as_str(), now, requires_reconciliation as i64],
+            )
+            .map_err(db_err)?;
+        if let Some(path_id) = path_id {
+            tx.execute(
+                "INSERT OR IGNORE INTO dirty_paths (app_id, path_id) VALUES (?1,?2)",
+                params![app_id.as_str(), path_id],
+            )
+            .map_err(db_err)?;
+        }
+        crate::persistence::bump_capture_generation(&tx, app_id)?;
+        if requires_reconciliation {
+            tx.execute(
+                "UPDATE file_state_index SET trust_state='VERIFY_REQUIRED'
+                 WHERE app_id=?1 AND trust_state<>'VERIFY_REQUIRED'",
+                [app_id.as_str()],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_reconciliation_required(&self, app_id: &AppId) -> Result<()> {
+        self.lock()?
+            .execute(
+                "UPDATE dirty_apps SET requires_reconciliation=0 WHERE app_id=?1",
+                params![app_id.as_str()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn clear_dirty(&self, app_id: &AppId) -> Result<()> {
+        self.lock()?
+            .execute(
+                "DELETE FROM dirty_apps WHERE app_id=?1",
+                params![app_id.as_str()],
+            )
+            .map_err(db_err)?;
+        self.lock()?
+            .execute(
+                "DELETE FROM dirty_paths WHERE app_id=?1",
+                params![app_id.as_str()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn list_dirty_apps(&self) -> Result<Vec<DirtyState>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT app_id, first_dirty_at, last_dirty_at, requires_reconciliation FROM dirty_apps",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for (app_id, first, last, recon) in rows {
+            let mut pstmt = conn
+                .prepare("SELECT path_id FROM dirty_paths WHERE app_id=?1")
+                .map_err(db_err)?;
+            let dirty_paths = pstmt
+                .query_map(params![app_id], |r| r.get(0))
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            out.push(DirtyState {
+                app_id: AppId(app_id),
+                first_dirty_at: secs_to_dt(first),
+                last_dirty_at: secs_to_dt(last),
+                dirty_paths,
+                requires_reconciliation: recon != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn add_known_root(&self, app_id: &AppId, kind: &str, path: &str) -> Result<()> {
+        self.lock()?
+            .execute(
+                "INSERT OR IGNORE INTO known_roots (app_id, kind, canonical_path) VALUES (?1,?2,?3)",
+                params![app_id.as_str(), kind, path],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Remember that this app had a runtime registration even before any private
+    /// file was indexed. Removing that record must not permit original-only
+    /// complete capture. The marker survives learned checkpoints but is hidden
+    /// from every ordinary known-root consumer.
+    pub fn require_runtime_binding(&self, app_id: &AppId, source_executable: &str) -> Result<()> {
+        self.add_known_root(app_id, RUNTIME_BINDING_REQUIRED, source_executable)
+    }
+
+    pub fn runtime_binding_required(&self, app_id: &AppId) -> Result<bool> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM known_roots WHERE app_id=?1 AND kind=?2)",
+                params![app_id.as_str(), RUNTIME_BINDING_REQUIRED],
+                |row| row.get(0),
+            )
+            .map_err(db_err)
+    }
+
+    pub fn known_roots(&self, app_id: Option<&AppId>) -> Result<Vec<(AppId, String, String)>> {
+        let mut out = Vec::new();
+        if let Some(app_id) = app_id {
+            let conn = self.lock()?;
+            let mut stmt = conn
+                .prepare("SELECT app_id, kind, canonical_path FROM known_roots WHERE app_id=?1 AND kind<>?2")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![app_id.as_str(), RUNTIME_BINDING_REQUIRED], |row| {
+                    Ok((
+                        AppId(row.get::<_, String>(0)?),
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                out.push(row.map_err(db_err)?);
+            }
+        } else {
+            let conn = self.lock()?;
+            let mut stmt = conn
+                .prepare("SELECT app_id, kind, canonical_path FROM known_roots WHERE kind<>?1")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([RUNTIME_BINDING_REQUIRED], |row| {
+                    Ok((
+                        AppId(row.get::<_, String>(0)?),
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(db_err)?;
+            for row in rows {
+                out.push(row.map_err(db_err)?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn insert_installer(&self, tx: &InstallerTransaction) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"INSERT INTO installer_transactions (
+                    transaction_id, app_id, session_id, transaction_type, confidence,
+                    candidate_roots_json, started_at, ended_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"#,
+                params![
+                    tx.transaction_id.to_string(),
+                    tx.app_id.as_str(),
+                    tx.session_id.map(|s| s.to_string()),
+                    tx.transaction_type.as_str(),
+                    tx.confidence,
+                    serde_json::to_string(&tx.candidate_roots)?,
+                    tx.started_at.timestamp(),
+                    tx.ended_at.map(|t| t.timestamp()),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn finish_installer(&self, transaction_id: Uuid) -> Result<()> {
+        self.lock()?
+            .execute(
+                "UPDATE installer_transactions SET ended_at=?1 WHERE transaction_id=?2",
+                params![now_secs(), transaction_id.to_string()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn open_installers(&self) -> Result<Vec<InstallerTransaction>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT transaction_id, app_id, session_id, transaction_type, confidence,
+                          candidate_roots_json, started_at, ended_at
+                   FROM installer_transactions WHERE ended_at IS NULL"#,
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], row_to_installer)
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn record_commit(
+        &self,
+        commit_id: Uuid,
+        app_id: &AppId,
+        bundle_id: Uuid,
+        manifest_hash: &str,
+        cloud_path: Option<&str>,
+        state: CommitVisibility,
+    ) -> Result<()> {
+        let now = now_secs();
+        let committed_at = if state == CommitVisibility::Committed {
+            Some(now)
+        } else {
+            None
+        };
+        let changed = self.lock()?
+            .execute(
+                r#"INSERT INTO bundle_commits (
+                    commit_id, app_id, bundle_id, manifest_hash, cloud_path, state, created_at, committed_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                ON CONFLICT(commit_id) DO UPDATE SET
+                    manifest_hash=CASE WHEN bundle_commits.manifest_hash='pending'
+                        THEN excluded.manifest_hash ELSE bundle_commits.manifest_hash END,
+                    state=excluded.state,
+                    cloud_path=COALESCE(excluded.cloud_path, bundle_commits.cloud_path),
+                    committed_at=COALESCE(excluded.committed_at, bundle_commits.committed_at)
+                WHERE bundle_commits.app_id=excluded.app_id
+                    AND bundle_commits.bundle_id=excluded.bundle_id
+                    AND (bundle_commits.manifest_hash='pending'
+                        OR excluded.manifest_hash='pending'
+                        OR bundle_commits.manifest_hash=excluded.manifest_hash)
+                "#,
+                params![
+                    commit_id.to_string(),
+                    app_id.as_str(),
+                    bundle_id.to_string(),
+                    manifest_hash,
+                    cloud_path,
+                    state.as_str(),
+                    now,
+                    committed_at,
+                ],
+            )
+            .map_err(db_err)?;
+        if changed == 0 {
+            return Err(StateError::Conflict(
+                "commit identity or manifest digest differs from the recorded revision".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn latest_commit(&self, app_id: &AppId) -> Result<Option<(Uuid, Uuid, String)>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT commit_id, bundle_id, manifest_hash FROM bundle_commits
+                   WHERE app_id=?1 AND state='COMMITTED'
+                   ORDER BY committed_at DESC, rowid DESC LIMIT 1"#,
+                params![app_id.as_str()],
+                |row| {
+                    Ok((
+                        Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or(Uuid::nil()),
+                        Uuid::parse_str(&row.get::<_, String>(1)?).unwrap_or(Uuid::nil()),
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn upsert_operation(&self, op: &OperationRecord) -> Result<()> {
+        // Serialize outside the connection lock; large terminal results never
+        // need to be parsed or copied by progress/reattachment readers.
+        let detail = op.detail_json.to_string();
+        let projection = crate::projections::matching_details(&op.detail_json).to_string();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        tx
+            .execute(
+                r#"INSERT INTO operations (
+                    operation_id, kind, app_id, state, created_at, updated_at, last_error, detail_json
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                ON CONFLICT(operation_id) DO UPDATE SET
+                    state=excluded.state,
+                    updated_at=excluded.updated_at,
+                    last_error=excluded.last_error,
+                    detail_json=excluded.detail_json
+                "#,
+                params![
+                    op.operation_id.to_string(),
+                    op.kind,
+                    op.app_id.as_ref().map(|a| a.as_str().to_string()),
+                    op.state,
+                    op.created_at.timestamp(),
+                    op.updated_at.timestamp(),
+                    op.last_error,
+                    detail,
+                ],
+            )
+            .map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO operation_projections(operation_id, detail_json) VALUES (?1,?2)
+             ON CONFLICT(operation_id) DO UPDATE SET detail_json=excluded.detail_json
+             WHERE operation_projections.detail_json IS NOT excluded.detail_json",
+            params![op.operation_id.to_string(), projection],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn get_operation(&self, id: Uuid) -> Result<Option<OperationRecord>> {
+        self.lock()?
+            .query_row(
+                r#"SELECT operation_id, kind, app_id, state, created_at, updated_at, last_error, detail_json
+                   FROM operations WHERE operation_id=?1"#,
+                params![id.to_string()],
+                row_to_operation,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn unfinished_operation_count(&self) -> Result<usize> {
+        let conn = self.lock()?;
+        Self::query_unfinished_count(&conn)
+    }
+
+    /// The exact committed count, not a cached/default zero when the writer is
+    /// busy. Active managed work is additionally reported by OperationManager.
+    pub fn unfinished_operation_count_for_health(&self) -> Result<usize> {
+        let conn = self.browse_lock()?;
+        Self::query_unfinished_count(&conn)
+    }
+
+    fn query_unfinished_count(conn: &Connection) -> Result<usize> {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE state NOT IN (
+            'COMPLETED','FAILED','CANCELLED','SEALED','ROLLED_BACK','INTERRUPTED')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    pub fn unfinished_operations(&self) -> Result<Vec<OperationRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                r#"SELECT operation_id, kind, app_id, state, created_at, updated_at, last_error, detail_json
+                   FROM operations WHERE state NOT IN (
+                     'COMPLETED','FAILED','CANCELLED','SEALED','ROLLED_BACK'
+                   )"#,
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], row_to_operation)
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn journal_put(
+        &self,
+        operation_id: &str,
+        item_key: &str,
+        direction: &str,
+        state: &str,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"INSERT INTO sync_journal (operation_id, item_key, direction, state, attempts, last_error, updated_at)
+                   VALUES (?1,?2,?3,?4,1,?5,?6)
+                   ON CONFLICT(operation_id, item_key) DO UPDATE SET
+                     state=excluded.state,
+                     attempts=sync_journal.attempts+1,
+                     last_error=excluded.last_error,
+                     updated_at=excluded.updated_at"#,
+                params![operation_id, item_key, direction, state, last_error, now_secs()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn remember_chunks_bulk(&self, chunks: &[(String, Option<String>, u64)]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    r#"INSERT INTO chunk_index (chunk_hash, pack_id, size, created_at)
+                       VALUES (?1,?2,?3,?4)
+                       ON CONFLICT(chunk_hash) DO UPDATE SET
+                           pack_id=COALESCE(excluded.pack_id, chunk_index.pack_id)"#,
+                )
+                .map_err(db_err)?;
+            let now = now_secs();
+            for (hash, pack_id, size) in chunks {
+                let size = i64::try_from(*size).map_err(|_| {
+                    StateError::Invalid("chunk size exceeds SQLite integer range".into())
+                })?;
+                stmt.execute(params![hash, pack_id, size, now])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn remember_chunk(&self, hash: &str, pack_id: Option<&str>, size: u64) -> Result<()> {
+        self.remember_chunks_bulk(&[(hash.to_string(), pack_id.map(str::to_string), size)])
+    }
+
+    pub fn known_chunk(&self, hash: &str) -> Result<bool> {
+        let found: Option<i64> = self
+            .lock()?
+            .query_row(
+                "SELECT 1 FROM chunk_index WHERE chunk_hash=?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(found.is_some())
+    }
+
+    pub fn insert_baseline(
+        &self,
+        image_id: &str,
+        path: &str,
+        file_type: Option<&str>,
+        size: Option<i64>,
+        mode: Option<i64>,
+        package_owner: Option<&str>,
+        baseline_hash: Option<&str>,
+    ) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"INSERT OR REPLACE INTO image_baseline (
+                    image_id, canonical_path, file_type, size, mode, package_owner, baseline_hash
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7)"#,
+                params![
+                    image_id,
+                    path,
+                    file_type,
+                    size,
+                    mode,
+                    package_owner,
+                    baseline_hash
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn baseline_entry(
+        &self,
+        image_id: &str,
+        path: &str,
+    ) -> Result<Option<(Option<i64>, Option<String>, Option<String>)>> {
+        self.lock()?
+            .query_row(
+                "SELECT size, package_owner, baseline_hash FROM image_baseline WHERE image_id=?1 AND canonical_path=?2",
+                params![image_id, path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn set_path_policy(&self, path: &str, app_id: Option<&AppId>, policy: &str) -> Result<()> {
+        self.lock()?
+            .execute(
+                "INSERT OR REPLACE INTO path_policies (canonical_path, app_id, policy) VALUES (?1,?2,?3)",
+                params![path, app_id.map(|a| a.as_str().to_string()), policy],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn path_policy(&self, path: &str, app_id: Option<&AppId>) -> Result<Option<String>> {
+        if let Some(app_id) = app_id {
+            if let Some(found) = self
+                .lock()?
+                .query_row(
+                    "SELECT policy FROM path_policies WHERE canonical_path=?1 AND app_id=?2",
+                    params![path, app_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_err)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        self.lock()?
+            .query_row(
+                "SELECT policy FROM path_policies WHERE canonical_path=?1 AND app_id IS NULL",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn record_seal(&self, seal: &SealRecord, state: SealState) -> Result<()> {
+        self.lock()?
+            .execute(
+                r#"INSERT INTO seals (seal_id, instance_id, image_id, state, payload_json, created_at, committed_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7)
+                   ON CONFLICT(seal_id) DO UPDATE SET state=excluded.state, payload_json=excluded.payload_json,
+                     committed_at=excluded.committed_at"#,
+                params![
+                    seal.seal_id.to_string(),
+                    seal.instance_id.to_string(),
+                    seal.image_id,
+                    state.as_str(),
+                    serde_json::to_string(seal)?,
+                    now_secs(),
+                    if state == SealState::Sealed {
+                        Some(now_secs())
+                    } else {
+                        None
+                    },
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn latest_seal(&self) -> Result<Option<(SealRecord, SealState)>> {
+        self.lock()?
+            .query_row(
+                "SELECT payload_json, state FROM seals ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| {
+                    let payload: String = row.get(0)?;
+                    let state: String = row.get(1)?;
+                    Ok((payload, state))
+                },
+            )
+            .optional()
+            .map_err(db_err)?
+            .map(|(payload, state)| {
+                let record: SealRecord = serde_json::from_str(&payload)?;
+                Ok((record, SealState::parse(&state)))
+            })
+            .transpose()
+    }
+
+    pub fn insert_restore(
+        &self,
+        restore_id: Uuid,
+        bundle_id: Uuid,
+        app_id: &AppId,
+        staging: &str,
+    ) -> Result<()> {
+        let now = now_secs();
+        self.lock()?
+            .execute(
+                r#"INSERT INTO restore_operations (
+                    restore_id, bundle_id, app_id, state, staging_path, created_at, updated_at, last_error
+                ) VALUES (?1,?2,?3,'QUEUED',?4,?5,?5,NULL)"#,
+                params![
+                    restore_id.to_string(),
+                    bundle_id.to_string(),
+                    app_id.as_str(),
+                    staging,
+                    now
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn update_restore(
+        &self,
+        restore_id: Uuid,
+        state: RestoreState,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.lock()?
+            .execute(
+                "UPDATE restore_operations SET state=?2, updated_at=?3, last_error=?4 WHERE restore_id=?1",
+                params![restore_id.to_string(), state.as_str(), now_secs(), last_error],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "browse_reads_tests.rs"]
+mod browse_reads_tests;
+
+fn db_err(err: rusqlite::Error) -> StateError {
+    StateError::Database(err.to_string())
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn secs_to_dt(secs: i64) -> chrono::DateTime<Utc> {
+    Utc.timestamp_opt(secs, 0).single().unwrap_or_else(Utc::now)
+}
+
+fn row_to_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppIdentity> {
+    let aliases_json: String = row.get(6)?;
+    let aliases = serde_json::from_str(&aliases_json).unwrap_or_default();
+    let launcher: Option<String> = row.get(5)?;
+    let exe: Option<String> = row.get(2)?;
+    let icon: Option<String> = row.get(8)?;
+    Ok(AppIdentity {
+        app_id: AppId(row.get(0)?),
+        display_name: row.get(1)?,
+        canonical_executable: exe.map(std::path::PathBuf::from),
+        desktop_entry_id: row.get(3)?,
+        steam_app_id: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+        launcher: launcher.as_deref().and_then(LauncherKind::parse),
+        aliases,
+        identity_confidence: row.get(7)?,
+        icon_path: icon.map(std::path::PathBuf::from),
+    })
+}
+
+fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AppSession> {
+    let sid: String = row.get(0)?;
+    let started: i64 = row.get(5)?;
+    let ended: Option<i64> = row.get(6)?;
+    let source: String = row.get(4)?;
+    Ok(AppSession {
+        session_id: Uuid::parse_str(&sid).unwrap_or_else(|_| Uuid::nil()),
+        app_id: AppId(row.get(1)?),
+        root_pid: row.get(2)?,
+        cgroup_path: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        started_at: secs_to_dt(started),
+        ended_at: ended.map(secs_to_dt),
+        source: SessionSource::parse(&source),
+        identity_confidence: row.get(7)?,
+    })
+}
+
+fn row_to_path(row: &rusqlite::Row<'_>) -> rusqlite::Result<PathRecord> {
+    Ok(PathRecord {
+        path_id: row.get(0)?,
+        canonical_path: row.get(1)?,
+        logical_root: row.get(2)?,
+        relative_path: row.get(3)?,
+        file_type: row.get(4)?,
+        inode: row.get(5)?,
+        mount_id: row.get(6)?,
+        size: row.get(7)?,
+        mtime_ns: row.get(8)?,
+        mode: row.get(9)?,
+        uid: row.get(10)?,
+        gid: row.get(11)?,
+        content_hash: row.get(12)?,
+        last_scanned_at: row.get(13)?,
+    })
+}
+
+fn row_to_assoc_from(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<PathAssociation> {
+    let evidence_json: String = row.get(offset + 5)?;
+    let evidence = serde_json::from_str(&evidence_json).unwrap_or_default();
+    let class: String = row.get(offset + 3)?;
+    let role: String = row.get(offset + 4)?;
+    Ok(PathAssociation {
+        path_id: row.get(offset)?,
+        app_id: AppId(row.get(offset + 1)?),
+        confidence: row.get(offset + 2)?,
+        persistence_class: PersistenceClass::parse(&class),
+        semantic_role: SemanticRole::parse(&role),
+        evidence,
+        first_seen_at: secs_to_dt(row.get(offset + 6)?),
+        last_seen_at: secs_to_dt(row.get(offset + 7)?),
+    })
+}
+
+fn row_to_installer(row: &rusqlite::Row<'_>) -> rusqlite::Result<InstallerTransaction> {
+    let roots_json: String = row.get(5)?;
+    let roots = serde_json::from_str(&roots_json).unwrap_or_default();
+    let session: Option<String> = row.get(2)?;
+    let ty: String = row.get(3)?;
+    Ok(InstallerTransaction {
+        transaction_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil()),
+        app_id: AppId(row.get(1)?),
+        session_id: session.and_then(|s| Uuid::parse_str(&s).ok()),
+        transaction_type: InstallTransactionType::parse(&ty),
+        confidence: row.get(4)?,
+        candidate_roots: roots,
+        started_at: secs_to_dt(row.get(6)?),
+        ended_at: row.get::<_, Option<i64>>(7)?.map(secs_to_dt),
+    })
+}
+
+fn row_to_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRecord> {
+    let detail: String = row.get(7)?;
+    Ok(OperationRecord {
+        operation_id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap_or_else(|_| Uuid::nil()),
+        kind: row.get(1)?,
+        app_id: row.get::<_, Option<String>>(2)?.map(AppId),
+        state: row.get(3)?,
+        created_at: secs_to_dt(row.get(4)?),
+        updated_at: secs_to_dt(row.get(5)?),
+        last_error: row.get(6)?,
+        detail_json: serde_json::from_str(&detail).unwrap_or(serde_json::json!({})),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_binding_requirement_is_durable_but_never_a_scan_root() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppId::desktop("required-runtime");
+        let other = AppId::desktop("ordinary-native");
+        assert!(!db.runtime_binding_required(&app).unwrap());
+        db.upsert_app(&AppIdentity::new(app.clone(), "Runtime"))
+            .unwrap();
+        db.add_known_root(&app, "install", "/home/user/Games/Runtime")
+            .unwrap();
+        db.require_runtime_binding(&app, "/home/user/Games/Runtime/game")
+            .unwrap();
+        db.require_runtime_binding(&app, "/home/user/Games/Runtime/game")
+            .unwrap();
+        assert!(db.runtime_binding_required(&app).unwrap());
+        assert!(!db.runtime_binding_required(&other).unwrap());
+        assert_eq!(db.known_roots(Some(&app)).unwrap().len(), 1);
+        assert_eq!(db.known_roots(None).unwrap().len(), 1);
+        let checkpoint = db.learned_checkpoint(Uuid::nil(), "fixture").unwrap();
+        let marker = checkpoint
+            .known_roots
+            .iter()
+            .find(|root| root.kind == RUNTIME_BINDING_REQUIRED)
+            .unwrap();
+        let restored = StateDb::open_in_memory().unwrap();
+        restored
+            .add_known_root(&app, &marker.kind, &marker.path)
+            .unwrap();
+        assert!(restored.runtime_binding_required(&app).unwrap());
+        assert!(restored.known_roots(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn committed_digest_replaces_pending_and_survives_retry_preparation() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppId::desktop("commit-digest");
+        let commit = Uuid::new_v4();
+        let bundle = Uuid::new_v4();
+        db.record_commit(
+            commit,
+            &app,
+            bundle,
+            "pending",
+            None,
+            CommitVisibility::Uploading,
+        )
+        .unwrap();
+        assert!(db.latest_commit(&app).unwrap().is_none());
+        db.record_commit(
+            commit,
+            &app,
+            bundle,
+            "blake3:verified",
+            Some("bundle"),
+            CommitVisibility::Committed,
+        )
+        .unwrap();
+        assert_eq!(
+            db.latest_commit(&app).unwrap(),
+            Some((commit, bundle, "blake3:verified".into()))
+        );
+        db.record_commit(
+            commit,
+            &app,
+            bundle,
+            "pending",
+            None,
+            CommitVisibility::Uploading,
+        )
+        .unwrap();
+        let stored: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT manifest_hash FROM bundle_commits WHERE commit_id=?1",
+                [commit.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "blake3:verified");
+        db.record_commit(
+            commit,
+            &app,
+            bundle,
+            "blake3:verified",
+            None,
+            CommitVisibility::Committed,
+        )
+        .unwrap();
+        assert_eq!(
+            db.latest_commit(&app).unwrap().unwrap().2,
+            "blake3:verified"
+        );
+    }
+
+    #[test]
+    fn an_existing_commit_cannot_change_its_digest_application_or_bundle() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppId::desktop("commit-binding");
+        let commit = Uuid::new_v4();
+        let bundle = Uuid::new_v4();
+        db.record_commit(
+            commit,
+            &app,
+            bundle,
+            "blake3:original",
+            Some("original"),
+            CommitVisibility::Committed,
+        )
+        .unwrap();
+        for (candidate_app, candidate_bundle, candidate_hash) in [
+            (app.clone(), bundle, "blake3:changed"),
+            (AppId::desktop("another-app"), bundle, "pending"),
+            (app.clone(), Uuid::new_v4(), "pending"),
+        ] {
+            assert!(matches!(
+                db.record_commit(
+                    commit,
+                    &candidate_app,
+                    candidate_bundle,
+                    candidate_hash,
+                    Some("changed"),
+                    CommitVisibility::Committed,
+                ),
+                Err(StateError::Conflict(_))
+            ));
+            assert_eq!(
+                db.latest_commit(&app).unwrap(),
+                Some((commit, bundle, "blake3:original".into()))
+            );
+        }
+        let cloud_path: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cloud_path FROM bundle_commits WHERE commit_id=?1",
+                [commit.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cloud_path, "original");
+    }
+
+    fn scan_entry(
+        db: &StateDb,
+        app_id: &AppId,
+        path: &str,
+    ) -> (PathRecord, PathAssociation, Option<PathAssociation>) {
+        let path_id = db.upsert_path(path).unwrap();
+        let mut record = db.get_path_by_id(path_id).unwrap().unwrap();
+        record.size = Some(5);
+        record.file_type = Some("file".into());
+        let association = PathAssociation {
+            path_id,
+            app_id: app_id.clone(),
+            confidence: CONF_DEPENDENCY,
+            persistence_class: PersistenceClass::ReconstructableApp,
+            semantic_role: SemanticRole::AppContent,
+            evidence: vec![Evidence::new(EvidenceKind::KnownAppRoot)],
+            first_seen_at: Utc::now(),
+            last_seen_at: Utc::now(),
+        };
+        (record, association, None)
+    }
+
+    #[test]
+    fn scan_batches_and_reclassification_cannot_overwrite_new_observer_evidence() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppIdentity::new(AppId::desktop("scan-race"), "Scan Race");
+        db.upsert_app(&app).unwrap();
+        let mut entry = scan_entry(&db, &app.app_id, "/scan/file");
+        db.upsert_association(&entry.1).unwrap();
+        entry.2 = Some(entry.1.clone());
+        let mut observed = entry.1.clone();
+        observed
+            .evidence
+            .push(Evidence::new(EvidenceKind::DirectCgroupWrite));
+        observed.confidence = CONF_EXPLICIT;
+        observed.persistence_class = PersistenceClass::PersistentState;
+        observed.semantic_role = SemanticRole::UserState;
+        db.upsert_association(&observed).unwrap();
+        db.upsert_scanned_paths(std::slice::from_ref(&entry))
+            .unwrap();
+        assert_eq!(
+            db.update_classifications(&[(
+                entry.1.clone(),
+                PersistenceClass::Ephemeral,
+                SemanticRole::Cache
+            )])
+            .unwrap(),
+            0
+        );
+        let current = db.associations_for_path(entry.0.path_id).unwrap().remove(0);
+        assert_eq!(current.confidence, observed.confidence);
+        assert_eq!(current.persistence_class, PersistenceClass::PersistentState);
+        assert!(current
+            .evidence
+            .iter()
+            .any(|e| e.kind == EvidenceKind::DirectCgroupWrite));
+        assert_eq!(
+            db.get_path_by_id(entry.0.path_id).unwrap().unwrap().size,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn scan_batch_rolls_back_metadata_and_associations_on_error() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppIdentity::new(AppId::desktop("scan-atomic"), "Scan Atomic");
+        db.upsert_app(&app).unwrap();
+        let first = scan_entry(&db, &app.app_id, "/scan/first");
+        let second = scan_entry(&db, &app.app_id, "/scan/fail");
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_scan BEFORE INSERT ON path_associations
+             WHEN (SELECT canonical_path FROM paths WHERE path_id=NEW.path_id)='/scan/fail'
+             BEGIN SELECT RAISE(ABORT, 'scan batch failure'); END;",
+            )
+            .unwrap();
+        assert!(db.upsert_scanned_paths(&[first, second]).is_err());
+        let record = db.get_path_by_canonical("/scan/first").unwrap().unwrap();
+        assert_eq!(record.size, None);
+        assert!(db.associations_for_path(record.path_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn finishing_scan_preserves_dirty_generations_and_selective_root_scope() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppIdentity::new(AppId::desktop("scan-generation"), "Scan Generation");
+        db.upsert_app(&app).unwrap();
+        db.mark_dirty(&app.app_id, None, true).unwrap();
+        db.mark_dirty_root(&app.app_id, "/scan/install", None, true)
+            .unwrap();
+        let generation = db.capture_generation(&app.app_id).unwrap();
+        db.mark_dirty_root(&app.app_id, "/scan/new", None, true)
+            .unwrap();
+        assert!(!db
+            .finish_reconciliation(&app.app_id, generation, None)
+            .unwrap());
+        assert_eq!(db.list_dirty_roots(Some(&app.app_id)).unwrap().len(), 2);
+        assert!(db.list_dirty_apps().unwrap()[0].requires_reconciliation);
+        let generation = db.capture_generation(&app.app_id).unwrap();
+        assert!(db
+            .finish_reconciliation(&app.app_id, generation, Some(&["/scan/install".into()]))
+            .unwrap());
+        assert_eq!(db.list_dirty_roots(Some(&app.app_id)).unwrap().len(), 1);
+        assert!(db.list_dirty_apps().unwrap()[0].requires_reconciliation);
+        assert!(db
+            .finish_reconciliation(&app.app_id, generation, None)
+            .unwrap());
+        assert!(db.list_dirty_roots(Some(&app.app_id)).unwrap().is_empty());
+        assert!(!db.list_dirty_apps().unwrap()[0].requires_reconciliation);
+    }
+
+    #[test]
+    fn restored_association_batch_rolls_back_on_mid_batch_failure() {
+        let db = StateDb::open_in_memory().unwrap();
+        let app = AppIdentity::new(AppId::desktop("restored-batch-test"), "Restored Batch Test");
+        db.upsert_app(&app).unwrap();
+        db.lock()
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TRIGGER fail_restored_association
+                BEFORE INSERT ON path_associations
+                WHEN (SELECT canonical_path FROM paths WHERE path_id=NEW.path_id) = '/restore/fail'
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected mid-batch failure');
+                END;
+                "#,
+            )
+            .unwrap();
+        let entries = vec![
+            RestoredPathAssociationInput {
+                canonical_path: "/restore/first".into(),
+                persistence_class: PersistenceClass::PersistentState,
+                semantic_role: SemanticRole::UserState,
+            },
+            RestoredPathAssociationInput {
+                canonical_path: "/restore/fail".into(),
+                persistence_class: PersistenceClass::SharedState,
+                semantic_role: SemanticRole::SharedRuntime,
+            },
+            RestoredPathAssociationInput {
+                canonical_path: "/restore/last".into(),
+                persistence_class: PersistenceClass::Ephemeral,
+                semantic_role: SemanticRole::Cache,
+            },
+        ];
+
+        let error = db
+            .upsert_restored_path_associations(&app.app_id, &entries)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected mid-batch failure"));
+
+        let conn = db.lock().unwrap();
+        let path_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM paths WHERE canonical_path LIKE '/restore/%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let association_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM path_associations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(path_count, 0);
+        assert_eq!(association_count, 0);
+    }
+
+    #[test]
+    fn wal_and_roundtrip() {
+        let db = StateDb::open_in_memory().unwrap();
+        assert_eq!(db.integrity_check().unwrap(), "ok");
+        let app = AppIdentity::new(AppId::steam(42), "Test Game");
+        db.upsert_app(&app).unwrap();
+        assert_eq!(
+            db.get_app(&app.app_id).unwrap().unwrap().display_name,
+            "Test Game"
+        );
+        let session = AppSession::new(app.app_id.clone(), 1001, SessionSource::Steam);
+        db.insert_session(&session).unwrap();
+        db.attach_pid(session.session_id, 1002, Some(1001), Some("/test/child"))
+            .unwrap();
+        assert!(db.session_for_pid(1001).unwrap().is_some());
+        let open_sessions = db.open_sessions().unwrap();
+        assert_eq!(open_sessions.len(), 1);
+        assert_eq!(open_sessions[0].session_id, session.session_id);
+        assert_eq!(
+            db.session_pids(session.session_id).unwrap(),
+            vec![1001, 1002]
+        );
+        db.end_session(session.session_id).unwrap();
+        assert!(db.open_sessions().unwrap().is_empty());
+        assert!(db.session_pids(session.session_id).unwrap().is_empty());
+    }
+}

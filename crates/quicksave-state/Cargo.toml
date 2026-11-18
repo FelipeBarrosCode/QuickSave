@@ -1,0 +1,37 @@
+[package]
+name = "quicksave-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Private atomic workspace settings and native-only provider credentials"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+rand.workspace = true
+quicksave-platform.workspace = true
+noland-rclone-adapter = { path = "../../shared-storage/crates/noland-rclone-adapter" }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+zeroize = "1.8"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,5 +1,63 @@
 # Architecture and format boundaries
 
+## Software/provider workspace revision
+
+The current desktop revision is specified in
+[WORKSPACE-V2-CONTRACT.md](WORKSPACE-V2-CONTRACT.md); its acceptance evidence and
+remaining limitations belong in
+[WORKSPACE-V2-ACCEPTANCE.md](WORKSPACE-V2-ACCEPTANCE.md).
+The local-preview architecture below remains relevant to the CLI, but does not
+describe the new cloud workspace or imply that the two formats interoperate.
+
+```text
+Overview / Backup / Restore
+    -> native workspace_query / workspace_prepare / workspace_execute
+    -> quicksave-service
+         + quicksave-state: private state.json, vault references, scope grants
+         + quicksave-tracking: approved roots, reconciliation, autosave scheduling
+         + quicksave-noland -> shared-storage: adapted native No Land libraries
+
+CLI -> quicksave-client -> quicksave-engine -> local QuickSave preview format
+```
+
+`upstream/no-land/` is still immutable reference material. `shared-storage/` is
+the separate active library fork: no remote lifecycle service, SSH provisioning,
+or production No Land state is part of native workspace initialization. The cloud
+path reuses the No Land wire format and repository keys, rather than treating
+the independent local preview format as compatible.
+
+The webview may submit transient provider fields, but never receives repository
+key bytes, OAuth refresh tokens, or vault entries. Native preparation binds the
+exact request to a deterministic authority snapshot, shows a native confirmation,
+then pins real selected roots/files. Execution accepts only the opaque one-use
+ticket. Tickets expire after ten minutes, are capacity-bounded, and are consumed
+before filesystem/provider IO; a changed scope fails instead of being widened.
+Cancellation of an IPC future does not detach its lane or shutdown guard.
+The gateway hands prepared native IDs/stamps to service workers as protected
+native-only metadata, preventing a re-pin from authorizing a replacement path.
+
+Persistent manual tracking and autosave need authenticated scope grants, not
+editable `state.json` booleans. Root identity, explicit file allowlists, software
+identity, provider scope, and grant revocation must survive restart and be
+revalidated by owned capture workers. Watcher events are hints; scanning a UI
+list cannot establish a confirmed uploaded baseline. A change during upload,
+overflow, failed capture, or unsupported local deletion remains pending.
+
+No Land import is an explicit, read-only source operation into QuickSave's own
+vault namespace. Imported connections start read-only; uploads require a separate
+native write grant. Disconnecting does not remove cloud history or recovery keys.
+QuickSave does not automatically run No Land's post-upload generation retirement.
+Physical cloud deletion is a separate frozen-preview/dependency-acknowledgement
+protocol, not an autosave side effect.
+
+These are implementation boundaries, not cross-platform or live-provider
+acceptance claims. Closing an autosave-enabled window hides it; macOS Dock
+activation reopens it. Explicit quit is blocked during active/finalizing work,
+then joins the tracker and owned queue before exit. Keep QuickSave running for
+its in-process background worker; a separate OS login service is not implied.
+
+## Initial local-preview architecture (retained CLI path)
+
 Read [the plan](PORTING-PLAN.md) for sequencing and
 [the implementation contract](IMPLEMENTATION-CONTRACT.md) for current APIs.
 This document separates first-slice invariants from future format requirements.

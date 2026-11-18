@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
-    validate_component, validate_relative, DirectoryIdentity, Entry, FileStamp, MAX_DEPTH,
-    MAX_PATH_BYTES, MAX_TREE_ENTRIES, MAX_TREE_PATH_BYTES,
+    validate_component, validate_link_target, validate_relative, DirectoryIdentity, Entry,
+    EntryKind, FileStamp, MetadataEntry, NativeLinkStamp, MAX_DEPTH, MAX_PATH_BYTES,
+    MAX_TREE_ENTRIES, MAX_TREE_PATH_BYTES,
 };
 use anyhow::{bail, ensure, Context, Result};
 use rand::{rngs::OsRng, RngCore};
@@ -234,6 +235,45 @@ impl Root {
         Ok((file, opened_stamp))
     }
 
+    pub(crate) fn open_directory(&self, relative: &str) -> Result<File> {
+        let (parent, name) = self.parent(relative)?;
+        let before = statat(parent.file(), &name)?;
+        require_directory(&before)?;
+        let directory = openat_file(parent.file(), &name, DIR_FLAGS, 0)
+            .context("open real no-follow relative directory")?;
+        let opened = fstat(&directory)?;
+        require_directory(&opened)?;
+        let identity = Identity::of(&opened);
+        ensure!(
+            identity == Identity::of(&before),
+            "directory changed while opening"
+        );
+        let after = statat(parent.file(), &name)?;
+        require_directory(&after)?;
+        ensure!(
+            identity == Identity::of(&after),
+            "relative directory name changed while opening"
+        );
+        parent.check()?;
+        ensure_edge(parent.file(), &name, identity)?;
+        Ok(directory)
+    }
+
+    pub(crate) fn clone_root_directory_handle(&self) -> Result<File> {
+        self.check()?;
+        let before = fstat(self.file())?;
+        require_directory(&before)?;
+        let directory = openat_file(self.file(), c".", DIR_FLAGS, 0)?;
+        let opened = fstat(&directory)?;
+        require_directory(&opened)?;
+        ensure!(
+            Identity::of(&opened) == Identity::of(&before),
+            "pinned root handle identity changed"
+        );
+        self.check()?;
+        Ok(directory)
+    }
+
     pub(crate) fn entries(&self) -> Result<Vec<Entry>> {
         self.check()?;
         let mut output = Vec::new();
@@ -250,6 +290,150 @@ impl Root {
         self.check()?;
         output.sort_unstable_by(|a, b| a.relative_path.cmp(&b.relative_path));
         Ok(output)
+    }
+
+    pub(crate) fn read_link(&self, relative: &str) -> Result<NativeLinkStamp> {
+        let (parent, name) = self.parent(relative)?;
+        let observed = read_link_at(parent.file(), &name, relative)?;
+        parent.check()?;
+        ensure!(
+            read_link_at(parent.file(), &name, relative)? == observed,
+            "symlink changed during namespace validation"
+        );
+        Ok(observed)
+    }
+
+    pub(crate) fn metadata_entries(&self) -> Result<Vec<MetadataEntry>> {
+        self.check()?;
+        let mut output = Vec::new();
+        let mut discovered = DiscoveryBudget::default();
+        let mut bytes = 0;
+        self.walk_metadata(self.file(), "", 0, &mut output, &mut discovered, &mut bytes)?;
+        self.check()?;
+        output.sort_unstable_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        Ok(output)
+    }
+
+    fn walk_metadata(
+        &self,
+        directory: &File,
+        prefix: &str,
+        depth: usize,
+        output: &mut Vec<MetadataEntry>,
+        discovered: &mut DiscoveryBudget,
+        bytes: &mut usize,
+    ) -> Result<()> {
+        ensure!(depth <= MAX_DEPTH, "tree exceeds maximum depth");
+        let before = fstat(directory)?;
+        require_directory(&before)?;
+        for name in directory_names(directory, prefix, discovered)? {
+            let text = name.to_str().context("tree contains a non-UTF8 name")?;
+            validate_component(text)?;
+            let relative = if prefix.is_empty() {
+                text.to_owned()
+            } else {
+                format!("{prefix}/{text}")
+            };
+            ensure!(
+                depth < MAX_DEPTH
+                    && relative.len() <= MAX_PATH_BYTES
+                    && output.len() < MAX_TREE_ENTRIES,
+                "tree exceeds entry, depth, or path limit"
+            );
+            *bytes = bytes
+                .checked_add(relative.len())
+                .context("tree size overflow")?;
+            let observed = statat(directory, &name)?;
+            let mut entry = MetadataEntry {
+                relative_path: relative.clone(),
+                kind: EntryKind::File,
+                stamp: stamp(&observed)?,
+                link: None,
+            };
+            match observed.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    entry.kind = EntryKind::Directory;
+                    let child = openat_file(directory, &name, DIR_FLAGS, 0)?;
+                    require_directory(&fstat(&child)?)?;
+                    ensure!(
+                        stamp(&fstat(&child)?)? == entry.stamp,
+                        "directory changed while opening metadata"
+                    );
+                    let identity = Identity::of(&observed);
+                    ensure_edge(directory, &name, identity)?;
+                    output.push(entry);
+                    self.walk_metadata(&child, &relative, depth + 1, output, discovered, bytes)?;
+                    ensure_edge(directory, &name, identity)?;
+                }
+                libc::S_IFREG => {
+                    require_regular(&observed)?;
+                    output.push(entry);
+                }
+                libc::S_IFLNK => {
+                    let link = read_link_at(directory, &name, &relative)?;
+                    ensure!(
+                        link.stamp == entry.stamp,
+                        "symlink replaced during metadata walk"
+                    );
+                    *bytes = bytes
+                        .checked_add(link.target.len())
+                        .context("link metadata size overflow")?;
+                    entry.kind = EntryKind::Symlink;
+                    entry.link = Some(link);
+                    output.push(entry);
+                }
+                _ => bail!("tree contains an unsupported special file: {relative}"),
+            }
+            ensure!(
+                *bytes <= MAX_TREE_PATH_BYTES,
+                "tree metadata exceeds memory limit"
+            );
+        }
+        ensure!(
+            stamp(&fstat(directory)?)? == stamp(&before)?,
+            "directory changed during metadata enumeration"
+        );
+        self.check()
+    }
+
+    pub(crate) fn create_new_relative_symlink(
+        &self,
+        relative: &str,
+        target: &str,
+        target_is_directory: Option<bool>,
+    ) -> Result<NativeLinkStamp> {
+        require_durable_platform()?;
+        validate_link_target(relative, target)?;
+        ensure!(
+            target_is_directory.is_none(),
+            "Unix symlinks have no directory-link kind"
+        );
+        let (parent, name) = self.parent(relative)?;
+        parent.check()?;
+        let target = CString::new(target)?;
+        // SAFETY: exactly one leaf beneath a pinned, no-follow parent. symlinkat
+        // is create-exclusive and never resolves or accesses the target.
+        if unsafe { libc::symlinkat(target.as_ptr(), parent.file().as_raw_fd(), name.as_ptr()) }
+            != 0
+        {
+            return Err(io::Error::last_os_error())
+                .context("create confined symlink without replacement");
+        }
+        let link = read_link_at(parent.file(), &name, relative)?;
+        ensure!(
+            link.target.as_bytes() == target.as_bytes(),
+            "new symlink was replaced"
+        );
+        parent
+            .file()
+            .sync_all()
+            .context("flush new symbolic link namespace")?;
+        parent.check()?;
+        ensure!(
+            read_link_at(parent.file(), &name, relative)? == link,
+            "new symlink changed during durability check"
+        );
+        Ok(link)
     }
 
     fn walk(
@@ -839,6 +1023,48 @@ fn statat(parent: &File, name: &CStr) -> io::Result<libc::stat> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn read_link_at(parent: &File, name: &CStr, relative: &str) -> Result<NativeLinkStamp> {
+    let before = statat(parent, name)?;
+    ensure!(
+        before.st_mode & libc::S_IFMT == libc::S_IFLNK,
+        "entry is not a symlink"
+    );
+    ensure!(
+        before.st_size >= 0 && before.st_size <= MAX_PATH_BYTES as _,
+        "symlink target exceeds size limit"
+    );
+    let mut bytes = vec![0u8; MAX_PATH_BYTES + 1];
+    // SAFETY: live no-follow parent and one name, with a bounded writable buffer.
+    let length = unsafe {
+        libc::readlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if length < 0 {
+        return Err(io::Error::last_os_error()).context("read symbolic link without following");
+    }
+    ensure!(
+        length as usize <= MAX_PATH_BYTES,
+        "symlink target exceeds size limit"
+    );
+    bytes.truncate(length as usize);
+    let target = String::from_utf8(bytes).context("symlink target is not UTF-8")?;
+    validate_link_target(relative, &target)?;
+    let after = statat(parent, name)?;
+    ensure!(
+        after.st_mode & libc::S_IFMT == libc::S_IFLNK && stamp(&before)? == stamp(&after)?,
+        "symlink changed while reading its text"
+    );
+    Ok(NativeLinkStamp {
+        stamp: stamp(&after)?,
+        target,
+        target_is_directory: None,
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

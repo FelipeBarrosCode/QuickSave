@@ -1,367 +1,257 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  api, chooseFolder, chooseRecoveryKey, filesystemAvailability, nativeRuntime, operationId, record, safeError, terminal,
-  type NativeReport, type Operation, type OperationKind, type RepositoryPaths, type Snapshot,
+  api, nativeRuntime, normalizeDashboard, record, safeError, terminal,
+  type Action, type ActionParams, type Activity, type AppTracking, type BatchReference, type Dashboard,
 } from './api'
 
-export type Workspace = RepositoryPaths & { source: string; destination: string }
-export type Notice = { tone: 'success' | 'error' | 'info'; title: string; message: string }
-type Busy = 'picker' | 'initialize' | 'snapshots' | 'backup' | 'restore' | null
-type Tracking = { operation: Operation; paths: RepositoryPaths | null; paused: string | null; recovered: boolean }
-
-// Bounded, serial polling: at most one native status request is pending.
-export const POLL_INTERVAL_MS = 1_500
+export const POLL_INTERVAL_MS = 2_000
 export const MAX_POLL_REQUESTS = 600
-const MAX_STATUS_ERRORS = 3
+const MAX_POLL_ERRORS = 3
 
 export function useQuickSave() {
   const [native] = useState(nativeRuntime)
-  const [report, setReport] = useState<NativeReport | null>(null)
-  const [directories, setDirectories] = useState<NativeReport | null>(null)
-  const [reportError, setReportError] = useState<string | null>(null)
-  const [directoriesError, setDirectoriesError] = useState<string | null>(null)
-  const [historyError, setHistoryError] = useState<string | null>(null)
-  const [checking, setChecking] = useState(native)
-  const [checksRound, setChecksRound] = useState(0)
-  const [untrackedError, setUntrackedError] = useState<string | null>(null)
-  const [workspace, setWorkspace] = useState<Workspace>({
-    repository: '', source: '', keyFile: '', destination: '',
-  })
-  const [mode, setMode] = useState<'existing' | 'new'>('existing')
-  const [verified, setVerified] = useState(false)
-  const [snapshots, setSnapshots] = useState<Snapshot[]>([])
-  const [snapshotsLoaded, setSnapshotsLoaded] = useState(false)
-  const [busy, setBusy] = useState<Busy>(null)
-  const [notice, setNotice] = useState<Notice | null>(null)
-  const [tracking, setTracking] = useState<Tracking | null>(null)
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [loading, setLoading] = useState(native)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [busy, setBusy] = useState<Action | 'picker' | null>(null)
+  const [activity, setActivity] = useState<Activity[]>([])
+  const [batches, setBatches] = useState<BatchReference[]>([])
+  const [tracking, setTracking] = useState<AppTracking | null>(null)
+  const [trackingError, setTrackingError] = useState<string | null>(null)
+  const [trackingPollIssue, setTrackingPollIssue] = useState<string | null>(null)
   const [trackingRound, setTrackingRound] = useState(0)
-  const lock = useRef(native)
-  const mounted = useRef(true)
+  const [pollIssue, setPollIssue] = useState<string | null>(null)
+  const [pollRound, setPollRound] = useState(0)
+  const mounted = useRef(false)
+  const lock = useRef(false)
+  const pendingConsent = useRef<AbortController | null>(null)
+  const refreshPromise = useRef<Promise<void> | null>(null)
+  const trackingPromise = useRef<Promise<AppTracking> | null>(null)
+  const lastActivity = useRef<Activity[]>([])
 
+  const rememberBatches = useCallback((references: BatchReference[]) => {
+    if (!mounted.current || !references.length) return
+    setBatches((previous) => [...references, ...previous.filter((item) =>
+      !references.some((reference) => reference.planSetId === item.planSetId))].slice(0, 64))
+  }, [])
   useEffect(() => {
     mounted.current = true
-    return () => { mounted.current = false }
+    return () => { mounted.current = false; pendingConsent.current?.abort() }
   }, [])
+
+  const acceptDashboard = useCallback((next: Dashboard) => {
+    if (!mounted.current) return
+    setDashboard(next)
+    setActivity(next.activity)
+    rememberBatches(next.activity.filter((item) => item.planSetId).map((item) => ({
+      planSetId: item.planSetId!, operationId: item.id, providerId: item.providerId,
+    })))
+    lastActivity.current = next.activity
+    setError(null)
+  }, [rememberBatches])
+  const readTracking = useCallback(() => {
+    if (trackingPromise.current) return trackingPromise.current
+    const pending = api.appTracking().finally(() => { trackingPromise.current = null })
+    trackingPromise.current = pending
+    return pending
+  }, [])
+  const refreshTracking = useCallback(async () => {
+    if (!native || !mounted.current) return
+    try {
+      const next = await readTracking()
+      if (mounted.current) { setTracking(next); setTrackingError(null) }
+    } catch (reason) {
+      if (mounted.current) setTrackingError(safeError(reason))
+    }
+  }, [native, readTracking])
+  const refresh = useCallback(async () => {
+    if (!native || !mounted.current) return
+    if (refreshPromise.current) return refreshPromise.current
+    const pending = (async () => {
+      try {
+        acceptDashboard(await api.dashboard())
+      } catch (reason) {
+        if (mounted.current) setError(safeError(reason))
+      } finally {
+        if (mounted.current) setLoading(false)
+      }
+    })()
+    refreshPromise.current = pending
+    try { await pending } finally { refreshPromise.current = null }
+  }, [acceptDashboard, native])
+
+  useEffect(() => { void refresh(); void refreshTracking() }, [refresh, refreshTracking])
+
+  useEffect(() => {
+    if (!native || !tracking?.scanning) return
+    let disposed = false
+    let requests = 0
+    let errors = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
+    async function poll() {
+      if (disposed) return
+      if (requests >= MAX_POLL_REQUESTS) {
+        setTrackingPollIssue('App-tracking checks paused after 600 requests. Resume to check native scanning; nothing was cancelled.')
+        return
+      }
+      requests += 1
+      try {
+        const next = await readTracking()
+        if (disposed) return
+        errors = 0
+        setTracking(next)
+        setTrackingError(null)
+        setTrackingPollIssue(null)
+        if (!next.scanning) { await refresh(); return }
+      } catch (reason) {
+        if (disposed) return
+        errors += 1
+        if (errors >= MAX_POLL_ERRORS) {
+          setTrackingPollIssue(`App-tracking status is unavailable after three checks. Native scanning may still be running. ${safeError(reason)}`)
+          return
+        }
+      }
+      if (!disposed) timer = setTimeout(() => { void poll() }, POLL_INTERVAL_MS)
+    }
+    timer = setTimeout(() => { void poll() }, POLL_INTERVAL_MS)
+    return () => {
+      disposed = true
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }, [native, tracking?.scanning, trackingRound, refresh, readTracking])
 
   useEffect(() => {
     if (!native) return
     let disposed = false
-    lock.current = true
-    setChecking(true)
-    setReport(null)
-    setDirectories(null)
-    setReportError(null)
-    setHistoryError(null)
-    setDirectoriesError(null)
-    async function loadReports() {
-      const [capabilities, dirs, history] = await Promise.allSettled([api.capabilities(), api.directories(), api.history()])
-      if (disposed) return
-      if (capabilities.status === 'fulfilled' && record(capabilities.value)) {
-        setReport(capabilities.value)
-      } else {
-        setReportError(capabilities.status === 'rejected'
-          ? safeError(capabilities.reason) : 'The native capability report was not an object.')
-      }
-      if (dirs.status === 'fulfilled' && record(dirs.value)) setDirectories(dirs.value)
-      else setDirectoriesError(dirs.status === 'rejected'
-        ? safeError(dirs.reason) : 'The native directories report was not an object.')
-      if (history.status === 'fulfilled') {
-        const previous = history.value.find((operation) => !terminal(operation.state)) ?? history.value[0]
-        setUntrackedError(null)
-        setTracking(previous ? { operation: previous, paths: null, paused: null, recovered: true } : null)
-        if (previous && !terminal(previous.state)) {
-          setBusy(previous.kind === 'initialize' ? 'initialize' : previous.kind)
-        } else {
-          lock.current = false
-          setBusy(null)
-        }
-      } else {
-        setHistoryError(safeError(history.reason))
-        lock.current = false
-      }
-      setChecking(false)
-    }
-    void loadReports()
-    return () => { disposed = true }
-  }, [native, checksRound])
-
-  const filesystem = filesystemAvailability(report)
-  const canRead = filesystem.canRead && !checking && !reportError
-  const canWrite = filesystem.canWrite && !checking && !reportError && !historyError && !untrackedError
-  const unavailableReason = reportError
-    ? 'The native capability report is unavailable. Filesystem actions remain disabled until native checks succeed.'
-    : historyError ? 'Operation history could not be checked. Mutations remain disabled until native checks succeed.'
-      : filesystem.reason
-
-  const fail = useCallback((title: string, error: unknown) => {
-    if (mounted.current) setNotice({ tone: 'error', title, message: safeError(error) })
-  }, [])
-
-  const acquire = useCallback((action: Exclude<Busy, null>): boolean => {
-    if (!native) {
-      fail('Desktop application required', 'Native actions are unavailable in the browser preview.')
-      return false
-    }
-    if ((action === 'initialize' || action === 'backup' || action === 'restore') && !canWrite) {
-      fail('Native writes are unavailable', unavailableReason || 'Wait for native capability and operation-history checks to finish.')
-      return false
-    }
-    if (action === 'snapshots' && !canRead) {
-      fail('Native reads are unavailable', 'The platform report has not confirmed safe native reads.')
-      return false
-    }
-    if (lock.current) {
-      fail('An operation is already active', 'Wait for the current operation to finish. Paused tracking does not cancel it.')
-      return false
-    }
-    lock.current = true
-    setBusy(action)
-    setNotice(null)
-    return true
-  }, [canRead, canWrite, fail, native, unavailableReason])
-
-  const release = useCallback(() => {
-    lock.current = false
-    if (mounted.current) setBusy(null)
-  }, [])
-
-  const pathsReady = workspace.repository.length > 0 && workspace.keyFile.length > 0
-  const active = tracking !== null && !terminal(tracking.operation.state)
-  const working = checking || busy !== null || active || untrackedError !== null
-
-  async function pick(field: keyof Workspace) {
-    if (!acquire('picker')) return
-    try {
-      const path = field === 'keyFile'
-        ? await chooseRecoveryKey(mode === 'new')
-        : await chooseFolder({
-          repository: mode === 'new' ? 'Choose an empty folder for the new repository' : 'Choose a QuickSave repository folder',
-          source: 'Choose the folder to back up',
-          destination: 'Choose an empty restore destination',
-        }[field])
-      if (!path || !mounted.current) return
-      setWorkspace((previous) => ({ ...previous, [field]: path }))
-      if (field === 'repository' || field === 'keyFile') {
-        setSnapshots([])
-        setSnapshotsLoaded(false)
-        setVerified(false)
-      }
-    } catch (error) {
-      fail('The path could not be selected', error)
-    } finally {
-      release()
-    }
-  }
-
-  function changeMode(next: 'existing' | 'new') {
-    if (lock.current || next === mode) return
-    setMode(next)
-    setWorkspace((previous) => ({ ...previous, keyFile: '' }))
-    setSnapshots([])
-    setSnapshotsLoaded(false)
-    setVerified(false)
-    setNotice(null)
-  }
-
-  async function initialize() {
-    if (!pathsReady || mode !== 'new' || !acquire('initialize')) return
-    try {
-      await api.initialize({ repository: workspace.repository, keyFile: workspace.keyFile })
-      if (!mounted.current) return
-      setVerified(true)
-      setMode('existing')
-      setSnapshots([])
-      setSnapshotsLoaded(true)
-      setNotice({
-        tone: 'success',
-        title: 'Your local repository is ready',
-        message: 'The native backend created your repository and external recovery-key file. Keep that file safe and separate; QuickSave cannot replace a lost key.',
-      })
-    } catch (error) {
-      fail('The repository could not be created', error)
-    } finally {
-      release()
-    }
-  }
-
-  async function loadSnapshots() {
-    if (!pathsReady || mode !== 'existing' || !acquire('snapshots')) return
-    try {
-      const result = await api.snapshots({ repository: workspace.repository, keyFile: workspace.keyFile })
-      if (!mounted.current) return
-      setSnapshots(result)
-      setSnapshotsLoaded(true)
-      setVerified(true)
-      setNotice({
-        tone: 'success', title: 'Repository opened',
-        message: `${result.length.toLocaleString()} saved ${result.length === 1 ? 'snapshot' : 'snapshots'} reported by the native engine.`,
-      })
-    } catch (error) {
-      // Old results must not look like a successful current repository read.
-      if (mounted.current) {
-        setSnapshotsLoaded(false)
-        setVerified(false)
-      }
-      fail('The snapshots could not be loaded', error)
-    } finally {
-      release()
-    }
-  }
-
-  async function start(kind: Exclude<OperationKind, 'initialize'>, snapshotId?: string) {
-    if (!pathsReady || mode !== 'existing') return
-    if (kind === 'backup' && !workspace.source) return
-    if (kind === 'restore' && (!workspace.destination || !snapshotId)) return
-    if (!acquire(kind)) return
-    const paths = { repository: workspace.repository, keyFile: workspace.keyFile }
-    try {
-      const summary = kind === 'backup'
-        ? await api.backup(paths, workspace.source)
-        : await api.restore(paths, snapshotId!, workspace.destination)
-      let id: string
-      try {
-        id = operationId(summary)
-      } catch (error) {
-        if (mounted.current) {
-          setUntrackedError(`The native request returned without a usable job identifier. It may already be running. ${safeError(error)}`)
-          setBusy(null)
-        }
-        // A successful invoke with a malformed receipt is not permission to start another job.
-        return
-      }
-      if (!mounted.current) return
-      setTracking({
-        operation: {
-          id, kind, state: 'queued', startedAt: null, finishedAt: null, result: null, error: null,
-        },
-        paths,
-        paused: null,
-        recovered: false,
-      })
-      // The mutation lock remains held until a native terminal status is observed.
-    } catch (error) {
-      fail(`${kind === 'backup' ? 'Backup' : 'Restore'} could not be started`, error)
-      release()
-    }
-  }
-
-  const trackedId = tracking?.operation.id
-  useEffect(() => {
-    if (!tracking || terminal(tracking.operation.state) || tracking.paused) return
-    const session = tracking
-    let disposed = false
-    let inFlight = false
     let requests = 0
     let errors = 0
-    let stopped = false
-    let interval: ReturnType<typeof setInterval> | undefined
-
-    function stop() {
-      stopped = true
-      if (interval !== undefined) clearInterval(interval)
-    }
-    function pause(message: string) {
-      stop()
-      setTracking((current) => current?.operation.id === session.operation.id
-        ? { ...current, paused: message } : current)
-      setBusy(null)
-    }
+    let timer: ReturnType<typeof setTimeout> | undefined
     async function poll() {
-      if (disposed || stopped || inFlight) return
+      if (disposed) return
       if (requests >= MAX_POLL_REQUESTS) {
-        pause('Automatic tracking reached its 600-request limit. The native job may still be running. Resume tracking to check it; no second operation can start yet.')
+        setPollIssue('Activity checks paused after 600 requests. Resume to check native work; nothing was cancelled.')
         return
       }
-      inFlight = true
       requests += 1
       try {
-        const operation = await api.status(session.operation.id, session.operation.kind)
+        const next = await api.activity()
         if (disposed) return
         errors = 0
-        setTracking((current) => current?.operation.id === operation.id
-          ? { ...current, operation, paused: null } : current)
-        if (!terminal(operation.state)) return
-        stop()
-        if (operation.state === 'succeeded') {
-          if (session.paths) setVerified(true)
-          const actionName = operation.kind === 'backup' ? 'Snapshot saved' : operation.kind === 'restore' ? 'Restore completed' : 'Repository initialization completed'
-          setNotice({
-            tone: 'success',
-            title: actionName,
-            message: operation.kind === 'backup'
-              ? 'The native engine reported a successful snapshot commit. Your previous versions are kept.'
-              : operation.kind === 'restore' ? 'The native engine reported a successful restore to the selected empty destination.'
-                : 'The native engine reported successful repository initialization. Choose the repository and external key file to open it in this session.',
-          })
-          if (operation.kind === 'backup' && session.paths) {
-            setBusy('snapshots')
-            try {
-              const latest = await api.snapshots(session.paths)
-              if (disposed) return
-              setSnapshots(latest)
-              setSnapshotsLoaded(true)
-            } catch (error) {
-              if (disposed) return
-              setSnapshotsLoaded(false)
-              setNotice({
-                tone: 'info', title: 'Backup finished; snapshot list needs a refresh',
-                message: `The backup succeeded, but the list could not be read: ${safeError(error)}`,
-              })
-            }
-          }
-        } else {
-          setNotice({
-            tone: 'error',
-            title: `${operation.kind === 'backup' ? 'Backup' : operation.kind === 'restore' ? 'Restore' : 'Initialization'} ${operation.state === 'interrupted' ? 'interrupted' : 'failed'}`,
-            message: operation.error || 'The native engine did not report a successful completion. No automatic retry was started.',
-          })
-        }
-        if (!disposed) release()
-      } catch (error) {
+        setPollIssue(null)
+        const completed = next.some((item) => terminal(item.state)
+          && lastActivity.current.find((previous) => previous.id === item.id)?.state !== item.state)
+        lastActivity.current = next
+        setActivity(next)
+        rememberBatches(next.filter((item) => item.planSetId).map((item) => ({
+          planSetId: item.planSetId!, operationId: item.id, providerId: item.providerId,
+        })))
+        if (completed) await refresh()
+      } catch (reason) {
         if (disposed) return
         errors += 1
-        if (errors >= MAX_STATUS_ERRORS) {
-          pause(`Status tracking is paused after three unsuccessful checks. The job has not been marked failed or cancelled. ${safeError(error)}`)
+        if (errors >= MAX_POLL_ERRORS) {
+          setPollIssue(`Activity is unavailable after three checks. Native work may still be running. ${safeError(reason)}`)
+          return
         }
-      } finally {
-        inFlight = false
       }
+      // Schedule only after the previous request/refresh settles: no overlap.
+      if (!disposed) timer = setTimeout(() => { void poll() }, POLL_INTERVAL_MS)
     }
-    interval = setInterval(() => { void poll() }, POLL_INTERVAL_MS)
-    void poll()
+    timer = setTimeout(() => { void poll() }, POLL_INTERVAL_MS)
     return () => {
       disposed = true
-      stop()
+      if (timer !== undefined) clearTimeout(timer)
     }
-    // Polling belongs to a single accepted job. Status renders must not restart its timer.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trackedId, trackingRound, release])
+  }, [native, pollRound, refresh, rememberBatches])
 
-  function resumeTracking() {
-    if (!tracking?.paused || terminal(tracking.operation.state)) return
-    setTracking((previous) => previous ? { ...previous, paused: null } : previous)
-    setBusy(tracking.operation.kind)
-    setTrackingRound((round) => round + 1)
+  const reportError = useCallback((reason: unknown) => {
+    if (mounted.current) setNotice(safeError(reason))
+  }, [])
+
+  async function run<A extends Action>(action: A, params: ActionParams[A]): Promise<unknown | undefined> {
+    if (!mounted.current || !native || loading || error || lock.current) return undefined
+    lock.current = true
+    const consent = new AbortController()
+    pendingConsent.current = consent
+    setBusy(action)
+    setNotice(null)
+    try {
+      const result = await api.action(action, params, consent.signal)
+      if (!mounted.current) return undefined
+      if (action === 'preview_delete' || action === 'preview_restore' || action === 'preview_upload_all'
+        || action === 'discover_noland_import') return result
+      if (action === 'upload_all') {
+        const operationId = record(result)?.operationId
+        if (typeof operationId === 'string' && operationId.length > 0 && operationId.length <= 4_096
+          && !/[\u0000-\u001f\u007f]/.test(operationId)) {
+          const planSetId = (params as ActionParams['upload_all']).planSetId
+          rememberBatches([{ planSetId, operationId }])
+        } else {
+          reportError('The batch request was accepted, but its original operation ID is unavailable. Check native Activity; do not resubmit the plan.')
+        }
+        await refresh()
+        return result
+      }
+      if (record(result)?.summary) acceptDashboard(normalizeDashboard(result))
+      else {
+        const id = record(result)?.operationId
+        const batchControl = (action === 'cancel' || action === 'retry')
+          && batches.some((batch) => batch.operationId === (params as ActionParams['cancel']).operationId)
+        if (typeof id === 'string' && !batchControl) {
+          try {
+            const operation = await api.operation(id)
+            if (mounted.current) {
+              setActivity((current) => [operation, ...current.filter((item) => item.id !== operation.id)].slice(0, 128))
+            }
+          } catch (reason) {
+            reportError(`The request was accepted; its status is unknown. ${safeError(reason)}`)
+          }
+        }
+        await refresh()
+      }
+      if (action === 'enable_app_tracking' || action === 'refresh_app_tracking') {
+        setTrackingPollIssue(null)
+        setTrackingRound((round) => round + 1)
+        await refreshTracking()
+      }
+      return result
+    } catch (reason) {
+      reportError(reason)
+      // A native failure can follow configuration but precede health verification.
+      // Refresh sanitized state so an unverified profile is shown as such, not
+      // hidden or optimistically treated as connected.
+      await refresh()
+      return undefined
+    } finally {
+      lock.current = false
+      pendingConsent.current = null
+      if (mounted.current) setBusy(null)
+    }
   }
 
-  function retryChecks() {
-    if (checking || (lock.current && !untrackedError)) return
-    setChecksRound((round) => round + 1)
+  async function pick<T>(picker: () => Promise<T>): Promise<T | undefined> {
+    if (!mounted.current || !native || loading || error || lock.current) return undefined
+    lock.current = true
+    setBusy('picker')
+    try {
+      const result = await picker()
+      return mounted.current ? result : undefined
+    } catch (reason) { reportError(reason); return undefined }
+    finally { lock.current = false; if (mounted.current) setBusy(null) }
   }
 
   return {
-    native, report, reportError, directories, directoriesError, historyError, checking,
-    canRead, canWrite, unavailableReason, untrackedError, retryChecks,
-    workspace, mode, verified, snapshots, snapshotsLoaded, busy, notice,
-    operation: tracking?.operation ?? null, trackingPaused: tracking?.paused ?? null,
-    operationRecovered: tracking?.recovered ?? false,
-    working, pathsReady, pick, changeMode, initialize, loadSnapshots,
-    backup: () => start('backup'),
-    restore: (snapshotId: string) => start('restore', snapshotId),
-    resumeTracking,
+    native, dashboard, activity, batches, tracking, trackingError, trackingPollIssue,
+    loading, error, notice, busy, pollIssue,
+    ready: native && !loading && !error && dashboard !== null,
+    refresh, refreshTracking, run, pick, reportError,
     dismissNotice: () => setNotice(null),
+    resumePolling: () => { setPollIssue(null); setPollRound((round) => round + 1); void refresh() },
+    resumeTrackingPolling: () => {
+      setTrackingPollIssue(null); setTrackingRound((round) => round + 1); void refreshTracking()
+    },
   }
 }
-
 export type QuickSave = ReturnType<typeof useQuickSave>

@@ -1,0 +1,43 @@
+[package]
+name = "quicksave-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["native-oauth"]
+native-oauth = ["dep:quicksave-oauth"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+zeroize = "1.8"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+quicksave-integrations.workspace = true
+quicksave-observation.workspace = true
+quicksave-platform.workspace = true
+quicksave-state = { path = "../quicksave-state" }
+quicksave-noland = { path = "../quicksave-noland" }
+quicksave-tracking = { path = "../quicksave-tracking" }
+quicksave-oauth = { path = "../quicksave-oauth", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+bytes = "1"
+noland-state-agent = { path = "../../shared-storage/crates/noland-state-agent", default-features = false, features = ["native-host"] }
+noland-rpc = { path = "../../shared-storage/crates/noland-rpc" }
+noland-state-core = { path = "../../shared-storage/crates/noland-state-core" }
+noland-storage = { path = "../../shared-storage/crates/noland-storage" }
+noland-crypto = { path = "../../shared-storage/crates/noland-crypto" }
+noland-snapshot = { path = "../../shared-storage/crates/noland-snapshot" }
+noland-pack = { path = "../../shared-storage/crates/noland-pack" }

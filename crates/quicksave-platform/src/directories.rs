@@ -3,6 +3,16 @@
 use anyhow::{ensure, Context, Result};
 use std::path::{Component, Path, PathBuf};
 
+#[allow(clippy::needless_return)]
+pub(crate) fn home_directory() -> Result<PathBuf> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    return native_home();
+    #[cfg(windows)]
+    return known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Profile);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    anyhow::bail!("native account-home discovery is unsupported on this platform")
+}
+
 // Each target's early return deliberately keeps platform branches independent.
 #[allow(clippy::needless_return)]
 pub(crate) fn app_directories() -> Result<serde_json::Value> {

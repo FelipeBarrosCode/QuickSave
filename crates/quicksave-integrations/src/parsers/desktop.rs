@@ -12,6 +12,10 @@ pub struct DesktopMetadata {
     pub display_name: Option<String>,
     pub hidden: bool,
     pub no_display: bool,
+    pub flatpak_id: Option<String>,
+    /// A literal absolute first executable only; never shell/env/wrapper
+    /// evaluation, PATH lookup, or ownership of its containing directory.
+    pub absolute_executable: Option<std::path::PathBuf>,
 }
 
 pub fn parse_desktop_entry(text: &str) -> Result<DesktopMetadata> {
@@ -44,7 +48,10 @@ pub fn parse_desktop_entry(text: &str) -> Result<DesktopMetadata> {
                 .ok_or_else(|| anyhow::anyhow!("invalid desktop field"))?;
             let key = key.trim();
             // Only retain bounded metadata. Never interpret shell commands.
-            if matches!(key, "Type" | "Name" | "Hidden" | "NoDisplay") {
+            if matches!(
+                key,
+                "Type" | "Name" | "Hidden" | "NoDisplay" | "X-Flatpak" | "Exec"
+            ) {
                 ensure!(
                     fields.insert(key, value.trim()).is_none(),
                     "duplicate desktop field"
@@ -64,11 +71,71 @@ pub fn parse_desktop_entry(text: &str) -> Result<DesktopMetadata> {
         .get("Name")
         .map(|name| decode_name(name))
         .transpose()?;
+    let flatpak_id = fields
+        .get("X-Flatpak")
+        .map(|id| {
+            crate::parsers::macos::validate_identifier(id)?;
+            ensure!(
+                id.split('.').count() >= 3,
+                "Flatpak ID must contain a namespace"
+            );
+            Ok::<_, anyhow::Error>((*id).to_owned())
+        })
+        .transpose()?;
     Ok(DesktopMetadata {
         display_name,
         hidden,
         no_display: parse_boolean(fields.get("NoDisplay").copied())?,
+        flatpak_id,
+        absolute_executable: fields
+            .get("Exec")
+            .and_then(|value| literal_absolute_executable(value)),
     })
+}
+
+fn literal_absolute_executable(value: &str) -> Option<std::path::PathBuf> {
+    if value.len() > 16384 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    let quoted = chars.peek() == Some(&'"');
+    if quoted {
+        chars.next();
+    }
+    let mut closed = !quoted;
+    while let Some(ch) = chars.next() {
+        if quoted && ch == '"' {
+            closed = true;
+            if chars.peek().is_some_and(|next| !next.is_whitespace()) {
+                return None;
+            }
+            break;
+        }
+        if !quoted && ch.is_whitespace() {
+            break;
+        }
+        // Refuse all expansion/escaping/wrappers rather than evaluating them.
+        if matches!(ch, '\\' | '\'' | '%' | '$' | '`' | ';' | '|' | '&') {
+            return None;
+        }
+        out.push(ch);
+    }
+    if !closed || !out.starts_with('/') || out.len() > 4096 {
+        return None;
+    }
+    let path = std::path::PathBuf::from(&out);
+    let basename = path.file_name()?.to_str()?;
+    if matches!(
+        basename,
+        "env" | "sh" | "bash" | "dash" | "zsh" | "fish" | "flatpak" | "gtk-launch" | "snap"
+    ) {
+        return None;
+    }
+    if out.split('/').any(|part| part == "." || part == "..") {
+        return None;
+    }
+    Some(path)
 }
 
 fn parse_boolean(value: Option<&str>) -> Result<bool> {

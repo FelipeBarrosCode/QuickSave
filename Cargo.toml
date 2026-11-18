@@ -8,8 +8,14 @@ members = [
   "crates/quicksave-control",
   "crates/quicksave-integrations",
   "crates/quicksave-cli",
+  "crates/quicksave-state",
+  "crates/quicksave-tracking",
+  "crates/quicksave-noland",
+  "crates/quicksave-service",
+  "crates/quicksave-oauth",
+  "crates/quicksave-observation",
 ]
-exclude = ["upstream/no-land/state-agent", "apps/desktop/src-tauri"]
+exclude = ["upstream/no-land/state-agent", "shared-storage", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,6 +39,7 @@ quicksave-engine = { path = "crates/quicksave-engine" }
 quicksave-client = { path = "crates/quicksave-client" }
 quicksave-control = { path = "crates/quicksave-control" }
 quicksave-integrations = { path = "crates/quicksave-integrations" }
+quicksave-observation = { path = "crates/quicksave-observation" }
 
 [profile.release]
 lto = "thin"

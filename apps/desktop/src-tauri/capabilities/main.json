@@ -8,15 +8,8 @@
     "core:default",
     "dialog:allow-open",
     "dialog:allow-save",
-    "allow-get-capabilities",
-    "allow-get-directories",
-    "allow-discover-applications",
-    "allow-authorize-operation",
-    "allow-initialize-repository",
-    "allow-backup-folder",
-    "allow-list-snapshots",
-    "allow-restore-snapshot",
-    "allow-operation-status",
-    "allow-operation-history"
+    "allow-workspace-query",
+    "allow-workspace-prepare",
+    "allow-workspace-execute"
   ]
 }

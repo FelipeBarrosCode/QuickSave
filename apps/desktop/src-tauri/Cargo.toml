@@ -29,6 +29,7 @@ quicksave-client = { path = "../../../crates/quicksave-client" }
 quicksave-control = { path = "../../../crates/quicksave-control" }
 quicksave-platform = { path = "../../../crates/quicksave-platform" }
 quicksave-integrations = { path = "../../../crates/quicksave-integrations" }
+quicksave-service = { path = "../../../crates/quicksave-service" }
 
 [features]
 default = ["custom-protocol"]

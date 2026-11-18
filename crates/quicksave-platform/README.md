@@ -5,6 +5,118 @@ was copied into this crate.
 
 ## API
 
+### Additive native metadata / state contract (2026-11)
+
+```rust
+pub enum EntryKind { File, Directory, Symlink }
+pub struct NativeLinkStamp {
+    pub stamp: FileStamp,
+    pub target: String,
+    pub target_is_directory: Option<bool>,
+}
+pub struct MetadataEntry {
+    pub relative_path: String,
+    pub kind: EntryKind,
+    pub stamp: FileStamp,
+    pub link: Option<NativeLinkStamp>,
+}
+impl SafeRoot {
+    pub fn open_directory(&self, relative: &str) -> anyhow::Result<std::fs::File>;
+    pub fn clone_root_directory_handle(&self) -> anyhow::Result<std::fs::File>;
+    pub fn metadata_entries(&self) -> anyhow::Result<Vec<MetadataEntry>>;
+    pub fn read_link(&self, relative: &str) -> anyhow::Result<NativeLinkStamp>;
+    pub fn verify_link(&self, relative: &str, before: &NativeLinkStamp) -> anyhow::Result<()>;
+    pub fn create_new_relative_symlink(
+        &self, relative: &str, target: &str, target_is_directory: Option<bool>,
+    ) -> anyhow::Result<NativeLinkStamp>;
+}
+```
+
+`open_directory` requires a nonempty ordinary relative path and returns a real
+read-only no-follow directory handle after before/open/after identity and pinned
+parent checks. `clone_root_directory_handle` is the explicit root-only operation;
+it performs a fresh handle-relative `.` open for an independent enumeration
+cursor. `""`, `"."`, and traversal are never root aliases. Callers doing a bounded
+one-level enumeration retain the returned handle and re-open through the same
+`SafeRoot` afterward to compare native IDs. Windows consumers query full native
+128-bit IDs from the handle, not Rust's legacy 64-bit metadata index.
+
+The metadata walk never traverses a link. Unix link text is retained exactly;
+Windows native separators are normalized to `/` in this logical-root API. Text
+must be bounded UTF-8 and lexically confined to the selected logical root: `..` is
+allowed only while it remains within that root. Absolute, drive/NT namespace,
+backslash, NUL, stream, and escaping targets fail. Dangling internal links do not
+cause target reads. Existing strict `entries()` and `read_file()` APIs retain
+their no-symlink behavior. A link stamp binds no-follow native identity, length,
+write/change times, link text and (on Windows) the directory-link bit.
+
+Windows-only state adapter (available under `cfg(windows)`):
+
+```rust
+pub struct PrivateDirectory; // pinned, protected current-user-SID namespace
+pub struct PrivateLock;      // scoped LockFileEx lock, persistent lock inode
+pub struct PrivateFileVersion; // complete native identity + content/change stamp
+pub fn flush_native_directory(directory: &File) -> anyhow::Result<()>;
+impl PrivateDirectory {
+    pub fn open(path: &Path) -> anyhow::Result<Self>;
+    pub fn lock(&self, name: &str) -> anyhow::Result<PrivateLock>;
+    pub fn read(&self, name: &str, limit: usize)
+        -> anyhow::Result<Option<(Vec<u8>, PrivateFileVersion)>>;
+    pub fn replace(&self, name: &str, bytes: &[u8], observed: Option<&PrivateFileVersion>)
+        -> anyhow::Result<()>;
+    pub fn flush(&self) -> anyhow::Result<()>;
+}
+impl PrivateLock { pub fn check(&self) -> anyhow::Result<()>; }
+```
+
+Replacement is exclusively for caller-approved private configuration, not
+arbitrary user-data overwrite. Callers hold the scoped lock across read/replace.
+The Windows durability boundary is local NTFS/ReFS, protected user-only DACL,
+native handle-based publication, and a successful actual filesystem/volume
+flush. Unsupported filesystem, flush privileges or OS semantics return errors;
+an error after publication is not rollback. No Windows acceptance is implied.
+
+Standalone fork coordination: `noland-snapshot/src/source.rs` declares
+`native_metadata.rs`; the parent owns the `lib.rs` exports and `metadata.rs`
+integration. Its Windows metadata must retain `NativeIdentity { volume,
+file_id: [u64; 2] }`, raw creation/access/write/change FILETIME ticks, attributes,
+link count, and the checked symlink tag. Never substitute Unix UID/GID or a
+truncated 64-bit file index.
+
+Concrete snapshot integration hook: `SourcePath::metadata()` on Windows calls
+`SourceMetadata::from_windows(&WindowsMetadata) -> SourceMetadata`. The parent
+must add that constructor in its owned `metadata.rs`, retain the supplied native
+metadata, and make stable comparisons ignore access-time-only changes. Available
+fields are `identity`, `size`, `creation_time`, `last_access_time`,
+`last_write_time`, `change_time`, `attributes`, `number_of_links`, `reparse_tag`,
+and `kind: NativeEntryKind`. `WindowsMetadata::from_file(&File)` performs native
+handle queries and rejects unsupported reparse tags. `modified()` converts the
+raw native write time without pretending its epoch is Unix.
+
+Snapshot native boundary helpers are additive: `native_identity()`,
+`parent_native_identity()`, `new_beneath_native(path, boundary, NativeIdentity)`,
+`native_link_stamp()`, and
+`create_new_relative_symlink(target, logical_relative, target_is_directory)`.
+The legacy `(device, inode)` boundary APIs intentionally fail on Windows, rather
+than truncating a 128-bit identity. Parent exports should include `NativeIdentity`,
+`NativeEntryKind`, `SourceLinkStamp`, and (on Windows) `WindowsMetadata`.
+
+`SourceMetadata::from_file(&File)` is already implemented in the new module.
+Standalone database/restore adapters can use
+`native_metadata::{identity_from_file, flush_directory, verify_private_file,
+verify_private_directory, ScopedFileLock}`. `ScopedFileLock::lock(&File)` is a
+real scoped `LockFileEx`/`flock` lock on the verified private inode; callers also
+validate its parent/name. `flush_directory` uses the same real Windows volume
+barrier rather than `File::sync_all` on a directory. `WindowsMetadata` supplies
+checked `mtime_ns()`/`ctime_ns()` and `same_file_state()` (ignoring access time).
+`apply_file_metadata(&File, mode, mtime_ns, uid, gid)` is Windows-only: exact native
+100ns mtime is supported, while requested Unix mode/UID/GID explicitly fails.
+Windows `SourcePath::move_new_to` is handle-based no-replace; its
+`move_new_to_checked(target, expected)` variant additionally binds the opened
+source to a frozen `SourceMetadata`.
+All handles denying delete-sharing must close before a Windows publication/move;
+sharing violations are real failures, never a reason to use a racy path fallback.
+
 The `SafeRoot`, `FileStamp`, `Entry`, `capabilities()`, and `app_directories()`
 interfaces follow `docs/IMPLEMENTATION-CONTRACT.md` exactly. `FileStamp` and
 `Entry` derive serde, `PartialEq`, and `Eq`.
@@ -52,7 +164,7 @@ directory to have mode `0700` and the effective user's ownership. Existing
 ancestors may be system-owned, shared, or sticky. It never chmods/chowns existing
 directories. Existing nonprivate final directories are errors.
 
-Private means more than mode bits. `verify_private_file` requires the effective
+On Unix, private means more than mode bits. `verify_private_file` requires the effective
 user's ownership, mode exactly `0600`, regular-file type, one native hard link,
 and **no extended ACL**. It checks metadata before/after handle-based ACL
 inspection. Callers must use it before reading external recovery-key bytes;
@@ -75,8 +187,10 @@ These checks apply to private directories, newly created directories, and both
 staging directories/files **before the writer is invoked** and again before
 publication. ACLs are never silently stripped or changed. Failed private
 directory creation can leave a new empty directory but never reports success or
-writes recovery-key bytes into it. Windows private-file ACL verification is
-unsupported and explicitly errors, consistent with its private-write capability.
+writes recovery-key bytes into it. Windows requires local NTFS/ReFS, current-user
+SID ownership, a protected DACL with exactly one explicit full-access allow ACE
+for that SID, and one hard link for private files. Null/default/inherited DACLs,
+additional ACEs, extra hard links and unverifiable ACL models are errors.
 
 `create_dir` creates one component beneath the root (parents must already exist);
 it accepts an existing verified real directory. `write_new` never accepts an
@@ -117,13 +231,34 @@ an application-atomic snapshot or protection from a compromised local account.
 `FILE_OPEN_REPARSE_POINT`, `OBJ_DONT_REPARSE`, native volume/128-bit file IDs,
 length/last-write/change times, and native `NtQueryDirectoryFile` enumeration.
 Every ancestor is opened without `FILE_SHARE_DELETE`, preventing rename/deletion
-while pinned. Reparse points, device/UNC roots, device names, alternate streams,
-and non-Unicode names are rejected.
+while pinned. Strict reads reject reparse points; the separate metadata API
+accepts only checked relative `IO_REPARSE_TAG_SYMLINK` data without traversing it.
+Junctions, unknown reparse tags, device/UNC roots, device names, alternate streams,
+and non-Unicode names fail explicitly.
+Content reads reopen the already checked native inode with deny-write/delete
+sharing, refusing ordinary concurrent write handles instead of trusting Windows
+timestamps that can be deferred until writer close. Metadata-only indexing is
+separate from a successful stable-content capture. This is not VSS or an
+application-wide atomic/mapped-memory snapshot; applications requiring that
+consistency need a separate supported quiescence/snapshot mechanism.
 
-Windows durable writes, directory creation, and private ACL creation are
-**unsupported and return errors before creating anything or running a writer**.
-Their capability fields are false; there is no racy `std::fs` fallback.
-Windows implementation is not a claim of Windows native acceptance.
+Windows creation uses `NtCreateFile(FILE_CREATE)` with an explicit protected
+current-user descriptor. Staging handles and names are checked around the entire
+writer; `NtSetInformationFile(FileRenameInformation)` publishes atomically without
+replacement. Private configuration replacement is separate and requires an
+observed prior version. `LockFileEx`/`UnlockFileEx` provide scoped persistent-inode
+locking. Native file data is flushed and the final writer is closed while the
+random private staging name is still unpublished. A sealed, read-only DELETE
+control handle denies ordinary writers and namespace replacement across rename,
+verification and `FlushFileBuffers` on the actual volume. Timestamp finalization
+is thus not a race with an application opening the newly published name.
+A volume GUID root is pinned and checked against the selected native
+volume ID. NTFS/ReFS and successful actual volume flush are mandatory, including
+a preflight flush before the writer. Windows may require elevation for that
+handle; denial is an error, not a pretend durable fallback. Link creation also
+requires the authenticated directory-link kind and enabled native
+`SeCreateSymbolicLinkPrivilege` (never silently enabled). Windows native acceptance
+and ordinary-user durability acceptance are still pending.
 
 ## Bounds and paths
 
@@ -131,8 +266,9 @@ Walks are deterministic and fail on any invalid entry instead of skipping it.
 Limits: 1,000,000 entries, depth 128, 32,768 bytes per relative path, and 128 MiB
 of aggregate path bytes. Discovery also charges pending names to the global
 entry/path budget, bounding recursive enumeration memory. All source names must
-be UTF-8 and ordinary directory/regular-file names; symlinks and special files
-are explicit errors. Relative paths use `/` and reject empty, `.`/`..`, NUL,
+be UTF-8. Strict walks accept ordinary directory/regular-file names only;
+metadata walks additionally retain confined symlinks and never follow them.
+Special files are errors. Relative paths use `/` and reject empty, `.`/`..`, NUL,
 backslash, colon, and overlong components. Hard-linked regular source files are
 permitted; their individual names and native identities are validated.
 
@@ -148,9 +284,35 @@ directories or reads application state.
 replacement, symlink escapes, traversal rejection, FIFO/non-UTF8 rejection,
 ordered repeatable walks, depth limits, private modes, verification-before-
 publication, callback failures/panics, concurrent create-new writers, overwrite
-refusal, file-handle swaps, and private-directory helpers. Windows-specific tests
-cover native reading, source-name pinning, device paths, and fail-closed writes.
+refusal, file-handle swaps, and private-directory helpers. `safe_links_unix.rs`
+adds 16 synthetic framework/confinement/no-follow/link-stability cases.
+Windows-specific tests cover protected ACLs, native hard links, reparse reads,
+source-name pinning, device paths, real barrier denial, and privileged durable
+configuration replacement/no-overwrite acceptance.
 
 Native tests and cross-target compilation must be reported separately. Merely
 compiling a target does not establish Windows/Linux acceptance or native
 packaging acceptance.
+
+### This native-boundary revision
+
+Only formatting/static whitespace validation was run by its assigned agent;
+Cargo builds/tests, commits and additional agents were expressly prohibited.
+New test names above are coverage to run, not passing native acceptance evidence.
+
+Executed checks (both passed):
+
+```sh
+rustfmt --check --edition 2021 crates/quicksave-platform/src/lib.rs crates/quicksave-platform/src/unix.rs crates/quicksave-platform/src/windows.rs crates/quicksave-platform/tests/safe_links_unix.rs crates/quicksave-platform/tests/safe_root_windows.rs crates/quicksave-state/src/state_file.rs shared-storage/crates/noland-snapshot/src/source.rs shared-storage/crates/noland-snapshot/src/windows.rs shared-storage/crates/noland-snapshot/src/native_metadata.rs
+git diff --check -- crates/quicksave-platform crates/quicksave-state/src/state_file.rs shared-storage/crates/noland-snapshot/src/source.rs shared-storage/crates/noland-snapshot/src/windows.rs shared-storage/crates/noland-snapshot/src/native_metadata.rs
+```
+
+The parent must integrate the snapshot metadata constructor/exports and native
+restore/database callers before Windows compilation. Native Windows tests,
+elevated NTFS/ReFS flush acceptance (including ignored tests), enabled-privilege
+symlink creation, power-loss/fault durability, and platform packaging remain
+unvalidated. No No Land reference checkout or live app/provider/vault state was
+accessed. New `windows/*.rs`, standalone `windows.rs`/`native_metadata.rs`, and link
+tests are original GPL-3.0-only native boundary code using SDK ABI declarations;
+the parent provenance ledger should separately record the changes to the derived
+active-fork `source.rs`.

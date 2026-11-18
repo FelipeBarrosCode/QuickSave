@@ -15,7 +15,9 @@ The source archive itself is not retained, so hashing the unpacked directory doe
 **not** reproduce the archive digest. `scripts/verify_repository.py` checks the
 source metadata and a separately pinned unpacked-tree digest in
 `scripts/upstream-provenance.json`, checks each file against
-`upstream/FILES.sha256.json`, and rejects runtime dependencies on the vendor tree.
+`upstream/FILES.sha256.json`, and rejects dependencies on that reference tree.
+The pinned unpacked tree remains **227 files**, tree SHA-256
+`597d8cb35df99f5aa94ad509b5030160d5916dd56d2bc50fdc933ff257dcdd26`.
 This is an accidental-change guard, not a signed provenance attestation.
 Do not rebuild the baseline to make an unexplained mismatch pass.
 
@@ -23,11 +25,90 @@ The copied upstream docs contain historical production details and test counts.
 Those are reference evidence only: they authorize no access to those machines,
 credentials or repositories and prove no QuickSave acceptance.
 
-## Reuse matrix
+## Two distinct implementation paths
+
+The software/provider workspace revision is defined by
+[`WORKSPACE-V2-CONTRACT.md`](WORKSPACE-V2-CONTRACT.md). Its native bridge uses the
+separate active library fork at `shared-storage/`; **it does not link or modify
+`upstream/no-land/`**. The fork retains No Land's existing format, encryption,
+packs and provider/session representations rather than creating a second
+"compatible" implementation.
+
+The earlier `quicksave-engine` / `quicksave-content` / local CLI path is separate.
+It has a deliberately different QuickSave envelope and local repository format.
+Its tests, performance and restore limitations must not be presented as evidence
+of No Land format interoperability or of workspace-v2 cloud acceptance. No
+automatic conversion between these repositories is implemented or promised.
+
+### Active native-library fork
+
+`shared-storage/SOURCE.json` identifies the exact source commit above and the
+local `../upstream/no-land/state-agent` reference. Its nonempty `adaptations`
+list describes actual changes, not planned parity. The bridge owner must finish
+that record after adaptations settle.
+
+`shared-storage/FORK-CHANGES.sha256.json` records the complete delta from the
+pinned `state-agent/` subtree:
+
+- Keys are relative fork paths, without the `state-agent/` prefix.
+- Added or modified files have their current lowercase SHA-256 as the value.
+- Omitted upstream files have `null` as the value. This explicitly records the
+  exclusion of deployment scripts, systemd/prebuilt artifacts and lifecycle code.
+- Only `SOURCE.json` and `FORK-CHANGES.sha256.json` are excluded from this delta
+  to avoid self-referential hashes. `Cargo.lock` and `LICENSE` are included.
+- Review and record changes; never regenerate the immutable upstream baseline
+  to hide them. This ledger detects drift, not whether a change is safe.
+
+The verifier permits only the following 17 exact library packages at
+`shared-storage/crates/<package>`:
+
+```text
+noland-attribution       noland-baseline       noland-cas
+noland-classifier        noland-crypto         noland-discovery
+noland-observer          noland-pack           noland-rclone-adapter
+noland-restore           noland-rpc            noland-snapshot
+noland-state-agent       noland-state-core     noland-state-db
+noland-storage           noland-testkit
+```
+
+Every fork manifest is checked, including unused crates, workspace dependencies,
+dev/build/target-specific dependencies, patches and replacements. Aliases must
+resolve to the actual package name. Path components must remain within the
+approved repository/fork boundary without symlinks or reparse points; absolute
+and external paths, upstream-reference dependencies, registry No Land packages,
+Git sources and binary-artifact dependencies are rejected. The active fork
+remains a separate Cargo workspace, not a member of the QuickSave workspace.
+Remote-agent executable targets are excluded; retained `src/main.rs` sources
+must have automatic binary discovery disabled. No lifecycle package, deployment
+scripts, systemd or prebuilt tree belongs in the active fork.
+
+| Shared area | Workspace-v2 use and required boundary |
+| --- | --- |
+| Crypto, CAS, compression and packs | Reuse source implementations and authenticated formats; do not substitute the legacy QuickSave envelope |
+| State core, database and storage | Use a private QuickSave instance/journal, never an existing No Land database or remote runtime |
+| Capture, generation guards, admission and receipts | Retain source guards; explicit native roots and file selections replace inferred Linux ownership |
+| Restore | Retain authenticated assembly and source safety protocols; confined native destinations and OS-specific behavior still need acceptance |
+| Provider adapter | Reuse provider/session formats; QuickSave has its own vault namespace and transient native credential handling |
+| `noland-state-agent` | In-process library only; no remote binary, provisioning, SSH, RPC listener or lifecycle process is authorized |
+| Observer/discovery policy | Native approved-root tracking must not infer backup permission from process names or Linux runtime paths |
+| Deletion/retry/cancellation | Reuse exact source protocols; deletion requires a fresh frozen preview, native confirmation and separate dependency acknowledgement |
+| History convergence | **Disabled by QuickSave policy.** Version history is additive; no automatic cloud retirement or local source deletion |
+
+The guard verifies local declarations, provenance hashes, the original license
+copy and manifest license/authorship notices. It is not a transitive registry
+SBOM, code-execution sandbox, proof that no forbidden runtime call exists, or
+legal review. Human review must preserve any in-source notices too.
+
+Current acceptance evidence and remaining gates are recorded separately in
+[`WORKSPACE-V2-ACCEPTANCE.md`](WORKSPACE-V2-ACCEPTANCE.md). Library linkage is not
+an assertion that every upstream feature works on every native platform.
+
+### Earlier local CLI extraction matrix
 
 Paths below are relative to `upstream/no-land/state-agent/crates/`.
 “Candidate” means review/extract/adapt; it does not mean that crate is linked or
-that its entire feature set is implemented in QuickSave.
+that its entire feature set is implemented in the earlier local engine. This
+historical matrix does not describe the new active-fork linkage above.
 
 The actual content excerpts/adaptations and their test fixtures are recorded in
 [`crates/quicksave-content/PROVENANCE.md`](../crates/quicksave-content/PROVENANCE.md),
@@ -73,7 +154,12 @@ manifests inherit that workspace value. These are conflicting source signals; a
 Cargo metadata field alone does not settle the complete snapshot's license.
 
 - Preserve original copyright/license notices and the unmodified snapshot.
+- Preserve `shared-storage/LICENSE` byte-for-byte from
+  `upstream/no-land/LICENSE`, and retain the original MIT workspace declaration
+  and inherited manifest notices as evidence of the unresolved discrepancy.
 - New QuickSave code is marked **GPL-3.0-only pending owner/license review**.
+- New source files added to the fork must carry their GPL-3.0-only SPDX notice;
+  retaining upstream MIT metadata does not relicense those additions.
 - Do not describe the snapshot or the resulting application as wholly MIT.
 - This conservative development choice is not a legal determination about every
   upstream contribution or a grant to redistribute code under different terms.
@@ -95,5 +181,5 @@ with:
 5. Remaining portability, parser, resource and security review.
 
 Portable algorithm equivalence does not imply storage-format interoperability.
-The verifier prevents vendor linkage; human review is still required for
-provenance, semantics and licensing.
+The verifier prevents immutable-reference linkage and narrowly permits the
+recorded active fork; human review remains necessary for semantics and licensing.
