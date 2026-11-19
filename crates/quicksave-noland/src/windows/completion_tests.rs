@@ -4,7 +4,7 @@
 //! isolated fixtures. No rclone, OS vault, provider account or collector is run.
 use super::*;
 use crate::windows::tests::Fixture;
-use quicksave_state::MemoryVault;
+use quicksave_state::{CredentialVault, MemoryVault, QUICKSAVE_VAULT_SERVICE};
 use quicksave_tracking::{NativeCaptureReceipt, Tracker, TrackingPolicy, TrackingStore};
 
 const SOFTWARE: &str = "fixture-software";
@@ -586,6 +586,15 @@ async fn completion_only_reads_fresh_grant_nonces_not_credentials_keys_or_curren
     drop(source);
     fixture.tracker.shutdown().unwrap(); // Freeze unrelated background I/O counters.
     let io = fixture.tracker.performance_counters();
+    // Migration protection must freshly prove the aggregate key item is absent
+    // before using a retained legacy device key. This is an absence probe, not
+    // permission to fetch any credential or encrypted-state key.
+    const MISSING_MIGRATION_ANCHOR: &str = "QuickSaveEncryptedStateVault.v1";
+    assert!(fixture
+        .vault
+        .read(QUICKSAVE_VAULT_SERVICE, MISSING_MIGRATION_ANCHOR)
+        .unwrap()
+        .is_none());
     let vault = fixture.vault.access_log().unwrap();
     fixture.engine.inner.proofs.lock().unwrap().insert(
         fixture.job.plan.operation,
@@ -632,8 +641,17 @@ async fn completion_only_reads_fresh_grant_nonces_not_credentials_keys_or_curren
     let after = fixture.vault.access_log().unwrap();
     assert_eq!(after["writes"], vault["writes"]);
     assert!(after["reads"].as_array().unwrap()[before..].iter().all(|read|
-        nonce_accounts.contains(&read[1].as_str().unwrap())),
-        "explicit completion may freshly read only the original grant nonce registry, never credentials/keys");
+        read[0] == QUICKSAVE_VAULT_SERVICE
+            && (nonce_accounts.contains(&read[1].as_str().unwrap())
+                || read[1] == MISSING_MIGRATION_ANCHOR)),
+        "completion may read only original grant nonces and probe an absent migration anchor; never fetch credentials/keys");
+    // With no intervening writes and absence verified on both sides, the added
+    // account cannot conceal an encryption-key read or a secret/key creation.
+    assert!(fixture
+        .vault
+        .read(QUICKSAVE_VAULT_SERVICE, MISSING_MIGRATION_ANCHOR)
+        .unwrap()
+        .is_none());
     assert_eq!(fixture.tracker.performance_counters(), io);
     assert_eq!(
         std::fs::read(path).unwrap(),
