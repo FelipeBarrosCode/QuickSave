@@ -87,6 +87,9 @@ Linux desktop builds additionally need the documented WebKitGTK/GTK development
 packages. Cross-compilation or a successful macOS test run is not native Windows
 or Linux acceptance.
 
+The [desktop build/test pipeline](docs/DESKTOP-BUILD-PIPELINE.md) covers native
+Windows, macOS and Linux runners on x64 and ARM64, with unsigned package artifacts.
+
 The desktop exposes only `workspace_query`, `workspace_prepare` and
 `workspace_execute`. Legacy local-repository/discovery commands are not a UI
 fallback; selected filesystem/provider operations require exact native tickets.
