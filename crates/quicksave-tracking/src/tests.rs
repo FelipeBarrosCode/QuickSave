@@ -6,6 +6,28 @@ use notify::{event::ModifyKind, Event, EventKind};
 use std::{fs, sync::mpsc::Receiver};
 use tempfile::TempDir;
 
+#[test]
+fn epoch_increment_is_concurrent_and_never_wraps() {
+    let epoch = Arc::new(AtomicU64::new(0));
+    let workers = (0..8)
+        .map(|_| {
+            let epoch = epoch.clone();
+            std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    increment_epoch(&epoch).unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(epoch.load(Ordering::Acquire), 8000);
+    let exhausted = AtomicU64::new(u64::MAX);
+    assert_eq!(increment_epoch(&exhausted), Err(u64::MAX));
+    assert_eq!(exhausted.load(Ordering::Acquire), u64::MAX);
+}
+
 #[derive(Default)]
 struct FakeVaultStore {
     records: Mutex<BTreeMap<String, Value>>,

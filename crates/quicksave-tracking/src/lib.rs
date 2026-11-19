@@ -51,6 +51,19 @@ impl std::fmt::Display for TrackingProjectionChanged {
     }
 }
 impl std::error::Error for TrackingProjectionChanged {}
+
+/// Preserve Rust 1.89 support without the subsequently deprecated fetch_update.
+/// Returns the previous value and never wraps an authority/uncertainty epoch.
+fn increment_epoch(epoch: &AtomicU64) -> std::result::Result<u64, u64> {
+    let mut previous = epoch.load(Ordering::Acquire);
+    loop {
+        let next = previous.checked_add(1).ok_or(previous)?;
+        match epoch.compare_exchange_weak(previous, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(previous) => return Ok(previous),
+            Err(current) => previous = current,
+        }
+    }
+}
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1076,10 +1089,7 @@ impl Tracker {
             .context("native unknown generation exhausted")?;
         let scope_hash = bundle::digest(&scope)?;
         let grant_hash = bundle::digest(&app.record.tracking_grant)?;
-        app.event_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                epoch.checked_add(1)
-            })
+        increment_epoch(&app.event_epoch)
             .map_err(|_| anyhow::anyhow!("native source event epoch exhausted"))?;
         app.scheduler.hint(self.shared.now())?;
         ensure!(
@@ -1442,11 +1452,7 @@ impl Shared {
     }
 
     fn uncertain(&self, reset_watch: bool) {
-        match self
-            .uncertainty_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
-                epoch.checked_add(1)
-            }) {
+        match increment_epoch(&self.uncertainty_epoch) {
             Ok(previous) => {
                 if reset_watch {
                     self.watch_reset_requested

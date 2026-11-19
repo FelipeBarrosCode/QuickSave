@@ -207,9 +207,30 @@ fn enqueue(sender: mpsc::Sender<QueueItem>, lifetime: Arc<Lifetime>) -> Enqueue 
             !lifetime.stopping.load(Ordering::SeqCst),
             "The autosave worker is stopping"
         );
-        lifetime.queued_bytes.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|current| {
-            current.checked_add(bytes).filter(|total|*total<=dto::MAX_WORK_BYTES)
-        }).map_err(|_|anyhow!("The bounded autosave queue byte budget is busy; reconciliation remains pending"))?;
+        let mut current = lifetime.queued_bytes.load(Ordering::SeqCst);
+        // A watcher callback never waits for queue capacity. Contention and
+        // budget exhaustion both retain the caller's reconciliation obligation.
+        let mut reserved = false;
+        for _ in 0..64 {
+            let next = current.checked_add(bytes).filter(|total| *total <= dto::MAX_WORK_BYTES)
+                .ok_or_else(|| anyhow!("The bounded autosave queue byte budget is busy; reconciliation remains pending"))?;
+            match lifetime.queued_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    reserved = true;
+                    break;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+        ensure!(
+            reserved,
+            "The bounded autosave queue byte budget is busy; reconciliation remains pending"
+        );
         lifetime.outstanding.fetch_add(1, Ordering::SeqCst);
         lifetime.queued.fetch_add(1, Ordering::SeqCst);
         if lifetime.stopping.load(Ordering::SeqCst) {
