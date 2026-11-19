@@ -628,14 +628,40 @@ fn root_remount_or_namespace_replacement_is_not_reapproved() {
     let fixture = Fixture::new();
     let mut probe = FixtureProbe::new(&fixture);
     let data = fixture.data_dir.clone();
+    let original = fs::read(&fixture.file).unwrap();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let attempted = blocked.clone();
     probe.on_process = Some(Box::new(move |call| {
         if call == 2 {
+            if cfg!(windows) {
+                // Native Windows directory handles deliberately deny delete
+                // sharing: this attack must be prevented before replacement,
+                // not made possible merely to exercise the Unix detector.
+                let error =
+                    fs::rename(&data, data.with_file_name("old-approved-data")).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(32), "{error}");
+                attempted.store(true, Ordering::Release);
+                return;
+            }
             fs::rename(&data, data.with_file_name("old-approved-data")).unwrap();
             fs::create_dir(&data).unwrap();
             fs::write(data.join("slot.dat"), b"unapproved replacement").unwrap();
         }
     }));
     let snapshot = engine(&fixture, probe).reconcile(100).unwrap();
+    if cfg!(windows) {
+        assert!(blocked.load(Ordering::Acquire));
+        assert_eq!(fs::read(&fixture.file).unwrap(), original);
+        assert!(!fixture
+            .data_dir
+            .with_file_name("old-approved-data")
+            .exists());
+        assert!(!has_gap(&snapshot, GapReason::RootIdentityChanged));
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.files[0].root_id(), "data");
+        assert_eq!(snapshot.files[0].relative_path(), "slot.dat");
+        return;
+    }
     assert!(snapshot.files.is_empty());
     assert!(has_gap(&snapshot, GapReason::RootIdentityChanged));
     assert_eq!(

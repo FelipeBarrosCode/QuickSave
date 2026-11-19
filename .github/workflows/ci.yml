@@ -60,7 +60,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev libelf-dev zlib1g-dev clang llvm
       - name: Run workspace tests on the native host
-        run: cargo test --locked --workspace -- --test-threads=1
+        run: cargo test --locked --workspace --no-fail-fast -- --test-threads=1
       - name: Build CLI
         run: cargo build --locked -p quicksave-cli
       - name: Run isolated CLI round trip or verify explicit unsupported refusal
