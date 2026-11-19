@@ -1174,7 +1174,9 @@ async fn actual_full_capture_history(encrypted_state: bool) -> Result<()> {
         );
         assert!(fixture.store.verify_tracking_grant(SOFTWARE)?);
     }
-    let first_work = fixture.prepare(None)?;
+    let first_work = fixture
+        .prepare(None)
+        .context("full history: prepare first capture after optional migration")?;
     assert_eq!(
         fixture.tracking.tracker()?.performance_counters()["bytesRead"],
         0
@@ -1224,7 +1226,9 @@ async fn actual_full_capture_history(encrypted_state: bool) -> Result<()> {
     for (relative, bytes) in &fixture.initial_files {
         assert_eq!(fixture.read_payload(&first, relative).await?, *bytes);
     }
-    let confirmed = fixture.complete(&first_work)?;
+    let confirmed = fixture
+        .complete(&first_work)
+        .context("full history: confirm first capture")?;
     assert_eq!(confirmed["sourceConfirmed"], true);
     assert!(
         fixture.store.software_record(SOFTWARE)?["pendingWork"].is_null(),
@@ -1252,7 +1256,9 @@ async fn actual_full_capture_history(encrypted_state: bool) -> Result<()> {
         .tracking
         .call("scan_metadata", &json!({"softwareId":SOFTWARE}))?;
     let before = fixture.storage.snapshot();
-    let second_work = fixture.prepare(None)?;
+    let second_work = fixture
+        .prepare(None)
+        .context("full history: prepare deletion capture")?;
     let evidence = second_work.full_evidence.as_ref().unwrap();
     assert_eq!(evidence["deletedFileIds"], json!([removed_id]));
     assert_eq!(evidence["baseline"]["kind"], "full");
@@ -1297,7 +1303,9 @@ async fn actual_full_capture_history(encrypted_state: bool) -> Result<()> {
     fixture
         .tracking
         .call("scan_metadata", &json!({"softwareId":SOFTWARE}))?;
-    let empty_work = fixture.prepare(None)?;
+    let empty_work = fixture
+        .prepare(None)
+        .context("full history: prepare empty capture")?;
     assert_eq!(empty_work.scope.node_count, 0);
     assert!(empty_work.selection.file_keys.as_ref().unwrap().is_empty());
     assert_eq!(empty_work.scope.full_scope.as_ref().unwrap().root_count, 1);

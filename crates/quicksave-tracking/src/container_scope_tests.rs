@@ -64,6 +64,9 @@ fn native_data_approval_indexes_owned_children_without_censusing_opaque_policy_c
     let opaque = protected.join("id_rsa");
     fs::create_dir(&opaque).unwrap();
     fs::set_permissions(&opaque, fs::Permissions::from_mode(0o000)).unwrap();
+    let overlap_control = quicksave_platform::SafeRoot::open(&documents)
+        .unwrap()
+        .overlaps_for_approval(&quicksave_platform::SafeRoot::open(&protected).unwrap());
     Arc::get_mut(&mut h.tracker.shared)
         .unwrap()
         .policy
@@ -80,6 +83,35 @@ fn native_data_approval_indexes_owned_children_without_censusing_opaque_policy_c
     let result = h.tracker.materialize_bundles(&[plan], &sealed);
     fs::remove_dir(&opaque).unwrap();
     let result = result.unwrap();
+    if let Err(error) = overlap_control {
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)),
+            "unexpected native proof failure: {error:#}"
+        );
+        // On unsupported boot mount layouts the same real permission denial
+        // must reject enrollment entirely. This is a negative safety test, not
+        // a skipped claim of optimized APFS support.
+        assert!(result["bundles"].as_array().unwrap().is_empty(), "{result}");
+        assert!(
+            result["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|item| item["rootDiagnostics"].as_array().into_iter().flatten())
+                .any(
+                    |item| item["code"] == "native_policy_root_inspection_failed"
+                        && item["inspectionSide"] == "protected"
+                        && item["osError"] == 13
+                ),
+            "{result}"
+        );
+        assert!(h.tracker.shared.apps().unwrap().is_empty());
+        assert_eq!(h.tracker.performance_counters()["bytesRead"], 0);
+        assert_eq!(h.tracker.performance_counters()["filesHashed"], 0);
+        return;
+    }
     assert_eq!(result["bundles"].as_array().unwrap().len(), 1, "{result}");
     let record = h.tracker.bundle_record(&id_from(&result)).unwrap();
     assert_eq!(record["fileCount"], 1);

@@ -355,7 +355,9 @@ impl TrackingStore for StoreAdapter {
     }
     fn verify_grant(&self, kind: &str, scope: &Value, grant: &Value) -> Result<bool> {
         self.0.verify_grant(kind, scope, grant).map_err(|error| {
-            if quicksave_state::is_legacy_credential_deferred(&error) {
+            if error.is::<quicksave_state::MetadataProjectionChanged>() {
+                quicksave_tracking::TrackingProjectionChanged.into()
+            } else if quicksave_state::is_legacy_credential_deferred(&error) {
                 quicksave_tracking::DeferredLegacyAuthority.into()
             } else {
                 error
@@ -500,6 +502,11 @@ impl TrackingAdapter {
     }
 
     fn verified(&self, software: &str) -> Result<Value> {
+        let record = self.store.software_record(software)?;
+        ensure!(
+            record["authorizationPending"] != true,
+            "Persisted manual tracking authority is paused pending explicit verification"
+        );
         ensure!(
             self.store.verify_tracking_grant(software)?,
             "Persisted manual tracking authority is invalid or revoked"

@@ -95,9 +95,20 @@ pub(crate) fn verify(
     })?;
     // The original verifier still authenticates the actual HMAC and reads the
     // current persistent vault nonce on EVERY call. A snapshot creates no key.
-    Some(frame.snapshot.with_secret_access(|vault| {
+    let result = frame.snapshot.with_secret_access(|vault| {
         store.verify_bound(vault, &frame.snapshot.document, scope, signature)
-    }))
+    });
+    // An encrypted snapshot retains its original anchor revision. A legitimate
+    // concurrent metadata writer can advance it before this verifier runs.
+    // Discard that projection; do not mislabel the stale anchor as a durable
+    // authorization denial. The bounded whole-request retry verifies anew.
+    Some(match result {
+        Err(error) => match frame.snapshot.is_current() {
+            Ok(false) => Err(MetadataProjectionChanged.into()),
+            _ => Err(error),
+        },
+        result => result,
+    })
 }
 
 impl WorkspaceStore {

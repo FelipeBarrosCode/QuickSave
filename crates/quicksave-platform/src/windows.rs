@@ -608,7 +608,28 @@ fn open_child(parent: &File, name: &str, directory: bool) -> Result<File> {
 }
 
 fn open_dot(parent: &File) -> Result<File> {
-    open_native(parent, ".", true)
+    // NtCreateFile's handle-relative namespace does not accept "." on Windows
+    // (STATUS_OBJECT_NAME_INVALID). Reopen the actual pinned vnode instead of
+    // resolving its path or duplicating its shared enumeration cursor.
+    let before = metadata(parent, true)?;
+    let handle = unsafe {
+        ReOpenFile(
+            parent.as_raw_handle(),
+            FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(io::Error::last_os_error()).context("reopen pinned directory");
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    let after = metadata(&file, true)?;
+    ensure!(
+        before.device == after.device && before.file_id == after.file_id,
+        "reopened directory native identity changed"
+    );
+    Ok(file)
 }
 
 fn open_native(parent: &File, name: &str, directory: bool) -> Result<File> {

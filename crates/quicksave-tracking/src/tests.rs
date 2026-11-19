@@ -14,6 +14,7 @@ struct FakeVaultStore {
     fail_writes: AtomicBool,
     issued_grants: AtomicUsize,
     verification_calls: AtomicUsize,
+    projection_changed: AtomicBool,
     failing_verification: Mutex<Option<(String, String)>>,
     deferred_tracking: Mutex<BTreeSet<String>>,
 }
@@ -68,6 +69,9 @@ impl TrackingStore for FakeVaultStore {
     }
     fn verify_grant(&self, kind: &str, scope: &Value, grant: &Value) -> Result<bool> {
         self.verification_calls.fetch_add(1, Ordering::Relaxed);
+        if self.projection_changed.load(Ordering::Acquire) {
+            return Err(TrackingProjectionChanged.into());
+        }
         if kind == "tracking"
             && scope["softwareId"]
                 .as_str()
@@ -414,6 +418,29 @@ fn scans_never_confirm_uploads_and_changed_dirty_is_since_last_confirmed_snapsho
     assert_eq!(h.scan(&id)["captureSource"]["changedDirty"], true);
     assert_eq!(h.scan(&id)["captureSource"]["changedDirty"], true);
     assert_eq!(fs::read(root.join("save.dat")).unwrap(), b"two");
+}
+
+#[test]
+fn changed_metadata_projection_does_not_latch_authorization_denial() {
+    let h = Harness::new();
+    let root = h.root("projection-source");
+    fs::write(root.join("save.dat"), b"one").unwrap();
+    let id = h.approve(&root);
+    h.store.projection_changed.store(true, Ordering::Release);
+    assert!(h
+        .tracker
+        .scan(&id)
+        .unwrap_err()
+        .is::<TrackingProjectionChanged>());
+    {
+        let apps = h.tracker.shared.apps().unwrap();
+        let app = &apps[&id];
+        assert!(!app.authorization_paused);
+        assert!(!app.record.authorization_pending);
+        assert!(!app.scheduler.paused);
+    }
+    h.store.projection_changed.store(false, Ordering::Release);
+    assert!(h.tracker.scan(&id).is_ok());
 }
 
 #[test]

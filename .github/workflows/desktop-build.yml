@@ -74,6 +74,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          cache-on-failure: true
+
       - name: Verify this is a native runner, not a cross-check
         run: python scripts/check_ci_native_host.py "${{ matrix.target }}"
 

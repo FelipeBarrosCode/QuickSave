@@ -1647,6 +1647,32 @@ fn metadata_frame_reuses_one_document_for_4096_trait_verifications_but_not_threa
 }
 
 #[test]
+fn encrypted_projection_race_is_not_a_persistent_vault_denial() {
+    let (_temp, _vault, store) = fixture();
+    let scope = json!({"softwareId":"racing-metadata","roots":[]});
+    let signature = store.issue_grant("tracking", &scope).unwrap();
+    store.migrate_to_encrypted_state().unwrap();
+    let result = store.with_metadata_verification_snapshot(|| {
+        let writer = store.clone();
+        thread::spawn(move || {
+            writer.issue_grant(
+                "tracking",
+                &json!({"softwareId":"other-software","roots":[]}),
+            )
+        })
+        .join()
+        .unwrap()?;
+        let error = store
+            .verify_grant("tracking", &scope, &signature)
+            .unwrap_err();
+        assert!(error.is::<MetadataProjectionChanged>(), "{error:#}");
+        Err::<(), _>(error)
+    });
+    assert!(result.unwrap_err().is::<MetadataProjectionChanged>());
+    assert!(store.verify_grant("tracking", &scope, &signature).unwrap());
+}
+
+#[test]
 fn metadata_frame_keeps_real_revocation_checks_and_discards_changed_results_without_replay() {
     let (_temp, vault, store) = fixture();
     let scope = json!({"softwareId":"synthetic-metadata","roots":[]});

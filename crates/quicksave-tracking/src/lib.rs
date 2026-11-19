@@ -41,6 +41,16 @@ impl std::fmt::Display for DeferredLegacyAuthority {
     }
 }
 impl std::error::Error for DeferredLegacyAuthority {}
+/// A synchronous metadata projection raced a workspace write. Not a denial,
+/// grant, or worker/publication retry; the caller must discard the whole DTO.
+#[derive(Debug)]
+pub struct TrackingProjectionChanged;
+impl std::fmt::Display for TrackingProjectionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tracking metadata projection changed; discard this read")
+    }
+}
+impl std::error::Error for TrackingProjectionChanged {}
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1478,6 +1488,9 @@ impl Shared {
         let valid = match verification {
             Ok(valid) => valid,
             Err(error) => {
+                if error.is::<TrackingProjectionChanged>() {
+                    return Err(error);
+                }
                 self.pause_authorization(app)?;
                 if error.is::<DeferredLegacyAuthority>() {
                     return Err(error);
