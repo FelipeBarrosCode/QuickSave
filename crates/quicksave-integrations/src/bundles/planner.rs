@@ -544,6 +544,10 @@ impl<'a> Planner<'a> {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "explicit ownership/evidence fields are kept separate at this admission boundary"
+    )]
     fn root(
         &self,
         path: Option<PathBuf>,
@@ -660,6 +664,10 @@ impl<'a> Planner<'a> {
         true
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "candidate evidence is explicit rather than implicit mutable planner state"
+    )]
     fn candidate(
         &mut self,
         plan: &mut SoftwareBundlePlan,

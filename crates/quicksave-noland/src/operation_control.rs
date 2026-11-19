@@ -298,7 +298,7 @@ mod source {
     #[serde(tag = "presence", rename_all = "snake_case")]
     pub enum SourceObservation {
         Absent { source_operation_id: Uuid },
-        Present { status: SourceOperationStatus },
+        Present { status: Box<SourceOperationStatus> },
     }
 
     /// Borrowing the actual agent keeps its actual StateDb/worker owner alive.
@@ -445,7 +445,7 @@ mod source {
                 })
                 .transpose()?;
             Ok(SourceObservation::Present {
-                status: SourceOperationStatus {
+                status: Box::new(SourceOperationStatus {
                     lifecycle: SourceLifecycle::from_source(&identity.state),
                     worker_running: self
                         .agent
@@ -457,7 +457,7 @@ mod source {
                         .cancel_requested(expected.source_operation_id),
                     identity,
                     progress,
-                },
+                }),
             })
         }
 

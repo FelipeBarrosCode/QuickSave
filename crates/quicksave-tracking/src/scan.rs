@@ -515,6 +515,7 @@ fn stopped(stop: &AtomicBool) -> Result<()> {
 }
 
 /// Hashes at most a fixed buffer at a time, checking stop and source identity.
+#[cfg(test)]
 pub(crate) fn capture(
     roots: &[ApprovedRoot],
     previous: Option<&Snapshot>,
@@ -545,9 +546,11 @@ pub(crate) fn capture_index(
     stop: &AtomicBool,
     counters: &IoCounters,
 ) -> Result<Snapshot> {
-    let mut snapshot = Snapshot::default();
-    snapshot.content_captured =
-        hash_content || (!force_hash && previous.is_some_and(|previous| previous.content_captured));
+    let mut snapshot = Snapshot {
+        content_captured: hash_content
+            || (!force_hash && previous.is_some_and(|previous| previous.content_captured)),
+        ..Snapshot::default()
+    };
     let mut path_bytes = 0_usize;
     let mut pinned = Vec::new();
     let mut tree_entries = Vec::new();

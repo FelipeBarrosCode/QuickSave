@@ -39,19 +39,21 @@
 
 use crate::{
     boundary as dto,
-    interfaces::{NativeFuture, PublishGuard, SourceGuard},
+    interfaces::{NativeFuture, PublishGuard},
     native_plans::{
         self, FinalizedNativeChild, FrozenCaptureBinding, FrozenNativePlan, FrozenNativePlanStore,
         NativeHistoryChild, NativeHistoryMetadata, ReconciliationGap, ReconciliationGapKind,
     },
     operations::{
-        ChildState, CompletionReceipt, FrozenChildPlan, FrozenPlanSet, NativeChildStatus,
-        NativeObservation, NativeOperationBackend, OperationBindings, OperationCoordinator,
-        OperationFuture, OperationSummary, ParentState, PublicationGuard, SelectionIntent,
-        StoreSigner, MAX_APPS_PER_PLAN, MAX_CHILDREN_PER_JOB,
+        ChildState, CompletionReceipt, FrozenChildPlan, FrozenPlanSet, NativeObservation,
+        NativeOperationBackend, OperationBindings, OperationCoordinator, OperationFuture,
+        OperationSummary, ParentState, PublicationGuard, SelectionIntent, StoreSigner,
+        MAX_APPS_PER_PLAN, MAX_CHILDREN_PER_JOB,
     },
     Active, Operation, OperationGuard, RetryPlan, WorkspaceService,
 };
+#[cfg(test)]
+use crate::{interfaces::SourceGuard, operations::NativeChildStatus};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -146,6 +148,7 @@ impl VerifiedSourceOperation {
 ///   device MAC was checked first. Do not trust the row's own roots/digests.
 /// - Cancellation verifies a retained exact-ID native capability and real
 ///   worker owner, even if current provider write/root authority was revoked.
+///
 /// Raw SQL/JSON status is never a successful implementation.
 pub trait BatchSourceVerifier: Send + Sync + 'static {
     fn require_supported(&self) -> Result<()>;
@@ -236,6 +239,10 @@ pub trait BatchRecovery: Send + Sync + 'static {
 }
 
 /// Explicit unsupported recovery, never a pretend receipt or dirty-state ack.
+#[allow(
+    dead_code,
+    reason = "retained fail-closed adapter for unsupported native implementations"
+)]
 pub struct UnavailableBatchRecovery;
 impl BatchRecovery for UnavailableBatchRecovery {
     fn recover_original_work<'a>(
@@ -400,6 +407,10 @@ impl NativeBatchRuntime {
     pub fn confirm_core_hooks_installed(&self) {
         self.backend.hooks_ready.store(true, Ordering::Release);
     }
+    #[allow(
+        dead_code,
+        reason = "native-only verifier installation hook; not renderer authority"
+    )]
     pub fn set_root_verifier(&self, verifier: Arc<dyn BatchRootVerifier>) -> Result<()> {
         *self
             .root_verifier
@@ -637,6 +648,7 @@ impl NativeBatchRuntime {
     /// Optional native-only footer/deduplication helper. Call recent_activity
     /// first; only device-MAC-verified ADMITTED membership enters this cache.
     /// This is display grouping, never source authentication or write authority.
+    #[cfg(test)]
     pub fn is_group_source(&self, source_id: &str) -> bool {
         let Ok(id) = Uuid::parse_str(source_id) else {
             return false;
@@ -1316,7 +1328,7 @@ impl WorkingNativeBatchBackend {
         result.validate(plan, capture, purpose)?;
         Ok(result)
     }
-    fn child_for_source<'a>(parent: &'a FrozenPlanSet, id: Uuid) -> Result<&'a FrozenChildPlan> {
+    fn child_for_source(parent: &FrozenPlanSet, id: Uuid) -> Result<&FrozenChildPlan> {
         parent
             .children()
             .find(|child| child.source_id == id)

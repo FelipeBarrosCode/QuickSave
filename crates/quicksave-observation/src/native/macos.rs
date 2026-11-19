@@ -101,7 +101,7 @@ impl ProcessProbe for MacLibproc {
             return Err(native_failure("libproc PID enumeration unavailable"));
         }
         ensure!(
-            count > 0 && count as usize % size_of::<i32>() == 0,
+            count > 0 && (count as usize).is_multiple_of(size_of::<i32>()),
             "libproc PID enumeration failed"
         );
         let received = count as usize / size_of::<i32>();
@@ -199,7 +199,7 @@ impl ProcessProbe for MacLibproc {
         ensure!(
             count >= 0
                 && count as usize <= bytes
-                && count as usize % size_of::<libc::proc_fdinfo>() == 0,
+                && (count as usize).is_multiple_of(size_of::<libc::proc_fdinfo>()),
             "libproc descriptor enumeration failed"
         );
         // Zero is ambiguous (exit/denial vs no descriptors), so never claim a

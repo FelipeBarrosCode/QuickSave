@@ -2,7 +2,7 @@
 //! Explicit provider lifecycle operations; credentials never enter history DTOs.
 
 use crate::{boundary as dto, OperationGuard, RetryPlan, WorkspaceService};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, ensure};
 use serde_json::{json, Value};
 use std::{
     ops::Deref,

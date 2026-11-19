@@ -146,11 +146,11 @@ impl std::fmt::Display for DirectoryIdentityInspectionStage {
 /// a containing directory), relative to `side`'s root. Unix bytes are not lossy.
 /// Construction is private to this boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DirectoryIdentityInspectionFailure {
     pub side: DirectoryIdentityInspectionSide,
     pub stage: DirectoryIdentityInspectionStage,
     pub relative_path: Option<PathBuf>,
-    _private: (),
 }
 
 impl DirectoryIdentityInspectionFailure {
@@ -163,7 +163,6 @@ impl DirectoryIdentityInspectionFailure {
             side,
             stage,
             relative_path,
-            _private: (),
         }
     }
 

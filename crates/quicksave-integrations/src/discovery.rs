@@ -569,7 +569,6 @@ mod scanning {
                     }
                 }
             }
-            return;
         }
         // Synthetic legacy fixtures (and non-macOS portable fixtures) only.
         #[cfg(any(not(target_os = "macos"), test))]

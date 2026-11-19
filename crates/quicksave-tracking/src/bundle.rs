@@ -1288,11 +1288,11 @@ impl Tracker {
                 if !renew_deferred_metadata
                     && !old.scheduler.paused
                     && same_policy_candidate
-                    && !old
+                    && old
                         .record
                         .auto_enrollment
                         .as_ref()
-                        .is_some_and(|enrollment| enrollment.unavailable_roots().next().is_some())
+                        .is_none_or(|enrollment| enrollment.unavailable_roots().next().is_none())
                     && old.record.tracked
                     && old.current.is_some()
                     && old.record.bundle_index_source.is_some()

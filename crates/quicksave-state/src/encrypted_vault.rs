@@ -135,7 +135,7 @@ impl EncryptedVault {
                 && self.nonce.len() == 48
                 && self.ciphertext.len() >= 32
                 && self.ciphertext.len() <= 2 * (MAX_PLAINTEXT + 16)
-                && self.ciphertext.len() % 2 == 0,
+                && self.ciphertext.len().is_multiple_of(2),
             "invalid encrypted vault bounds"
         );
         ensure!(

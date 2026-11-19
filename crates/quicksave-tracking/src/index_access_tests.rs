@@ -77,7 +77,7 @@ fn unavailable_child_discards_its_entire_root_not_just_unknown_files() {
         .policy
         .faults
         .deny(&failed, "read_required_metadata", Some("zz-blocked"), 13);
-    let report = materialize(&h, &base, &[plan.clone()]);
+    let report = materialize(&h, &base, std::slice::from_ref(&plan));
     assert_eq!(report["bundles"].as_array().unwrap().len(), 1);
     assert_eq!(report["partialBundles"], 1);
     assert_eq!(report["incomplete"], true);
@@ -224,7 +224,7 @@ fn failed_refresh_keeps_original_index_roots_baseline_and_grants() {
     fs::write(first.join("first"), b"first actual source").unwrap();
     fs::write(second.join("second"), b"second actual source").unwrap();
     let plan = two_root_plan("synthetic.refresh-failure", &first, &second);
-    let report = materialize(&h, &base, &[plan.clone()]);
+    let report = materialize(&h, &base, std::slice::from_ref(&plan));
     let id = id_from(&report);
     let work = h
         .tracker
@@ -242,7 +242,7 @@ fn failed_refresh_keeps_original_index_roots_baseline_and_grants() {
         )
     };
     let initial_issues = h.store.issued_grants.load(Ordering::Acquire);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     let after_attestation = h.store.issued_grants.load(Ordering::Acquire);
     assert_eq!(after_attestation, initial_issues + 2);
     h.tracker
@@ -252,7 +252,7 @@ fn failed_refresh_keeps_original_index_roots_baseline_and_grants() {
         .deny(&second, "read_required_metadata", Some("second"), 13);
     let failed = h
         .tracker
-        .materialize_bundles(&[plan.clone()], &sealed)
+        .materialize_bundles(std::slice::from_ref(&plan), &sealed)
         .unwrap();
     assert!(failed["bundles"].as_array().unwrap().is_empty());
     assert_eq!(

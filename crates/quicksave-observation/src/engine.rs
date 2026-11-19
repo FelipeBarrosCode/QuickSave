@@ -555,9 +555,9 @@ fn push_trigger(triggers: &mut Vec<CaptureTrigger>, trigger: CaptureTrigger) {
     }
 }
 
-fn file_fingerprint(
-    files: &[&FileEvidence],
-) -> BTreeSet<(String, String, NativeFileIdentity, u64, i64, u32, i64, u32)> {
+type FileFingerprint = (String, String, NativeFileIdentity, u64, i64, u32, i64, u32);
+
+fn file_fingerprint(files: &[&FileEvidence]) -> BTreeSet<FileFingerprint> {
     files
         .iter()
         .map(|file| {

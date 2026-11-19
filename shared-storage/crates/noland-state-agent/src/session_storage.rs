@@ -95,7 +95,12 @@ impl<'a, P> SessionStorage<'a, P> {
     fn native_deletion_guard(&self) -> Result<()> {
         if self.agent.config.native_host {
             if let Some(id) = self.native_operation {
-                if self.agent.db.get_operation(id)?.is_some_and(|operation| operation.kind == "delete") {
+                if self
+                    .agent
+                    .db
+                    .get_operation(id)?
+                    .is_some_and(|operation| operation.kind == "delete")
+                {
                     return self.agent.native_check_publication_guard(id);
                 }
             }

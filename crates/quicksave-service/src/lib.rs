@@ -1597,7 +1597,7 @@ impl WorkspaceService {
                 payload.scope == service.source_scope(params)?,
                 "The approved provider/root scope was revoked or changed"
             );
-            let provider = dto::id(&params, "providerId")?;
+            let provider = dto::id(params, "providerId")?;
             let snapshot = service.snapshot()?;
             ensure!(
                 dto::provider_record(&snapshot, provider)?["status"] == "connected",

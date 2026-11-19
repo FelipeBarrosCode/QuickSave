@@ -435,20 +435,6 @@ impl CatalogCache {
         Ok(revision)
     }
 
-    pub fn invalidate(&self, provider_id: &str) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Catalog cache lock failed"))?;
-        if let Some(previous) = state.providers.remove(provider_id) {
-            state.bytes = state
-                .bytes
-                .checked_sub(previous.serialized_bytes)
-                .context("Catalog cache byte count underflow")?;
-        }
-        Ok(())
-    }
-
     pub fn page(&self, provider_id: &str, query: CatalogQuery) -> Result<Value> {
         identifier(provider_id, 128)?;
         ensure!(
@@ -896,7 +882,10 @@ fn encode_cursor(cursor: &Cursor) -> Result<String> {
 
 fn decode_cursor(raw: &str) -> Result<Cursor> {
     ensure!(
-        !raw.is_empty() && raw.len() <= MAX_CURSOR_BYTES && raw.len() % 2 == 0 && raw.is_ascii(),
+        !raw.is_empty()
+            && raw.len() <= MAX_CURSOR_BYTES
+            && raw.len().is_multiple_of(2)
+            && raw.is_ascii(),
         "Catalog cursor is invalid or oversized"
     );
     let bytes = (0..raw.len())

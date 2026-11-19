@@ -162,7 +162,7 @@ fn container_plan(
 fn data_only_authority(h: &Harness, sealed: &Value, plan: &Value) -> Value {
     let mut scope = sealed["policyScope"].clone();
     scope["baseDirectories"][0]["allowedRoles"] = json!(["save", "config"]);
-    sign_authority(h, scope, &[plan.clone()])
+    sign_authority(h, scope, std::slice::from_ref(plan))
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn every_tree_role_keeps_protected_inspection_failures_fail_closed() {
             "kind":"reviewed_exact_product_mapping","identifier":app,
             "metadataPath":null,"nativeIdentity":native_identity(&root),
         }]);
-        let sealed = authority(&h, &base, &[plan.clone()], true);
+        let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
         let mut scope = sealed["policyScope"].clone();
         scope["baseDirectories"][0]["ownershipRules"] = json!(["reviewed_exact_product_mapping"]);
         let sealed = sign_authority(&h, scope, &[plan.clone()]);
@@ -564,7 +564,7 @@ fn protected_root_failures_are_not_mislabeled_or_omitted_as_denied_application_r
             .faults
             .deny(&protected, stage, None, 13);
         let plan = candidate("synthetic.protection-proof", &root);
-        let sealed = authority(&h, &base, &[plan.clone()], true);
+        let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
         let issued = h.store.issued_grants.load(Ordering::Acquire);
         let report = h.tracker.materialize_bundles(&[plan], &sealed).unwrap();
         assert!(report["bundles"].as_array().unwrap().is_empty(), "{report}");

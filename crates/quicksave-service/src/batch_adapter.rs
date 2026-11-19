@@ -35,8 +35,6 @@ use crate::{
     },
 };
 use anyhow::{bail, ensure, Context, Result};
-#[cfg(unix)]
-use quicksave_noland::capture_control::NativeCaptureController;
 use quicksave_noland::NativeEngine;
 use quicksave_state::WorkspaceStore;
 use serde_json::{json, Value};

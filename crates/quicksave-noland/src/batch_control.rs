@@ -23,7 +23,9 @@ use noland_state_agent::native_capture::{
 use noland_state_agent::native_host::{
     native_file_id, native_root_token, validate_native_relative, NativeCoverage, NativeSelection,
 };
-use noland_state_core::{AppId, BackupMode, BundleManifest, ConsistencyKind, OperationRecord};
+#[cfg(test)]
+use noland_state_core::BackupMode;
+use noland_state_core::{AppId, BundleManifest, ConsistencyKind, OperationRecord};
 use quicksave_platform::{FileStamp, SafeRoot};
 use quicksave_state::ProviderAccess;
 use serde::{Deserialize, Serialize};
@@ -2324,7 +2326,7 @@ fn original_prepared_manifest(
                     == path
                         .join(prepared.manifest.bundle_id.to_string())
                         .join(format!("{id}.pack"))
-                && prepared.checksums.get(id).is_some(),
+                && prepared.checksums.contains_key(id),
             "Original prepared backup changed its fixed pack identities"
         );
         // Only retained immutable ciphertext is opened here, never live app
@@ -3331,7 +3333,7 @@ mod tests {
             .native_binding_fingerprint(&app)
             .unwrap();
         assert_eq!(
-            frozen_native_roots_fingerprint(&app, &[manual.clone()]).unwrap(),
+            frozen_native_roots_fingerprint(&app, std::slice::from_ref(&manual)).unwrap(),
             actual_manual,
         );
         let mut invalid_manual = manual;
@@ -3366,7 +3368,7 @@ mod tests {
             .native_binding_fingerprint(&app)
             .unwrap();
         assert_eq!(
-            frozen_native_roots_fingerprint(&app, &[direct_file.clone()]).unwrap(),
+            frozen_native_roots_fingerprint(&app, std::slice::from_ref(&direct_file)).unwrap(),
             actual_file,
         );
         let mut wrong_kind = direct_file.clone();
@@ -4045,7 +4047,7 @@ mod tests {
             .unwrap();
         assert_eq!(proof["verified"], true);
         assert_eq!(proof["generation"], 7);
-        assert_eq!(store.software_record(&software_id).unwrap()["dirty"], true);
+        assert_eq!(store.software_record(software_id).unwrap()["dirty"], true);
         assert!(fixture.engine.runtime.get().is_none());
         let mut wrong = binding;
         wrong["sourceExpectedManifestAuth"]["manifestHash"] =

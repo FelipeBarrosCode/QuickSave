@@ -83,23 +83,6 @@ impl Directory {
         &self.path
     }
 
-    pub fn metadata(&self) -> Result<Metadata> {
-        Ok(self.file.metadata()?)
-    }
-
-    /// Inspect a real regular-file handle without reading its contents.
-    pub fn regular_file_metadata(&self, name: &str) -> Result<Metadata> {
-        let name = component(name)?;
-        let file = open_at(
-            self.file.as_raw_fd(),
-            &name,
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )?;
-        let metadata = file.metadata()?;
-        ensure!(metadata.is_file(), "native identity is not a regular file");
-        Ok(metadata)
-    }
-
     pub fn entries(&self, max_entries: usize) -> Result<Listing> {
         // openat(".") gets an independent directory offset; dup would share it.
         let file = open_at(self.file.as_raw_fd(), c".", DIRECTORY_FLAGS)?;

@@ -1442,6 +1442,10 @@ fn check_cursor(state: &EngineObservationState, software: &str, frame: &Frame) -
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "native ownership, path, stamp and observed-use facts are explicit at admission"
+)]
 fn make_entry(
     engine: &NativeEngine,
     approved: &ApprovedRecord,

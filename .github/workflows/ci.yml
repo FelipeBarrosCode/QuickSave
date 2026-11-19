@@ -29,6 +29,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Linux native dependency headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev libelf-dev zlib1g-dev clang llvm
       - name: Verify read-only upstream provenance and dependency boundaries
         run: python scripts/verify_repository.py
       - name: Test isolated verification and smoke harnesses
@@ -50,6 +54,11 @@ jobs:
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux native dependency headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev libelf-dev zlib1g-dev clang llvm
       - name: Run workspace tests on the native host
         run: cargo test --locked --workspace -- --test-threads=1
       - name: Build CLI
@@ -90,7 +99,7 @@ jobs:
         run: sudo apt-get update
       - name: Install Linux native Tauri prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        run: sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libelf-dev zlib1g-dev clang llvm
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci

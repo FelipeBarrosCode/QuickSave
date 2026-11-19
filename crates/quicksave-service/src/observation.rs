@@ -46,10 +46,6 @@ pub(super) struct ObservationSession {
     store: Option<WorkspaceStore>,
 }
 
-/// Alias for native owners which prefer manager naming. There is one bounded
-/// process worker across all successfully bound materialized applications.
-pub(super) type ObservationManager = ObservationSession;
-
 struct Shared {
     stopping: AtomicBool,
     revoked: AtomicBool,
@@ -230,6 +226,7 @@ impl ObservationSession {
 
     /// Explicitly inert: does not read settings/vaults, start watchers, determine
     /// a user, or construct an ambient process source.
+    #[cfg(test)]
     pub(super) fn disabled() -> Self {
         Self {
             worker: None,
@@ -240,6 +237,7 @@ impl ObservationSession {
 
     /// Native policy owner only. No provider/default-provider access is needed.
     /// Unit tests cannot take this ambient source path.
+    #[cfg(test)]
     pub(super) fn start(
         store: WorkspaceStore,
         tracker: Arc<Tracker>,
@@ -249,6 +247,7 @@ impl ObservationSession {
         Self::start_with_graph(store, tracker, policy, excluded_paths, None)
     }
 
+    #[cfg(test)]
     pub(super) fn start_if_enabled(
         store: WorkspaceStore,
         tracker: Arc<Tracker>,
@@ -262,6 +261,7 @@ impl ObservationSession {
         Self::start(store, tracker, policy, excluded_paths)
     }
 
+    #[cfg(test)]
     pub(super) fn start_with_graph(
         store: WorkspaceStore,
         tracker: Arc<Tracker>,
@@ -313,6 +313,10 @@ impl ObservationSession {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "injected native observation dependencies stay explicit"
+    )]
     fn start_injected<F>(
         store: WorkspaceStore,
         tracker: Arc<Tracker>,
@@ -795,6 +799,7 @@ impl ObservationSession {
         Some(watermark)
     }
 
+    #[cfg(test)]
     pub(super) fn request_reconcile(&self) -> Result<()> {
         self.worker
             .as_ref()
@@ -809,6 +814,10 @@ impl Drop for ObservationSession {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded native snapshot ownership and verification inputs stay explicit"
+)]
 fn process_snapshot(
     store: &WorkspaceStore,
     tracker: &Tracker,
@@ -1299,7 +1308,7 @@ pub(super) fn materialize_source_indices(
             stage = "import_source_index";
             let imported = engine
                 .native_materialize_index(record, owner)
-                .map_err(|error| {
+                .inspect_err(|error| {
                     if let Some(failure) = error.downcast_ref::<
                     quicksave_noland::observation_control::NativeIndexImportFailure>() {
                     stage = failure.stage();
@@ -1307,7 +1316,6 @@ pub(super) fn materialize_source_indices(
                     // paths, record JSON, grant contents or credential errors.
                     eprintln!("[QuickSave source-index] {}", stage);
                 }
-                    error
                 })?;
             stage = "verify_source_acknowledgement";
             ensure!(

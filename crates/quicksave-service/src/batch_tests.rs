@@ -1119,9 +1119,9 @@ impl BatchRecovery for FixtureRecovery {
 }
 
 struct Fixture {
-    temp: tempfile::TempDir,
+    _temp: tempfile::TempDir,
     base: PathBuf,
-    native_store: WorkspaceStore,
+    _native_store: WorkspaceStore,
     vault: Arc<MemoryVault>,
     signer: Arc<WorkspaceOperationSigner>,
     state: Arc<FixtureStore>,
@@ -1204,9 +1204,9 @@ impl Fixture {
         assert!(Arc::ptr_eq(&service.batch_runtime().unwrap(), &batch));
         batch.confirm_core_hooks_installed();
         let fixture = Self {
-            temp,
+            _temp: temp,
             base,
-            native_store,
+            _native_store: native_store,
             vault,
             signer,
             state,
@@ -1406,19 +1406,20 @@ async fn all_app_batch_runs_actual_service_capture_and_finalization_with_fixed_i
         "Fresh children must not acquire provider access through retained-source reauthentication"
     );
     assert_eq!(fixture.engine.reads.load(Ordering::SeqCst), 3);
-    let submissions = fixture.engine.submissions.lock().unwrap();
-    assert_eq!(
-        submissions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        expected
-    );
-    for (_, selection) in submissions.iter() {
+    {
+        let submissions = fixture.engine.submissions.lock().unwrap();
         assert_eq!(
-            selection["sourceIdentity"]["app_id"],
-            "desktop:original.fixture"
+            submissions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected
         );
-        assert_ne!(selection["appId"], selection["sourceIdentity"]["app_id"]);
+        for (_, selection) in submissions.iter() {
+            assert_eq!(
+                selection["sourceIdentity"]["app_id"],
+                "desktop:original.fixture"
+            );
+            assert_ne!(selection["appId"], selection["sourceIdentity"]["app_id"]);
+        }
     }
-    drop(submissions);
     assert!(!fixture.service.shutdown_blocked());
     fixture.service.shutdown().await.unwrap();
 }
@@ -1432,10 +1433,11 @@ async fn selected_batch_does_not_add_a_later_native_enrollment_or_other_instance
     fixture.add_software(9, "desktop:late.enrollment");
     fixture.batch.execute(&id.to_string()).unwrap();
     assert_eq!(fixture.wait_finished(id).await["state"], "completed");
-    let submissions = fixture.engine.submissions.lock().unwrap();
-    assert_eq!(submissions.len(), 1);
-    assert_eq!(submissions[0].1["softwareId"], "software-1");
-    drop(submissions);
+    {
+        let submissions = fixture.engine.submissions.lock().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].1["softwareId"], "software-1");
+    }
     assert_eq!(fixture.tracking.prepared.load(Ordering::SeqCst), 1);
     fixture.service.shutdown().await.unwrap();
 }
@@ -2063,13 +2065,14 @@ async fn empty_whole_root_batch_uses_verified_native_authority_not_a_placeholder
     let capture = fixture.batch.plans.capture(&plan).unwrap().unwrap();
     assert_eq!(capture.file_count, 0);
     assert!(capture.empty_full_scope_proof_digest.is_some());
-    let rows = fixture.engine.rows.lock().unwrap();
-    let manifest = &rows.get(&child.source_id).unwrap().body["manifest"];
-    assert_eq!(manifest["files"], json!([]));
-    assert_eq!(manifest["coverage"], "full_approved_scope");
-    assert_eq!(manifest["fullScope"]["rootCount"], 1);
-    assert_eq!(manifest["roots"], plan.roots);
-    drop(rows);
+    {
+        let rows = fixture.engine.rows.lock().unwrap();
+        let manifest = &rows.get(&child.source_id).unwrap().body["manifest"];
+        assert_eq!(manifest["files"], json!([]));
+        assert_eq!(manifest["coverage"], "full_approved_scope");
+        assert_eq!(manifest["fullScope"]["rootCount"], 1);
+        assert_eq!(manifest["roots"], plan.roots);
+    }
     assert!(fixture.batch.plans.finalization(&plan).unwrap().is_some());
     fixture.service.shutdown().await.unwrap();
 }
@@ -2154,11 +2157,12 @@ async fn original_installation_and_root_ids_with_at_are_preserved_through_the_re
     fixture.batch.execute(&id.to_string()).unwrap();
     let result = fixture.wait_finished(id).await;
     assert_eq!(result["state"], "completed", "{result}");
-    let submissions = fixture.engine.submissions.lock().unwrap();
-    assert_eq!(submissions[0].1["appId"], "steam:480@installation-one");
-    assert_eq!(submissions[0].1["sourceIdentity"]["app_id"], "steam:480");
-    assert_eq!(submissions[0].1["roots"][0]["id"], "save@root-one");
-    drop(submissions);
+    {
+        let submissions = fixture.engine.submissions.lock().unwrap();
+        assert_eq!(submissions[0].1["appId"], "steam:480@installation-one");
+        assert_eq!(submissions[0].1["sourceIdentity"]["app_id"], "steam:480");
+        assert_eq!(submissions[0].1["roots"][0]["id"], "save@root-one");
+    }
     fixture.service.shutdown().await.unwrap();
 }
 

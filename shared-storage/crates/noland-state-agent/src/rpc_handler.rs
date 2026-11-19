@@ -187,10 +187,14 @@ impl AgentRpc {
                 // with CompleteApplication merely because this is a new job.
                 let mode = if legacy_selection || agent.config.native_host {
                     if agent.config.native_host
-                        && !matches!(request.params.get("mode").and_then(|value| value.as_str()),
-                            Some("complete_application" | "personal_state" | "custom"))
+                        && !matches!(
+                            request.params.get("mode").and_then(|value| value.as_str()),
+                            Some("complete_application" | "personal_state" | "custom")
+                        )
                     {
-                        return Err(StateError::Invalid("native backup requires an explicit compatible capture mode".into()));
+                        return Err(StateError::Invalid(
+                            "native backup requires an explicit compatible capture mode".into(),
+                        ));
                     }
                     BackupMode::parse(
                         request
@@ -204,17 +208,27 @@ impl AgentRpc {
                 };
                 let performance = if legacy_selection || agent.config.native_host {
                     if agent.config.native_host
-                        && request.params.get("performance_mode").is_some_and(|value|
-                            !matches!(value.as_str(),Some("automatic" | "fast" | "balanced" | "full")))
+                        && request.params.get("performance_mode").is_some_and(|value| {
+                            !matches!(
+                                value.as_str(),
+                                Some("automatic" | "fast" | "balanced" | "full")
+                            )
+                        })
                     {
-                        return Err(StateError::Invalid("invalid native performance policy".into()));
+                        return Err(StateError::Invalid(
+                            "invalid native performance policy".into(),
+                        ));
                     }
                     BackupPerformanceMode::parse(
                         request
                             .params
                             .get("performance_mode")
                             .and_then(|value| value.as_str())
-                            .unwrap_or(if agent.config.native_host { "automatic" } else { "balanced" }),
+                            .unwrap_or(if agent.config.native_host {
+                                "automatic"
+                            } else {
+                                "balanced"
+                            }),
                     )
                 } else {
                     BackupPerformanceMode::Automatic

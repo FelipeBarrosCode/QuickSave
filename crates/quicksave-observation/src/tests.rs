@@ -870,11 +870,13 @@ fn poll_bounds_overflow_restart_and_missed_poll_never_mean_clean() {
     let fixture = Fixture::new();
     let mut probe = FixtureProbe::new(&fixture);
     probe.fd_count = 999;
-    let mut limits = ObservationLimits::default();
-    limits.max_descriptors_per_process = 2;
-    limits.max_descriptors_total = 2;
-    limits.max_evidence = 2;
-    limits.max_poll_interval_ms = 5000;
+    let limits = ObservationLimits {
+        max_descriptors_per_process: 2,
+        max_descriptors_total: 2,
+        max_evidence: 2,
+        max_poll_interval_ms: 5000,
+        ..ObservationLimits::default()
+    };
     let mut observer =
         ObservationEngine::new(fixture.scope(), Box::new(PollingSource::new(probe)), limits)
             .unwrap();

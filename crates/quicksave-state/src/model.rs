@@ -553,11 +553,11 @@ pub(crate) fn validate_pending_work_reference(value: &Value, software_id: &str) 
         validate_text(id, 1024, "native work application ID")?;
         let bytes = id.as_bytes();
         ensure!(
-            !id.starts_with(['/', '\\'])
-                && !(bytes.len() >= 3
+            !(id.starts_with(['/', '\\'])
+                || (bytes.len() >= 3
                     && bytes[0].is_ascii_alphabetic()
                     && bytes[1] == b':'
-                    && matches!(bytes[2], b'/' | b'\\')),
+                    && matches!(bytes[2], b'/' | b'\\'))),
             "native work reference cannot contain an absolute application path"
         );
     }

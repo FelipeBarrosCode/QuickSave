@@ -11,10 +11,10 @@ fn explicit_refresh_can_reapprove_only_pristine_deferred_metadata_scopes() {
         let root = h.root("legacy-refresh/App.app");
         fs::write(root.join("actual"), b"isolated metadata only").unwrap();
         let plan = candidate("synthetic.deferred-refresh", &root);
-        let sealed = authority(&h, &base, &[plan.clone()], true);
+        let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
         let initial = h
             .tracker
-            .materialize_bundles(&[plan.clone()], &sealed)
+            .materialize_bundles(std::slice::from_ref(&plan), &sealed)
             .unwrap();
         let id = id_from(&initial);
         if history {
@@ -36,7 +36,7 @@ fn explicit_refresh_can_reapprove_only_pristine_deferred_metadata_scopes() {
         let issued = h.store.issued_grants.load(Ordering::Acquire);
         let automatic = h
             .tracker
-            .materialize_bundles(&[plan.clone()], &sealed)
+            .materialize_bundles(std::slice::from_ref(&plan), &sealed)
             .unwrap();
         assert!(automatic["bundles"].as_array().unwrap().is_empty());
         assert_eq!(h.store.issued_grants.load(Ordering::Acquire), issued);
@@ -76,10 +76,10 @@ fn deferred_metadata_refresh_cannot_widen_roots_or_replace_native_identity() {
     let extra = h.root("legacy-exact/Other.app");
     fs::write(root.join("actual"), b"unchanged").unwrap();
     let mut plan = candidate("synthetic.deferred-exact", &root);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     let initial = h
         .tracker
-        .materialize_bundles(&[plan.clone()], &sealed)
+        .materialize_bundles(std::slice::from_ref(&plan), &sealed)
         .unwrap();
     let id = id_from(&initial);
     let before = h.store.records.lock().unwrap()[&id].clone();
@@ -110,10 +110,10 @@ fn only_explicit_refresh_rechecks_paused_app_authority_and_reconciles_metadata()
     let root = h.root("refresh-base/App.app");
     fs::write(root.join("save"), b"synthetic saved bytes").unwrap();
     let plan = candidate("synthetic.explicit-refresh", &root);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     let initial = h
         .tracker
-        .materialize_bundles(&[plan.clone()], &sealed)
+        .materialize_bundles(std::slice::from_ref(&plan), &sealed)
         .unwrap();
     let id = id_from(&initial);
     let before = h.store.records.lock().unwrap()[&id].clone();
@@ -125,7 +125,7 @@ fn only_explicit_refresh_rechecks_paused_app_authority_and_reconciles_metadata()
     *h.store.failing_verification.lock().unwrap() = None;
     let automatic = h
         .tracker
-        .materialize_bundles(&[plan.clone()], &sealed)
+        .materialize_bundles(std::slice::from_ref(&plan), &sealed)
         .unwrap();
     assert!(automatic["bundles"].as_array().unwrap().is_empty());
     assert_eq!(
@@ -570,9 +570,9 @@ fn plaintext_enrollment_and_unattested_candidate_changes_cannot_create_bundles()
     let plan = candidate("synthetic.authenticated", &root);
     assert!(h
         .tracker
-        .materialize_bundles(&[plan.clone()], &json!({"enabled": true}))
+        .materialize_bundles(std::slice::from_ref(&plan), &json!({"enabled": true}))
         .is_err());
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     let mut changed = plan;
     changed["appId"] = json!("synthetic.attacker");
     assert!(h.tracker.materialize_bundles(&[changed], &sealed).is_err());
@@ -1066,7 +1066,7 @@ fn failed_persistence_cannot_publish_a_tracked_bundle_or_dummy_counts() {
     let root = h.root("apps/App.app");
     fs::write(root.join("data"), b"real").unwrap();
     let plan = candidate("synthetic.persist-failure", &root);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     h.store.fail_writes.store(true, Ordering::Release);
     let report = h.tracker.materialize_bundles(&[plan], &sealed).unwrap();
     assert!(report["bundles"].as_array().unwrap().is_empty());
@@ -1083,7 +1083,7 @@ fn native_policy_revocation_disables_auto_enrollment_and_source_proof_tampering(
     let root = h.root("apps/App.app");
     fs::write(root.join("data"), b"real").unwrap();
     let plan = candidate("synthetic.revocable", &root);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     let report = h.tracker.materialize_bundles(&[plan], &sealed).unwrap();
     let id = id_from(&report);
     h.store
@@ -1273,7 +1273,7 @@ fn explicit_permission_failures_never_become_successful_zero_count_bundles() {
     let root = h.root("apps/Restricted.app");
     fs::write(root.join("data"), b"actual bytes").unwrap();
     let plan = candidate("synthetic.permissions", &root);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     // Deterministic even under elevated CI users: inject the actual native
     // EACCES category at the root approval boundary, not OS chmod assumptions.
     h.tracker
@@ -1986,7 +1986,7 @@ fn unknown_transition_rejects_unsigned_tracking_and_revoked_policy_without_fake_
     let app = h.root("apps/Real.app");
     fs::write(app.join("data"), b"real application").unwrap();
     let plan = candidate("synthetic.unknown-revoked-policy", &app);
-    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let sealed = authority(&h, &base, std::slice::from_ref(&plan), true);
     let report = h.tracker.materialize_bundles(&[plan], &sealed).unwrap();
     let auto = id_from(&report);
     let before_auto = h.store.records.lock().unwrap()[&auto].clone();

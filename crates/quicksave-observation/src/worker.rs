@@ -273,21 +273,6 @@ impl PollBackoff {
     }
 }
 
-#[cfg(test)]
-mod scheduling_tests {
-    use super::*;
-    #[test]
-    fn idle_backoff_is_bounded_and_activity_resets_without_real_processes() {
-        let mut backoff = PollBackoff::new(Duration::from_secs(2), Duration::from_secs(30));
-        assert_eq!(backoff.next_interval(false), Duration::from_secs(4));
-        assert_eq!(backoff.next_interval(false), Duration::from_secs(8));
-        assert_eq!(backoff.next_interval(false), Duration::from_secs(16));
-        assert_eq!(backoff.next_interval(false), Duration::from_secs(30));
-        assert_eq!(backoff.next_interval(false), Duration::from_secs(30));
-        assert_eq!(backoff.next_interval(true), Duration::from_secs(2));
-    }
-}
-
 impl Drop for ObservationWorker {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
@@ -444,5 +429,20 @@ fn watcher_gap(shared: &Shared) {
     shared.watcher_loss.store(true, Ordering::Release);
     if shared.sender.try_send(Command::Wake).is_err() {
         shared.overflow.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    #[test]
+    fn idle_backoff_is_bounded_and_activity_resets_without_real_processes() {
+        let mut backoff = PollBackoff::new(Duration::from_secs(2), Duration::from_secs(30));
+        assert_eq!(backoff.next_interval(false), Duration::from_secs(4));
+        assert_eq!(backoff.next_interval(false), Duration::from_secs(8));
+        assert_eq!(backoff.next_interval(false), Duration::from_secs(16));
+        assert_eq!(backoff.next_interval(false), Duration::from_secs(30));
+        assert_eq!(backoff.next_interval(false), Duration::from_secs(30));
+        assert_eq!(backoff.next_interval(true), Duration::from_secs(2));
     }
 }

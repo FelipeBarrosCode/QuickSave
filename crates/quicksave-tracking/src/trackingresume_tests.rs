@@ -49,7 +49,7 @@ fn read_artifact(locator: &SourceLocator, artifact: &Artifact) -> Result<Value> 
     ensure!(
         bytes.len() as u64 == stamp.size
             && blake3::hash(&bytes).to_hex().as_str() == artifact.hash
-            && blake3::keyed_hash(&*locator.key.lock().unwrap(), artifact.hash.as_bytes())
+            && blake3::keyed_hash(&locator.key.lock().unwrap(), artifact.hash.as_bytes())
                 .to_hex()
                 .as_str()
                 == artifact.mac,
@@ -80,13 +80,13 @@ impl ReloadedSource {
         }
         let prepared = write_artifact(
             &root,
-            &*key.lock().unwrap(),
+            &key.lock().unwrap(),
             &json!({
                 "kind":"actual_isolated_prepared_capture","evidence":actual.evidence,
                 "roots":actual.roots,"files":files,
             }),
         );
-        let committed = commit.then(|| write_artifact(&root,&*key.lock().unwrap(),&json!({
+        let committed = commit.then(|| write_artifact(&root,&key.lock().unwrap(),&json!({
             "kind":"actual_isolated_committed_manifest","preparedHash":prepared.hash,
             "workId":work["workId"],"metadataIdentity":work["captureSource"]["snapshotIdentity"],
         })));
@@ -365,7 +365,7 @@ fn prepared_checkpoint_recovery_is_not_a_json_completion_or_a_new_capture() {
     let mut committed = locator.clone();
     committed.committed = Some(write_artifact(
         &provider,
-        &*locator.key.lock().unwrap(),
+        &locator.key.lock().unwrap(),
         &json!({
             "kind":"actual_isolated_committed_manifest","preparedHash":locator.prepared.hash,
             "workId":work["workId"],"metadataIdentity":work["captureSource"]["snapshotIdentity"],

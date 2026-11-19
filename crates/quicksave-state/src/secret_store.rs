@@ -202,9 +202,8 @@ impl SecretAccess for SnapshotSecretAccess {
                 return Err(crate::MetadataProjectionChanged.into());
             }
         } else {
-            let envelope = self.selected(&anchor).map_err(|error| {
+            let envelope = self.selected(&anchor).inspect_err(|_| {
                 self.invalidated.set(true);
-                error
             })?;
             let contents = envelope.open(
                 &anchor.key,

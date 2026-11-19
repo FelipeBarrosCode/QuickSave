@@ -438,6 +438,10 @@ fn is_missing(error: &anyhow::Error) -> bool {
 /// Inspect either supported leaf kind once, without retrying a failed directory
 /// open as a file open. Parent traversal stays inside the retained SafeRoot.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "libc stat field widths differ across Unix targets"
+)]
 pub(super) fn inspect_pinned_node(
     root: &quicksave_platform::SafeRoot,
     relative: Option<&str>,

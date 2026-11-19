@@ -5,10 +5,7 @@ use super::*;
 use core_foundation::{base::TCFType, string::CFString};
 use security_framework::{
     item::{ItemClass, ItemSearchOptions, SearchResult},
-    os::macos::{
-        item::ItemSearchOptionsExt,
-        keychain::{SecKeychain, SecPreferencesDomain},
-    },
+    os::macos::keychain::{SecKeychain, SecPreferencesDomain},
 };
 
 pub(super) fn accounts(service: &str) -> Result<Vec<String>> {
@@ -60,7 +57,7 @@ pub(super) fn accounts(service: &str) -> Result<Vec<String>> {
                     continue;
                 }
                 let key = CFString::wrap_under_get_rule((*key).cast());
-                if key.char_len() != 4 || key.to_string() != "acct" {
+                if key.char_len() != 4 || key != "acct" {
                     continue;
                 }
                 ensure!(

@@ -25,6 +25,12 @@ platforms.
 
 ## Test gates
 
+The existing `.github/workflows/ci.yml` remains a separate validation
+run: Python/provenance guards, workspace formatting, strict Clippy, native
+workspace tests and isolated CLI smoke tests. Its Linux jobs install the native
+libelf/DBus/OpenSSL headers too. An all-green desktop matrix alone does not mean
+this separate workflow passed.
+
 The preparation job verifies upstream/fork provenance and runs Python tests,
 including matrix completeness and native-host guard tests. Every matrix job:
 

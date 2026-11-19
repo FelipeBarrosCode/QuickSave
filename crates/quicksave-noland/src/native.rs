@@ -210,6 +210,7 @@ struct PrivateAccess {
 }
 
 impl PrivateAccess {
+    #[cfg(test)]
     fn from_access(access: &ProviderAccess) -> Result<Self> {
         Self::with_lifecycle(access, None)
     }

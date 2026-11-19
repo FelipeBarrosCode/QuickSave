@@ -526,21 +526,6 @@ impl Snapshot {
                 .context("native path/link memory count overflow")
         })
     }
-
-    pub(crate) fn changed_ids(&self, baseline: &Self) -> BTreeSet<String> {
-        self.nodes
-            .iter()
-            .filter(|(id, node)| baseline.nodes.get(*id) != Some(*node))
-            .map(|(id, _)| id.clone())
-            .chain(
-                baseline
-                    .nodes
-                    .keys()
-                    .filter(|id| !self.nodes.contains_key(*id))
-                    .cloned(),
-            )
-            .collect()
-    }
 }
 
 struct HashWriter<'a> {

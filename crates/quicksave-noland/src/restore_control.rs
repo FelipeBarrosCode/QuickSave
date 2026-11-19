@@ -96,8 +96,6 @@ pub struct ApprovedNativeRestore {
     pub job_id: Uuid,
     pub app_id: String,
     pub bundle_id: Uuid,
-    pub destination: PathBuf,
-    pub destination_identity: NativeObjectId,
     pub file_keys: Vec<NativeFileKey>,
     pub frozen_plan_fingerprint: String,
     pub control: Arc<NativeRestoreControl>,
@@ -313,8 +311,6 @@ impl NativeRestoreController {
             job_id: frozen.preview.job_id,
             app_id: frozen.preview.app_id.as_str().into(),
             bundle_id: frozen.preview.bundle_id,
-            destination: frozen.preview.destination.clone(),
-            destination_identity: frozen.preview.destination_identity,
             file_keys: frozen
                 .preview
                 .entries
@@ -340,18 +336,6 @@ impl NativeRestoreController {
                 .mac(&plan_message(control.preview())?)
                 .map_err(source_error)?,
         })
-    }
-
-    pub fn recover_authenticated(
-        &self,
-        agent: &StateAgent,
-        plan: AuthenticatedRestorePlan,
-        gate: RestoreConsentGate,
-    ) -> Result<Vec<noland_restore::NativeRestoreRecoveryReport>> {
-        let control = self.reattach(plan, gate)?;
-        let job_id = control.preview().job_id;
-        self.install(agent, control)?;
-        agent.native_recover_restore(job_id).map_err(source_error)
     }
 
     /// Freeze the already-authenticated source manifest in place. Whole-app and
@@ -447,20 +431,6 @@ impl NativeRestoreController {
             RestoreMode::CompleteApplication,
         )
         .map_err(source_error)
-    }
-
-    /// Seal a native-private durable plan for restart. The caller should stream
-    /// it to its checked native state writer, not return this inventory over IPC.
-    pub fn authenticate_plan(
-        &self,
-        preview: NativeRestorePreview,
-    ) -> Result<AuthenticatedRestorePlan> {
-        let message = plan_message(&preview)?;
-        let device_mac = self.authority.mac(&message).map_err(source_error)?;
-        Ok(AuthenticatedRestorePlan {
-            preview,
-            device_mac,
-        })
     }
 
     pub fn reattach(

@@ -676,10 +676,16 @@ fn reconcile_roots(
                 let source = noland_snapshot::SourcePath::new(&path)?;
                 let logical = agent.native_logical_path(app_id, &path)?;
                 let target = source.read_link()?;
-                validate_relative_symlink_target_within_root(&logical.relative_path,
-                    target.to_str().ok_or_else(|| StateError::UnsafePath("native link target is not UTF-8".into()))?)?;
+                validate_relative_symlink_target_within_root(
+                    &logical.relative_path,
+                    target.to_str().ok_or_else(|| {
+                        StateError::UnsafePath("native link target is not UTF-8".into())
+                    })?,
+                )?;
                 if !noland_snapshot::same_file_identity(&metadata, &source.metadata()?) {
-                    return Err(StateError::Conflict("native link changed during metadata reconciliation".into()));
+                    return Err(StateError::Conflict(
+                        "native link changed during metadata reconciliation".into(),
+                    ));
                 }
             }
             if let Some(binding) = &runtime {
@@ -724,7 +730,9 @@ fn reconcile_roots(
                 FileType::File
             } else {
                 if agent.config.native_host {
-                    return Err(StateError::UnsafePath("unsupported special entry in approved native root".into()));
+                    return Err(StateError::UnsafePath(
+                        "unsupported special entry in approved native root".into(),
+                    ));
                 }
                 continue;
             };

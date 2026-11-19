@@ -99,7 +99,7 @@ impl PolicyRootFailure {
         policy: &TrackingPolicy,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        (|| {
+        let execute = || {
             #[cfg(test)]
             policy.faults.check(
                 match self.side {
@@ -112,8 +112,8 @@ impl PolicyRootFailure {
             )?;
             let _ = policy;
             operation()
-        })()
-        .map_err(|error| {
+        };
+        execute().map_err(|error| {
             let context = self.with_native_failure(&error);
             error.context(context)
         })
@@ -224,15 +224,15 @@ impl RootContext {
         policy: &TrackingPolicy,
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        (|| {
+        let execute = || {
             #[cfg(test)]
             policy
                 .faults
                 .check(self.path.as_deref(), self.relative.as_deref(), self.stage)?;
             let _ = policy;
             operation()
-        })()
-        .map_err(|error| self.attach(error))
+        };
+        execute().map_err(|error| self.attach(error))
     }
     pub(crate) fn attach(self, error: anyhow::Error) -> anyhow::Error {
         // Keep the innermost native operation, not a generic enclosing
@@ -421,12 +421,10 @@ pub(crate) fn failures(error: &anyhow::Error) -> Vec<Value> {
 }
 
 #[cfg(test)]
+type FaultMap = std::collections::BTreeMap<(PathBuf, String, Option<String>), i32>;
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Faults(
-    std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeMap<(PathBuf, String, Option<String>), i32>>,
-    >,
-);
+pub(crate) struct Faults(std::sync::Arc<std::sync::Mutex<FaultMap>>);
 
 #[cfg(test)]
 impl Faults {

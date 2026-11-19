@@ -780,12 +780,13 @@ async fn local_restore_recovery_never_connects_or_retries_a_disconnected_provide
     assert_eq!(result["recovery"]["recovered"], true);
     assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.engine.published.load(Ordering::SeqCst), 0);
-    let calls = fixture.engine.calls.lock().unwrap();
-    assert!(calls.iter().all(|(method, _)| matches!(
-        method.as_str(),
-        "restore_recovery_scope" | "recover_restore_local"
-    )));
-    drop(calls);
+    {
+        let calls = fixture.engine.calls.lock().unwrap();
+        assert!(calls.iter().all(|(method, _)| matches!(
+            method.as_str(),
+            "restore_recovery_scope" | "recover_restore_local"
+        )));
+    }
     assert!(
         fixture.engine.guards.lock().unwrap()[&original]().is_err(),
         "Recovery authority must expire when the owned local recovery returns"
@@ -1118,10 +1119,11 @@ async fn partial_success_does_not_clear_other_dirty_files() {
         fixture.store.document.lock().unwrap()["software"][0]["dirty"],
         true
     );
-    let calls = fixture.engine.calls.lock().unwrap();
-    let (_, input) = calls.iter().find(|(method, _)| method == "upload").unwrap();
-    assert_eq!(input["fileIds"], json!(["file-a"]));
-    drop(calls);
+    {
+        let calls = fixture.engine.calls.lock().unwrap();
+        let (_, input) = calls.iter().find(|(method, _)| method == "upload").unwrap();
+        assert_eq!(input["fileIds"], json!(["file-a"]));
+    }
     fixture.service.shutdown().await.unwrap();
 }
 
@@ -1234,7 +1236,7 @@ async fn cancellation_waits_for_real_native_terminal_state() {
         fixture.service.query("operation", operation).await.unwrap()["state"],
         "cancelled"
     );
-    assert_eq!(fixture.tracker.completed.lock().unwrap()[0].2, false);
+    assert!(!fixture.tracker.completed.lock().unwrap()[0].2);
     assert!(!fixture.service.shutdown_blocked());
     fixture.service.shutdown().await.unwrap();
 }
@@ -1259,7 +1261,7 @@ async fn provider_or_root_scope_change_cannot_confirm_saved_generation() {
         fixture.service.query("operation", operation).await.unwrap()["state"].as_str(),
         Some("failed" | "cancelled")
     ));
-    assert_eq!(fixture.tracker.completed.lock().unwrap()[0].2, false);
+    assert!(!fixture.tracker.completed.lock().unwrap()[0].2);
     assert_eq!(fixture.tracker.dirty.lock().unwrap().len(), 2);
     fixture.service.shutdown().await.unwrap();
 }
@@ -1324,7 +1326,7 @@ async fn autosave_work_is_verified_off_callback_before_cloud_access() {
         .unwrap();
     fixture.join().await;
     assert_eq!(fixture.engine.count("upload"), 1);
-    assert_eq!(fixture.tracker.completed.lock().unwrap()[0].2, true);
+    assert!(fixture.tracker.completed.lock().unwrap()[0].2);
     fixture.service.shutdown().await.unwrap();
 }
 
@@ -1825,14 +1827,15 @@ async fn native_pins_are_excluded_from_scope_digest_and_preserved_for_owned_down
         .await
         .unwrap();
     fixture.join().await;
-    let calls = fixture.engine.calls.lock().unwrap();
-    let selection = &calls
-        .iter()
-        .find(|(method, _)| method == "download")
-        .unwrap()
-        .1;
-    assert_eq!(selection["_approvedPaths"], proofs);
-    drop(calls);
+    {
+        let calls = fixture.engine.calls.lock().unwrap();
+        let selection = &calls
+            .iter()
+            .find(|(method, _)| method == "download")
+            .unwrap()
+            .1;
+        assert_eq!(selection["_approvedPaths"], proofs);
+    }
     fixture.service.shutdown().await.unwrap();
 }
 
