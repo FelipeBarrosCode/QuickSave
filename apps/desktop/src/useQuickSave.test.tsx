@@ -22,6 +22,36 @@ async function ready() {
 async function tick() { await act(async () => { await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS) }) }
 
 describe('bounded activity polling', () => {
+  it('does not queue tracking or activity reads while startup waits for Keychain consent', async () => {
+    let finish!: (value: unknown) => void
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (record(args)?.query === 'dashboard') return new Promise((resolve) => { finish = resolve })
+      return respond(command, args as Record<string, unknown>)
+    })
+    const { result } = await ready()
+    await act(async () => { await vi.advanceTimersByTimeAsync(30 * POLL_INTERVAL_MS) })
+    expect(result.current.loading).toBe(true)
+    expect(vi.mocked(invoke).mock.calls.map(([, args]) => record(args)?.query)).toEqual(['dashboard'])
+    expect(result.current.pollIssue).toBeNull()
+    await act(async () => { finish(dashboard) })
+    expect(result.current.loading).toBe(false)
+    expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'app_tracking')).toHaveLength(1)
+    await tick()
+    expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'activity')).toHaveLength(1)
+  })
+
+  it('keeps background reads paused when startup authorization fails', async () => {
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (record(args)?.query === 'dashboard') throw new Error('Native vault access denied')
+      return respond(command, args as Record<string, unknown>)
+    })
+    const { result } = await ready()
+    await act(async () => { await vi.advanceTimersByTimeAsync(30 * POLL_INTERVAL_MS) })
+    expect(result.current.error).toBeTruthy()
+    expect(vi.mocked(invoke).mock.calls.map(([, args]) => record(args)?.query)).toEqual(['dashboard'])
+    expect(result.current.pollIssue).toBeNull()
+  })
+
   it('polls every two seconds and never overlaps a slow request', async () => {
     let finish!: (value: unknown) => void
     let count = 0
@@ -57,10 +87,79 @@ describe('bounded activity polling', () => {
     expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'activity')).toHaveLength(4)
   })
   it('has a 600-request cap and requires explicit resumption', async () => {
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      record(args)?.query === 'activity' ? { activity: [activity] }
+        : respond(command, args as Record<string, unknown>))
     const { result } = await ready()
     for (let index = 0; index <= MAX_POLL_REQUESTS; index += 1) await tick()
     expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'activity')).toHaveLength(MAX_POLL_REQUESTS)
     expect(result.current.pollIssue).toContain('600')
+    expect(vi.getTimerCount()).toBe(0)
+  })
+  it('does not exhaust an activity budget while the workspace is idle', async () => {
+    const { result } = await ready()
+    for (let index = 0; index <= MAX_POLL_REQUESTS; index += 1) await tick()
+    expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'activity')).toHaveLength(1)
+    expect(result.current.pollIssue).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === 'workspace_execute')).toBe(false)
+  })
+  it('resumes bounded status checks after an accepted user action in an idle workspace', async () => {
+    const { result } = await ready()
+    await tick()
+    expect(vi.getTimerCount()).toBe(0)
+    await act(async () => { await result.current.run('refresh_app_tracking', {}) })
+    await tick()
+    expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'activity')).toHaveLength(2)
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === 'workspace_execute')).toHaveLength(1)
+    expect(result.current.pollIssue).toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+  it('shares an in-flight activity request when a user resumes checks', async () => {
+    let finish!: (value: unknown) => void
+    let count = 0
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (record(args)?.query === 'activity') {
+        count += 1
+        if (count === 1) return new Promise((resolve) => { finish = resolve })
+        return { activity: [activity] }
+      }
+      return respond(command, args as Record<string, unknown>)
+    })
+    const { result } = await ready()
+    await tick()
+    act(() => result.current.resumePolling())
+    await tick(); await tick()
+    expect(count).toBe(1)
+    await act(async () => { finish({ activity: [activity] }) })
+    expect(result.current.activity[0].state).toBe('running')
+    await tick()
+    expect(count).toBe(2)
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === 'workspace_execute')).toBe(false)
+  })
+  it('retains missing unfinished work instead of treating absence as completion', async () => {
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      record(args)?.query === 'dashboard' ? { ...dashboard, activity: [activity] }
+        : respond(command, args as Record<string, unknown>))
+    const { result } = await ready()
+    await tick(); await tick()
+    expect(result.current.activity).toHaveLength(1)
+    expect(result.current.activity[0]).toMatchObject(activity)
+    expect(result.current.pollIssue).toContain('last known state')
+    expect(vi.getTimerCount()).toBe(0)
+    expect(vi.mocked(invoke).mock.calls.filter(([, args]) => record(args)?.query === 'activity')).toHaveLength(1)
+  })
+  it('keeps unfinished known work when a full native page would otherwise evict it', async () => {
+    vi.mocked(invoke).mockImplementation(async (command, args) =>
+      record(args)?.query === 'dashboard' ? { ...dashboard, activity: [activity] }
+        : record(args)?.query === 'activity' ? {
+          activity: Array.from({ length: 128 }, (_, index) => ({ ...activity, id: `later-operation-${index}` })),
+        } : respond(command, args as Record<string, unknown>))
+    const { result } = await ready()
+    await tick(); await tick()
+    expect(result.current.activity).toHaveLength(128)
+    expect(result.current.activity[0]).toMatchObject(activity)
+    expect(result.current.pollIssue).toContain('128 rows')
     expect(vi.getTimerCount()).toBe(0)
   })
   it('refreshes software state only after native completion', async () => {

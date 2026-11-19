@@ -2245,6 +2245,7 @@ version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "328c4789d42200f1eeec05bd86c9c13c7f091d2ba9a6ea35acdf51f31bc0f043"
 dependencies = [
+ "cc",
  "pkg-config",
 ]
 
@@ -3444,6 +3445,7 @@ dependencies = [
  "quicksave-integrations",
  "quicksave-platform",
  "quicksave-service",
+ "quicksave-state",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -3474,6 +3476,7 @@ name = "quicksave-integrations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "libc",
  "plist",
  "quicksave-platform",
@@ -3586,14 +3589,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "chacha20poly1305",
  "chrono",
+ "core-foundation 0.10.1",
  "hex",
  "hmac",
  "keyring",
  "libc",
+ "libdbus-sys",
  "noland-rclone-adapter",
  "quicksave-platform",
  "rand 0.8.8",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2",

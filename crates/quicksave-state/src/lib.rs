@@ -3,12 +3,23 @@
 //! cross-component API and explicit native-consent requirements.
 
 mod discovery;
+mod encrypted_vault;
 mod grant;
 mod import;
 mod lifecycle;
+mod local_tracking_setup;
 mod metadata_verification;
+mod migration;
 mod model;
+mod pending_legacy;
+
+/// Native adapters may distinguish a deliberately deferred legacy authority
+/// from a missing/revoked value or an OS vault failure. Never inspect error text.
+pub fn is_legacy_credential_deferred(error: &anyhow::Error) -> bool {
+    error.is::<pending_legacy::LegacyCredentialDeferred>()
+}
 mod provider;
+mod secret_store;
 mod state_file;
 mod vault;
 
@@ -18,6 +29,7 @@ pub use import::{
 };
 pub use lifecycle::{NativeOAuthProfile, NativeRecoveryExport};
 pub use metadata_verification::MetadataProjectionChanged;
+pub use migration::{migration_error_message, MigrationStage};
 pub use model::{
     AppTrackingBaseDirectory, AppTrackingIdentityPolicy, AppTrackingPolicyScope,
     AppTrackingSettings, NativeFileStampID, ProviderRecord, ScopeProviderId, StateAutoEnrollment,
@@ -34,6 +46,7 @@ use provider::{
 };
 use quicksave_platform::FileStamp;
 use rand::{rngs::OsRng, RngCore};
+use secret_store::{LegacySecretAccess, SecretAccess};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -76,8 +89,8 @@ struct Inner {
     file: state_file::StateFile,
     operation: Mutex<()>,
     vault: Arc<dyn CredentialVault>,
-    // Loaded only by explicit native operations or grant verification, not open
-    // or pure dashboard/approval-scope queries.
+    // Legacy device keys only. Encrypted contexts never read this cache, and the
+    // native encrypted-anchor absence is checked before every legacy cache use.
     device_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
     verified_grants: Mutex<BTreeMap<String, (String, String)>>,
     noland_sources: Mutex<BTreeMap<String, Arc<NativeNolandSourceProof>>>,
@@ -97,22 +110,122 @@ pub struct WorkspaceStore {
 pub struct WorkspaceReadSnapshot {
     store: WorkspaceStore,
     document: WorkspaceDocument,
+    secret_access: Option<secret_store::SnapshotSecretAccess>,
+}
+
+/// The legacy native vault is used only when the persisted document has not
+/// explicitly migrated. This adapter imposes no Send/Sync bound on lock access.
+struct UnmigratedSecretAccess<'a> {
+    legacy: LegacySecretAccess<'a>,
+    device_key: &'a Mutex<Option<Zeroizing<[u8; 32]>>>,
+}
+impl UnmigratedSecretAccess<'_> {
+    fn ensure_unmigrated(&self) -> Result<()> {
+        ensure!(
+            self.legacy
+                .0
+                .read(
+                    QUICKSAVE_VAULT_SERVICE,
+                    secret_store::ENCRYPTED_VAULT_ACCOUNT
+                )?
+                .is_none(),
+            "encrypted native vault exists; refusing legacy-state rollback"
+        );
+        Ok(())
+    }
+}
+impl SecretAccess for UnmigratedSecretAccess<'_> {
+    fn read(&self, service: &str, account: &str) -> Result<Option<Zeroizing<String>>> {
+        self.ensure_unmigrated()?;
+        if service == QUICKSAVE_VAULT_SERVICE && account == DEVICE_KEY_ACCOUNT {
+            let mut cache = self
+                .device_key
+                .lock()
+                .map_err(|_| anyhow::anyhow!("device key cache poisoned"))?;
+            if let Some(key) = cache.as_ref() {
+                return Ok(Some(Zeroizing::new(hex::encode(key.as_ref()))));
+            }
+            let value = self.legacy.read(service, account)?;
+            if let Some(encoded) = &value {
+                *cache = Some(decode_key(encoded)?);
+            }
+            return Ok(value);
+        }
+        self.legacy.read(service, account)
+    }
+    fn write(&self, service: &str, account: &str, value: &str) -> Result<()> {
+        self.ensure_unmigrated()?;
+        if service == QUICKSAVE_VAULT_SERVICE && account == DEVICE_KEY_ACCOUNT {
+            *self
+                .device_key
+                .lock()
+                .map_err(|_| anyhow::anyhow!("device key cache poisoned"))? = None;
+        }
+        self.legacy.write(service, account, value)
+    }
+    fn delete(&self, service: &str, account: &str) -> Result<()> {
+        self.ensure_unmigrated()?;
+        if service == QUICKSAVE_VAULT_SERVICE && account == DEVICE_KEY_ACCOUNT {
+            *self
+                .device_key
+                .lock()
+                .map_err(|_| anyhow::anyhow!("device key cache poisoned"))? = None;
+        }
+        self.legacy.delete(service, account)
+    }
 }
 impl WorkspaceReadSnapshot {
+    fn with_secret_access<R>(
+        &self,
+        read: impl FnOnce(&dyn SecretAccess) -> Result<R>,
+    ) -> Result<R> {
+        // Recheck the retained native root without reopening state.json. Frozen
+        // metadata grants still read the persistent native anchor on EVERY call.
+        self.store.encrypted_workspace_binding()?;
+        match &self.secret_access {
+            Some(access) => read(access),
+            None => read(&UnmigratedSecretAccess {
+                legacy: LegacySecretAccess(self.store.inner.vault.as_ref()),
+                device_key: &self.store.inner.device_key,
+            }),
+        }
+    }
+
     pub fn verify_grant(&self, kind: &str, scope: &Value, signature: &Value) -> Result<bool> {
-        self.store.verify_bound(
-            &self.document,
-            &json!({"kind":kind,"scope":scope}),
-            signature,
-        )
+        if !grant_signature_well_formed(signature)? {
+            return Ok(false);
+        }
+        self.with_secret_access(|vault| {
+            self.store.verify_bound(
+                vault,
+                &self.document,
+                &json!({"kind":kind,"scope":scope}),
+                signature,
+            )
+        })
     }
     pub fn verify_tracking_grant(&self, software_id: &str) -> Result<bool> {
-        self.store
-            .verify_tracking_in_document(&self.document, software_id)
+        let software = self
+            .document
+            .software
+            .iter()
+            .find(|software| software.id == software_id)
+            .context("software not found")?;
+        let Some(signature) = &software.tracking_grant else {
+            return Ok(false);
+        };
+        if !grant_signature_well_formed(signature)? {
+            return Ok(false);
+        }
+        self.with_secret_access(|vault| {
+            self.store
+                .verify_tracking_in_document(vault, &self.document, software_id)
+        })
     }
     /// Optional end-of-read validation, comparing decoded content rather than
     /// trusting an attacker-editable generation counter. Not a long-lived cache.
     pub fn is_current(&self) -> Result<bool> {
+        self.store.encrypted_workspace_binding()?;
         Ok(self.store.document()? == self.document)
     }
 }
@@ -120,7 +233,11 @@ impl WorkspaceReadSnapshot {
 impl WorkspaceStore {
     /// Creates/loads only private settings. No native vault reads on open.
     pub fn open(data_dir: &Path) -> Result<Self> {
-        Self::open_inner(data_dir, Arc::new(NativeVault), true)
+        Self::open_inner(
+            data_dir,
+            Arc::new(vault::SessionVaultGate::new(Arc::new(NativeVault))),
+            true,
+        )
     }
 
     pub fn open_with_vault(data_dir: &Path, vault: Arc<dyn CredentialVault>) -> Result<Self> {
@@ -182,6 +299,10 @@ impl WorkspaceStore {
         let before = document.clone();
         let result = update(&mut document)?;
         ensure!(
+            document.encrypted_secrets == before.encrypted_secrets,
+            "metadata transactions cannot replace encrypted secrets"
+        );
+        ensure!(
             document.generation == before.generation,
             "transaction cannot replace the state generation"
         );
@@ -192,9 +313,116 @@ impl WorkspaceStore {
                 .generation
                 .checked_add(1)
                 .context("state generation exhausted")?;
+            ensure!(
+                locked.read()?.as_deref() == Some(bytes.as_slice()),
+                "workspace state changed during transaction"
+            );
             locked.replace(&encode_document(&document)?)?;
         }
         Ok(result)
+    }
+
+    /// Secret operations borrow this already-held OS lock. Each encrypted
+    /// mutation is independently durable, even when the metadata closure fails.
+    fn transaction_with_secrets<R>(
+        &self,
+        update: impl FnOnce(&mut WorkspaceDocument, &dyn SecretAccess) -> Result<R>,
+    ) -> Result<R> {
+        let _operation = self
+            .inner
+            .operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace state lock poisoned"))?;
+        let locked = self.inner.file.lock()?;
+        let bytes = locked.read()?.context("workspace state disappeared")?;
+        let mut document = decode_document(&bytes)?;
+        let before = document.clone();
+        let binding = self.encrypted_workspace_binding()?;
+        let access = if document.encrypted_secrets.is_some() {
+            // No native anchor, decrypted key or mutable secret state is cached.
+            self.inner
+                .verified_grants
+                .lock()
+                .map_err(|_| anyhow::anyhow!("authority cache poisoned"))?
+                .clear();
+            Some(crate::secret_store::LockedSecretAccess::new(
+                &locked,
+                self.inner.vault.as_ref(),
+                binding,
+            )?)
+        } else {
+            None
+        };
+        let legacy = UnmigratedSecretAccess {
+            legacy: LegacySecretAccess(self.inner.vault.as_ref()),
+            device_key: &self.inner.device_key,
+        };
+        let vault: &dyn SecretAccess = match &access {
+            Some(access) => access,
+            None => &legacy,
+        };
+        let result = update(&mut document, vault)?;
+        ensure!(
+            self.encrypted_workspace_binding()? == binding,
+            "native workspace identity changed during secret access"
+        );
+        ensure!(
+            document.generation == before.generation,
+            "transaction cannot replace the state generation"
+        );
+        ensure!(
+            document.encrypted_secrets == before.encrypted_secrets,
+            "secret transaction cannot replace encrypted envelopes directly"
+        );
+        document.validate()?;
+        if document != before {
+            metadata_verification::invalidate(self);
+            document.generation = before
+                .generation
+                .checked_add(1)
+                .context("state generation exhausted")?;
+            if let Some(access) = access {
+                // Merges the freshest durable slots, never the closure's old copy.
+                access.publish_metadata(&document)?;
+            } else {
+                // A new read is mandatory before every state-file replacement.
+                ensure!(
+                    locked.read()?.as_deref() == Some(bytes.as_slice()),
+                    "workspace state changed during transaction"
+                );
+                locked.replace(&encode_document(&document)?)?;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn encrypted_workspace_binding(&self) -> Result<[u8; 32]> {
+        let identity = self.inner.data_root.identity()?;
+        let mut digest = Sha256::new();
+        digest.update(b"QuickSave/encrypted-secrets/workspace/v1\0");
+        digest.update(identity.device.to_le_bytes());
+        digest.update(identity.file_id[0].to_le_bytes());
+        digest.update(identity.file_id[1].to_le_bytes());
+        Ok(digest.finalize().into())
+    }
+
+    /// A retained metadata snapshot never supplies secret authority. Validate it
+    /// against a fresh locked document before loading the current native anchor.
+    fn with_snapshot_secrets<R>(
+        &self,
+        snapshot: &WorkspaceDocument,
+        read: impl FnOnce(&dyn SecretAccess) -> Result<R>,
+    ) -> Result<R> {
+        if snapshot.encrypted_secrets.is_none() {
+            return read(&UnmigratedSecretAccess {
+                legacy: LegacySecretAccess(self.inner.vault.as_ref()),
+                device_key: &self.inner.device_key,
+            });
+        }
+        self.transaction_with_secrets(|current, vault| {
+            ensure!(current == snapshot, "workspace metadata projection changed");
+            read(vault)
+        })
     }
 
     pub fn document(&self) -> Result<WorkspaceDocument> {
@@ -208,9 +436,20 @@ impl WorkspaceStore {
     }
 
     pub fn read_snapshot(&self) -> Result<WorkspaceReadSnapshot> {
+        let document = self.document()?;
+        let secret_access = if document.encrypted_secrets.is_some() {
+            Some(secret_store::SnapshotSecretAccess::new(
+                &document,
+                self.inner.vault.clone(),
+                self.encrypted_workspace_binding()?,
+            )?)
+        } else {
+            None
+        };
         Ok(WorkspaceReadSnapshot {
             store: self.clone(),
-            document: self.document()?,
+            document,
+            secret_access,
         })
     }
 
@@ -289,7 +528,7 @@ impl WorkspaceStore {
 
     /// Native restore plan/journal authority, NOT a repository/master key.
     /// Borrows bounded message bytes and hashes directly: no JSON normalization
-    /// or whole-message copy. Device vault is accessed once, then cached in Rust.
+    /// or whole-message copy. Native authority is freshly read for every use.
     pub fn recovery_mac(&self, bytes: &[u8]) -> Result<[u8; 32]> {
         self.native_document_mac(b"QuickSave/native-restore-recovery/v1\0", bytes, true)
     }
@@ -325,9 +564,38 @@ impl WorkspaceStore {
         // Native root identities bind a vault-shared device key to this exact
         // QuickSave workspace, without trusting a path or JSON generation.
         let identity = self.inner.data_root.identity()?;
-        let key = self
-            .device_key(create_key)?
-            .context("native device authority key is unavailable")?;
+        let cached_legacy_key = self
+            .inner
+            .device_key
+            .lock()
+            .map_err(|_| anyhow::anyhow!("device key cache poisoned"))?
+            .clone();
+        let key = if let Some(key) = cached_legacy_key {
+            // Preserve the metadata/ledger MAC fast path without file reads.
+            // A FRESH anchor check is mandatory: a cache cannot authorize a
+            // legacy key after another process migrates the workspace.
+            if self
+                .inner
+                .vault
+                .read(
+                    QUICKSAVE_VAULT_SERVICE,
+                    secret_store::ENCRYPTED_VAULT_ACCOUNT,
+                )?
+                .is_none()
+            {
+                key
+            } else {
+                self.transaction_with_secrets(|_, vault| {
+                    self.device_key(vault, create_key)?
+                        .context("native device authority key is unavailable")
+                })?
+            }
+        } else {
+            self.transaction_with_secrets(|_, vault| {
+                self.device_key(vault, create_key)?
+                    .context("native device authority key is unavailable")
+            })?
+        };
         let mut mac = Hmac::<Sha256>::new_from_slice(&key[..])?;
         mac.update(domain);
         mac.update(&identity.device.to_le_bytes());
@@ -353,9 +621,10 @@ impl WorkspaceStore {
             .map_err(|_| anyhow::anyhow!("invalid native app-tracking policy"))?;
         policy.validate()?;
         let scope = serde_json::to_value(&policy.policy_scope)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             ensure!(
                 self.verify_bound(
+                    vault,
                     document,
                     &json!({"kind":"app_tracking_policy","scope":scope}),
                     &policy.policy_grant
@@ -365,7 +634,7 @@ impl WorkspaceStore {
             if let Some(old) = &document.settings.app_tracking {
                 let old_scope = serde_json::to_value(&old.policy_scope)?;
                 if old_scope != scope {
-                    self.revoke_bound("app_tracking_policy", &old_scope)?;
+                    self.revoke_bound(vault, "app_tracking_policy", &old_scope)?;
                 }
             }
             document.settings.app_tracking = Some(policy);
@@ -374,9 +643,10 @@ impl WorkspaceStore {
     }
 
     pub fn clear_app_tracking_policy(&self) -> Result<()> {
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             if let Some(old) = &document.settings.app_tracking {
                 self.revoke_bound(
+                    vault,
                     "app_tracking_policy",
                     &serde_json::to_value(&old.policy_scope)?,
                 )?;
@@ -395,11 +665,14 @@ impl WorkspaceStore {
         };
         let scope = serde_json::to_value(&policy.policy_scope)?;
         if !policy.policy_scope.enabled
-            || !self.verify_bound(
-                &document,
-                &json!({"kind":"app_tracking_policy","scope":scope}),
-                &policy.policy_grant,
-            )?
+            || !self.with_snapshot_secrets(&document, |vault| {
+                self.verify_bound(
+                    vault,
+                    &document,
+                    &json!({"kind":"app_tracking_policy","scope":scope}),
+                    &policy.policy_grant,
+                )
+            })?
         {
             return Ok(None);
         }
@@ -477,13 +750,13 @@ impl WorkspaceStore {
         // Validate exact adapter/session shape locally, without provider I/O.
         let mut validation_session = secret.session("configure")?;
         zeroize_json(&mut validation_session);
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             ensure!(
                 document.providers.len() < model::MAX_PROVIDERS,
                 "too many provider profiles"
             );
-            self.repository_key(true)?;
-            self.write_secret(&record.credential_ref, &secret)?;
+            self.repository_key(vault, true)?;
+            self.write_secret(vault, &record.credential_ref, &secret)?;
             document.providers.push(record);
             Ok(())
         })?;
@@ -572,13 +845,13 @@ impl WorkspaceStore {
                 "OAuth refresh token is empty or contains invalid characters"
             );
         }
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document.providers.iter().find(|provider| provider.id == provider_id)
                 .context("OAuth provider not found")?;
             ensure!(provider.status != "disconnected", "OAuth provider is disconnected");
             let kind = parse_kind(&provider.kind)?;
             ensure!(kind.is_oauth(), "credential refresh requires an existing OAuth provider");
-            let mut secret = self.read_secret(provider)
+            let mut secret = self.read_secret_with_access(vault, provider)
                 .map_err(|_| anyhow::anyhow!("native OAuth profile is unavailable or its identity changed"))?;
             if let Some(expected) = expected_generation {
                 ensure!(
@@ -602,12 +875,12 @@ impl WorkspaceStore {
             zeroize_json(&mut validation_session);
             let encoded = Zeroizing::new(serde_json::to_string(&secret)
                 .map_err(|_| anyhow::anyhow!("native OAuth credential encoding failed"))?);
-            self.inner.vault.write(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref, &encoded)
+            vault.write(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref, &encoded)
                 .map_err(|_| anyhow::anyhow!("native OAuth credential persistence failed; retry the native flow or reconnect"))?;
             // Enforce read-back for injected backends too. A backend's Ok is not
             // evidence of an atomic/persistent replacement. Never compensate by
             // blindly restoring an old, potentially already-rotated token.
-            let verified = self.inner.vault.read(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref)
+            let verified = vault.read(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref)
                 .map_err(|_| anyhow::anyhow!("native OAuth credential persistence could not be verified"))?;
             ensure!(
                 verified.as_deref().map(String::as_str) == Some(encoded.as_str()),
@@ -627,7 +900,7 @@ impl WorkspaceStore {
             .and_then(Value::as_str)
             .context("native provider access has no operation binding")?;
         validate_id(operation)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter()
@@ -641,7 +914,7 @@ impl WorkspaceStore {
                 parse_kind(&provider.kind)?.is_oauth(),
                 "native refresh sink requires OAuth"
             );
-            let secret = self.read_secret(provider)?;
+            let secret = self.read_secret_with_access(vault, provider)?;
             let mut expected = secret.session(operation)?;
             let matches = expected == access.session && secret.read_only == access.read_only;
             zeroize_json(&mut expected);
@@ -657,20 +930,18 @@ impl WorkspaceStore {
     /// or cloud data. The app-wide master key survives all disconnections.
     pub fn disconnect_provider(&self, id: &str) -> Result<()> {
         validate_id(id)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter_mut()
                 .find(|provider| provider.id == id)
                 .context("provider not found")?;
-            self.inner
-                .vault
-                .delete(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref)?;
+            vault.delete(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref)?;
             provider.status = "disconnected".into();
             provider.error = None;
             for software in &mut document.software {
                 if software.provider_id.as_deref() == Some(id) {
-                    self.revoke_bound("autosave", &json!({"softwareId":software.id}))?;
+                    self.revoke_bound(vault, "autosave", &json!({"softwareId":software.id}))?;
                     software.autosave = false;
                     software.autosave_grant = None;
                 }
@@ -712,7 +983,7 @@ impl WorkspaceStore {
             input
         };
         let mut imports = import::prepare(input, self.inner.vault.as_ref())?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             ensure!(document.providers.len() + imports.len() <= model::MAX_PROVIDERS, "too many provider profiles");
             for import in &imports {
                 ensure!(
@@ -736,8 +1007,8 @@ impl WorkspaceStore {
                     source_profile_id: Some(import.source_id.clone()), authority_revision: 0, error: None,
                 };
                 let key_hex = Zeroizing::new(hex::encode(import.key.as_ref()));
-                self.inner.vault.write(QUICKSAVE_VAULT_SERVICE, &record.repository_key_ref, &key_hex)?;
-                ensure!(self.inner.vault.read(QUICKSAVE_VAULT_SERVICE, &record.repository_key_ref)?
+                vault.write(QUICKSAVE_VAULT_SERVICE, &record.repository_key_ref, &key_hex)?;
+                ensure!(vault.read(QUICKSAVE_VAULT_SERVICE, &record.repository_key_ref)?
                     .as_deref().map(String::as_str) == Some(key_hex.as_str()),
                     "Imported repository-key persistence failed verification");
                 let secret = SecretProfile {
@@ -749,7 +1020,7 @@ impl WorkspaceStore {
                 };
                 let mut validation_session = secret.session("import")?;
                 zeroize_json(&mut validation_session);
-                self.write_secret(&record.credential_ref, &secret)?;
+                self.write_secret(vault, &record.credential_ref, &secret)?;
                 document.providers.push(record);
             }
             Ok(())
@@ -762,7 +1033,7 @@ impl WorkspaceStore {
         validate_id(id)?;
         validate_id(operation_id)?;
         // Keep state snapshot, routing validation, and vault read under one lock.
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter()
@@ -772,10 +1043,8 @@ impl WorkspaceStore {
                 provider.status != "disconnected",
                 "provider is disconnected"
             );
-            let secret = self.read_secret(provider)?;
-            let encoded = self
-                .inner
-                .vault
+            let secret = self.read_secret_with_access(vault, provider)?;
+            let encoded = vault
                 .read(QUICKSAVE_VAULT_SERVICE, &provider.repository_key_ref)?
                 .context("provider repository key is missing from the native vault")?;
             let repository_key = decode_key(&encoded)?;
@@ -792,7 +1061,7 @@ impl WorkspaceStore {
     /// Separate native consent for exactly this profile/root. JSON is not a grant.
     pub fn grant_provider_write(&self, id: &str) -> Result<()> {
         validate_id(id)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter_mut()
@@ -802,14 +1071,14 @@ impl WorkspaceStore {
                 provider.status != "disconnected",
                 "provider is disconnected"
             );
-            let mut secret = self.read_secret(provider)?;
+            let mut secret = self.read_secret_with_access(vault, provider)?;
             secret.read_only = false;
-            self.write_secret(&provider.credential_ref, &secret)?;
+            self.write_secret(vault, &provider.credential_ref, &secret)?;
             provider.read_only = false;
             // A changed grant never silently reactivates prior autosave.
             for software in &mut document.software {
                 if software.provider_id.as_deref() == Some(id) {
-                    self.revoke_bound("autosave", &json!({"softwareId":software.id}))?;
+                    self.revoke_bound(vault, "autosave", &json!({"softwareId":software.id}))?;
                     software.autosave = false;
                     software.autosave_grant = None;
                 }
@@ -833,7 +1102,9 @@ impl WorkspaceStore {
         if provider.status != "connected" || provider.read_only {
             return Ok(false);
         }
-        Ok(!self.read_secret(provider)?.read_only)
+        self.with_snapshot_secrets(&document, |vault| {
+            Ok(!self.read_secret_with_access(vault, provider)?.read_only)
+        })
     }
 
     /// Trusted native health evidence only; never a user-supplied success flag.
@@ -862,7 +1133,7 @@ impl WorkspaceStore {
             } else {
                 can_read == Some(true) && key_verified == Some(true)
             };
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter_mut()
@@ -874,7 +1145,7 @@ impl WorkspaceStore {
             );
             // A modified prefix/ref/read-only flag cannot be legitimized by a
             // health report for some other native credential binding.
-            let secret = self.read_secret(provider)?;
+            let secret = self.read_secret_with_access(vault, provider)?;
             let durable = !parse_kind(&provider.kind)?.is_oauth()
                 || secret.credentials["value"]["refresh_token"]
                     .as_str()
@@ -918,6 +1189,33 @@ impl WorkspaceStore {
 
     /// Bounded typed merge patch. Omitted baseline/grant/generation fields survive
     /// coalesced updates. Native authority is never inferred from tracked=true.
+    pub fn pause_tracking_authorization(&self, record: &Value) -> Result<()> {
+        bounded_json(record, 3 * 1024 * 1024)?;
+        let id = required_str(record, "id")?;
+        validate_id(id)?;
+        self.transaction(|document| {
+            let software = document.software.iter_mut().find(|software|software.id == id)
+                .context("software not found")?;
+            for (name, current) in [
+                ("dirtyGeneration",&mut software.dirty_generation),
+                ("unknownGeneration",&mut software.unknown_generation),
+            ] {
+                if let Some(value) = record.get(name) {
+                    let value = value.as_u64().context("invalid denial-only generation")?;
+                    *current = (*current).max(value);
+                }
+            }
+            software.authorization_pending = true;
+            software.reconciliation_required = true;
+            software.confirmed_generation = None;
+            software.dirty = true;
+            software.status = "needs_authorization".into();
+            software.error = Some("Tracking authorization is temporarily unavailable; existing approvals and history are retained.".into());
+            Ok(())
+        })
+    }
+
+    /// Native record persistence; changing scope still requires fresh authority.
     pub fn update_software(&self, patch: &Value) -> Result<Value> {
         bounded_json(patch, 3 * 1024 * 1024)?;
         let id = required_str(patch, "id")?.to_owned();
@@ -930,7 +1228,7 @@ impl WorkspaceStore {
             // native source admission. This validates shape only, never grants.
             model::validate_pending_work_reference(reference, &id)?;
         }
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let position = document
                 .software
                 .iter()
@@ -995,20 +1293,20 @@ impl WorkspaceStore {
                 || initial.tracked != candidate.tracked;
             let provider_changed = initial.provider_id != candidate.provider_id;
             if initial.tracking_grant.is_some() && candidate.tracking_grant.is_none() {
-                self.revoke_bound("tracking", &json!({"softwareId":id}))?;
+                self.revoke_bound(vault, "tracking", &json!({"softwareId":id}))?;
             }
             if initial.autosave && (!candidate.autosave || candidate.autosave_grant.is_none()) {
-                self.revoke_bound("autosave", &json!({"softwareId":id}))?;
+                self.revoke_bound(vault, "autosave", &json!({"softwareId":id}))?;
             }
             if tracking_changed && !patch.contains_key("trackingGrant") {
                 if previous.is_some() {
-                    self.revoke_bound("tracking", &json!({"softwareId":id}))?;
+                    self.revoke_bound(vault, "tracking", &json!({"softwareId":id}))?;
                 }
                 candidate.tracking_grant = None;
             }
             if (tracking_changed || provider_changed) && !patch.contains_key("autosaveGrant") {
                 if previous.is_some() {
-                    self.revoke_bound("autosave", &json!({"softwareId":id}))?;
+                    self.revoke_bound(vault, "autosave", &json!({"softwareId":id}))?;
                 }
                 candidate.autosave = false;
                 candidate.autosave_grant = None;
@@ -1021,7 +1319,7 @@ impl WorkspaceStore {
             {
                 let scope = grant::tracking_scope(&candidate)?;
                 ensure!(
-                    self.verify_bound(document, &scope, stored)?,
+                    self.verify_bound(vault, document, &scope, stored)?,
                     "tracking grant does not authorize these roots/app"
                 );
             }
@@ -1037,7 +1335,7 @@ impl WorkspaceStore {
                     .as_ref()
                     .context("autosave requires a native authority grant")?;
                 ensure!(
-                    self.verify_bound(document, &scope, stored)?,
+                    self.verify_bound(vault, document, &scope, stored)?,
                     "autosave grant does not authorize this scope"
                 );
                 ensure!(
@@ -1057,7 +1355,7 @@ impl WorkspaceStore {
 
     pub fn set_software_provider(&self, software_id: &str, provider_id: &str) -> Result<()> {
         validate_id(provider_id)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             ensure!(
                 document
                     .providers
@@ -1071,7 +1369,7 @@ impl WorkspaceStore {
                 .find(|software| software.id == software_id)
                 .context("software not found")?;
             if software.provider_id.as_deref() != Some(provider_id) {
-                self.revoke_bound("autosave", &json!({"softwareId":software_id}))?;
+                self.revoke_bound(vault, "autosave", &json!({"softwareId":software_id}))?;
                 software.provider_id = Some(provider_id.into());
                 software.autosave = false;
                 software.autosave_grant = None;
@@ -1082,14 +1380,18 @@ impl WorkspaceStore {
 
     /// Caller must have native-approved exactly the current roots/app/allowlist.
     pub fn seal_tracking_grant(&self, software_id: &str) -> Result<Value> {
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let software = document
                 .software
                 .iter()
                 .find(|software| software.id == software_id)
                 .context("software not found")?;
-            let signature =
-                self.issue_bound(document, "tracking", &grant::tracking_scope(software)?)?;
+            let signature = self.issue_bound(
+                vault,
+                document,
+                "tracking",
+                &grant::tracking_scope(software)?,
+            )?;
             let software = document
                 .software
                 .iter_mut()
@@ -1101,15 +1403,18 @@ impl WorkspaceStore {
     }
 
     pub fn verify_tracking_grant(&self, software_id: &str) -> Result<bool> {
-        let document = self.document()?;
-        self.verify_tracking_in_document(&document, software_id)
-    }
-
-    fn verify_tracking_in_document(
-        &self,
-        document: &WorkspaceDocument,
-        software_id: &str,
-    ) -> Result<bool> {
+        // Execution admission must not race a cooperating metadata writer
+        // between snapshot verification and its end check. Hold one read scope,
+        // without publishing state or relaxing the metadata-UI snapshot checks.
+        validate_id(software_id)?;
+        let _operation = self
+            .inner
+            .operation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace state lock poisoned"))?;
+        let locked = self.inner.file.lock()?;
+        let bytes = locked.read()?.context("workspace state disappeared")?;
+        let document = decode_document(&bytes)?;
         let software = document
             .software
             .iter()
@@ -1118,18 +1423,72 @@ impl WorkspaceStore {
         let Some(signature) = &software.tracking_grant else {
             return Ok(false);
         };
+        if software.authorization_pending
+            || !grant_signature_well_formed(signature)?
+            || grant::tracking_scope(software).is_err()
+        {
+            return Ok(false);
+        }
+        let binding = self.encrypted_workspace_binding()?;
+        let encrypted = if document.encrypted_secrets.is_some() {
+            Some(secret_store::LockedSecretAccess::new(
+                &locked,
+                self.inner.vault.as_ref(),
+                binding,
+            )?)
+        } else {
+            None
+        };
+        let legacy = UnmigratedSecretAccess {
+            legacy: LegacySecretAccess(self.inner.vault.as_ref()),
+            device_key: &self.inner.device_key,
+        };
+        let vault: &dyn SecretAccess = match &encrypted {
+            Some(access) => access,
+            None => &legacy,
+        };
+        let verified = self.verify_tracking_in_document(vault, &document, software_id)?;
+        // External writers that ignore the OS lock still cannot publish an
+        // authority result for a replaced/edited document or workspace.
+        ensure!(
+            self.encrypted_workspace_binding()? == binding
+                && locked.read()?.as_deref() == Some(bytes.as_slice()),
+            MetadataProjectionChanged
+        );
+        Ok(verified)
+    }
+
+    fn verify_tracking_in_document(
+        &self,
+        vault: &dyn SecretAccess,
+        document: &WorkspaceDocument,
+        software_id: &str,
+    ) -> Result<bool> {
+        let software = document
+            .software
+            .iter()
+            .find(|software| software.id == software_id)
+            .context("software not found")?;
+        if software.authorization_pending {
+            return Ok(false);
+        }
+        let Some(signature) = &software.tracking_grant else {
+            return Ok(false);
+        };
         let Ok(scope) = grant::tracking_scope(software) else {
             return Ok(false);
         };
-        if !self.verify_bound(document, &scope, signature)? {
+        if !self.verify_bound(vault, document, &scope, signature)? {
             return Ok(false);
         }
         if let Some(enrollment) = &software.auto_enrollment {
             if !self.verify_bound(
+                vault,
                 document,
                 &json!({"kind":"app_tracking_policy","scope":enrollment.policy_scope}),
                 &enrollment.policy_grant,
             )? || !self.verify_bound(
+                vault,
                 document,
                 &json!({"kind":"bundle_discovery","scope":enrollment.discovery_scope}),
                 &enrollment.discovery_grant,
@@ -1145,6 +1504,9 @@ impl WorkspaceStore {
         document: &WorkspaceDocument,
         software: &StateSoftware,
     ) -> Result<bool> {
+        if software.authorization_pending {
+            return Ok(false);
+        }
         let Some(signature) = &software.tracking_grant else {
             return Ok(false);
         };
@@ -1170,14 +1532,14 @@ impl WorkspaceStore {
 
     /// Native-approved opt-in. Disable never creates/loads a device key.
     pub fn set_autosave(&self, software_id: &str, provider_id: &str, enabled: bool) -> Result<()> {
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let software = document
                 .software
                 .iter()
                 .find(|software| software.id == software_id)
                 .context("software not found")?;
             if !enabled {
-                self.revoke_bound("autosave", &json!({"softwareId":software_id}))?;
+                self.revoke_bound(vault, "autosave", &json!({"softwareId":software_id}))?;
                 let software = document
                     .software
                     .iter_mut()
@@ -1192,7 +1554,7 @@ impl WorkspaceStore {
                 .iter()
                 .find(|provider| provider.id == provider_id)
                 .context("provider not found")?;
-            let secret = self.read_secret(provider)?;
+            let secret = self.read_secret_with_access(vault, provider)?;
             ensure!(!secret.read_only, "provider has no native write grant");
             let tracking_scope = grant::tracking_scope(software)?;
             let tracking_signature = software
@@ -1200,10 +1562,11 @@ impl WorkspaceStore {
                 .as_ref()
                 .context("tracking authority must be approved before autosave")?;
             ensure!(
-                self.verify_bound(document, &tracking_scope, tracking_signature)?,
+                self.verify_bound(vault, document, &tracking_scope, tracking_signature)?,
                 "tracking authority is invalid"
             );
             let signature = self.issue_bound(
+                vault,
                 document,
                 "autosave",
                 &grant::autosave_scope(software, provider)?,
@@ -1220,61 +1583,66 @@ impl WorkspaceStore {
     }
 
     pub fn verify_autosave_grant(&self, software_id: &str, provider_id: &str) -> Result<bool> {
-        let document = self.document()?;
-        let software = document
-            .software
-            .iter()
-            .find(|software| software.id == software_id)
-            .context("software not found")?;
-        if !software.autosave {
-            return Ok(false);
-        }
-        let Some(provider) = document
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-        else {
-            return Ok(false);
-        };
-        if provider.status != "connected" || provider.read_only {
-            return Ok(false);
-        }
-        let (Some(tracking_signature), Some(signature)) =
-            (&software.tracking_grant, &software.autosave_grant)
-        else {
-            return Ok(false);
-        };
-        let Ok(tracking_scope) = grant::tracking_scope(software) else {
-            return Ok(false);
-        };
-        if !self.verify_bound(&document, &tracking_scope, tracking_signature)? {
-            return Ok(false);
-        }
-        let Ok(scope) = grant::autosave_scope(software, provider) else {
-            return Ok(false);
-        };
-        if !self.verify_bound(&document, &scope, signature)? {
-            return Ok(false);
-        }
-        let secret = self.read_secret(provider)?;
-        Ok(!secret.read_only)
+        self.transaction_with_secrets(|document, vault| {
+            let software = document
+                .software
+                .iter()
+                .find(|software| software.id == software_id)
+                .context("software not found")?;
+            if !software.autosave {
+                return Ok(false);
+            }
+            let Some(provider) = document
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+            else {
+                return Ok(false);
+            };
+            if provider.status != "connected" || provider.read_only {
+                return Ok(false);
+            }
+            let (Some(tracking_signature), Some(signature)) =
+                (&software.tracking_grant, &software.autosave_grant)
+            else {
+                return Ok(false);
+            };
+            let Ok(tracking_scope) = grant::tracking_scope(software) else {
+                return Ok(false);
+            };
+            if !self.verify_bound(vault, document, &tracking_scope, tracking_signature)? {
+                return Ok(false);
+            }
+            let Ok(scope) = grant::autosave_scope(software, provider) else {
+                return Ok(false);
+            };
+            if !self.verify_bound(vault, document, &scope, signature)? {
+                return Ok(false);
+            }
+            let secret = self.read_secret_with_access(vault, provider)?;
+            Ok(!secret.read_only)
+        })
     }
 
     /// Native callers may sign tracking/baseline scopes. A top-level providerId
     /// automatically adds its current exact native routing binding to the MAC.
     pub fn grant_seal(&self, scope: &Value) -> Result<Value> {
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let (kind, scope) = normalize_scope(scope)?;
-            self.issue_bound(document, &kind, scope)
+            self.issue_bound(vault, document, &kind, scope)
         })
     }
 
     pub fn grant_verify(&self, scope: &Value, signature: &Value) -> Result<bool> {
+        if !grant_signature_well_formed(signature)? {
+            return Ok(false);
+        }
         if let Some(result) = metadata_verification::verify(self, scope, signature) {
             return result;
         }
-        let document = self.document()?;
-        self.verify_bound(&document, scope, signature)
+        self.transaction_with_secrets(|document, vault| {
+            self.verify_bound(vault, document, scope, signature)
+        })
     }
 
     pub fn issue_grant(&self, kind: &str, scope: &Value) -> Result<Value> {
@@ -1286,7 +1654,7 @@ impl WorkspaceStore {
     }
 
     pub fn revoke_grant(&self, kind: &str, scope: &Value) -> Result<()> {
-        self.transaction(|_| self.revoke_bound(kind, scope))
+        self.transaction_with_secrets(|_, vault| self.revoke_bound(vault, kind, scope))
     }
 
     pub fn grant_revoke(&self, scope: &Value) -> Result<()> {
@@ -1354,19 +1722,13 @@ impl WorkspaceStore {
 
     fn verify_bound(
         &self,
+        vault: &dyn SecretAccess,
         document: &WorkspaceDocument,
         scope: &Value,
         signature: &Value,
     ) -> Result<bool> {
-        bounded_json(signature, 1024)?;
         // Malformed/missing grants must not cause key creation or vault reads.
-        if signature.get("version").and_then(Value::as_u64) != Some(1)
-            || signature.get("algorithm").and_then(Value::as_str) != Some("hmac-sha256")
-            || signature
-                .get("mac")
-                .and_then(Value::as_str)
-                .is_none_or(|value| value.len() != 64)
-        {
+        if !grant_signature_well_formed(signature)? {
             return Ok(false);
         }
         let (kind, scope) = match normalize_scope(scope) {
@@ -1377,14 +1739,14 @@ impl WorkspaceStore {
             Ok(value) => value,
             Err(_) => return Ok(false),
         };
-        let Some(key) = self.device_key(false)? else {
+        let Some(key) = self.device_key(vault, false)? else {
             return Ok(false);
         };
         if !grant::verify(&key, &payload, signature)? {
             return Ok(false);
         }
         let account = authority_account(&kind, scope)?;
-        let Some(stored) = self.inner.vault.read(QUICKSAVE_VAULT_SERVICE, &account)? else {
+        let Some(stored) = vault.read(QUICKSAVE_VAULT_SERVICE, &account)? else {
             return Ok(false);
         };
         let authority: Value = serde_json::from_str(&stored)
@@ -1401,12 +1763,13 @@ impl WorkspaceStore {
 
     fn issue_bound(
         &self,
+        vault: &dyn SecretAccess,
         document: &WorkspaceDocument,
         kind: &str,
         scope: &Value,
     ) -> Result<Value> {
         let key = self
-            .device_key(true)?
+            .device_key(vault, true)?
             .context("device authority key missing")?;
         let mut random = Zeroizing::new([0u8; 32]);
         OsRng
@@ -1422,9 +1785,7 @@ impl WorkspaceStore {
         let registry = Zeroizing::new(serde_json::to_string(
             &json!({"version":1,"active":true,"nonce":nonce}),
         )?);
-        self.inner
-            .vault
-            .write(QUICKSAVE_VAULT_SERVICE, &account, &registry)?;
+        vault.write(QUICKSAVE_VAULT_SERVICE, &account, &registry)?;
         // Rotating a scope's native nonce invalidates every previously issued
         // signature, including a state.json rollback to an earlier "enabled".
         self.inner
@@ -1436,14 +1797,14 @@ impl WorkspaceStore {
         Ok(signature)
     }
 
-    fn revoke_bound(&self, kind: &str, scope: &Value) -> Result<()> {
+    fn revoke_bound(&self, vault: &dyn SecretAccess, kind: &str, scope: &Value) -> Result<()> {
         let account = authority_account(kind, scope)?;
         self.inner
             .verified_grants
             .lock()
             .map_err(|_| anyhow::anyhow!("authority cache poisoned"))?
             .retain(|_, (existing_account, _)| existing_account != &account);
-        self.inner.vault.write(
+        vault.write(
             QUICKSAVE_VAULT_SERVICE,
             &account,
             r#"{"version":1,"active":false}"#,
@@ -1478,6 +1839,11 @@ impl WorkspaceStore {
         scope: &Value,
         signature: &Value,
     ) -> Result<bool> {
+        // Dashboard projections remain vault-free. A cached verification cannot
+        // establish freshness of a mutable encrypted-store native anchor.
+        if document.encrypted_secrets.is_some() {
+            return Ok(false);
+        }
         let (kind, scope) = normalize_scope(scope)?;
         let payload = signature_payload(document, &kind, scope, signature)?;
         let Some(mac) = signature.get("mac").and_then(Value::as_str) else {
@@ -1493,20 +1859,12 @@ impl WorkspaceStore {
             .is_some_and(|(_, expected)| expected == &fingerprint))
     }
 
-    fn device_key(&self, create: bool) -> Result<Option<Zeroizing<[u8; 32]>>> {
-        let mut cache = self
-            .inner
-            .device_key
-            .lock()
-            .map_err(|_| anyhow::anyhow!("device key cache poisoned"))?;
-        if let Some(key) = cache.as_ref() {
-            return Ok(Some(key.clone()));
-        }
-        let key = match self
-            .inner
-            .vault
-            .read(QUICKSAVE_VAULT_SERVICE, DEVICE_KEY_ACCOUNT)?
-        {
+    fn device_key(
+        &self,
+        vault: &dyn SecretAccess,
+        create: bool,
+    ) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        let key = match vault.read(QUICKSAVE_VAULT_SERVICE, DEVICE_KEY_ACCOUNT)? {
             Some(encoded) => decode_key(&encoded)?,
             None if create => {
                 let mut key = Zeroizing::new([0u8; 32]);
@@ -1514,12 +1872,9 @@ impl WorkspaceStore {
                     .try_fill_bytes(key.as_mut())
                     .map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
                 let encoded = Zeroizing::new(hex::encode(key.as_ref()));
-                self.inner
-                    .vault
-                    .write(QUICKSAVE_VAULT_SERVICE, DEVICE_KEY_ACCOUNT, &encoded)?;
+                vault.write(QUICKSAVE_VAULT_SERVICE, DEVICE_KEY_ACCOUNT, &encoded)?;
                 ensure!(
-                    self.inner
-                        .vault
+                    vault
                         .read(QUICKSAVE_VAULT_SERVICE, DEVICE_KEY_ACCOUNT)?
                         .as_deref()
                         .map(String::as_str)
@@ -1530,16 +1885,15 @@ impl WorkspaceStore {
             }
             None => return Ok(None),
         };
-        *cache = Some(key.clone());
         Ok(Some(key))
     }
 
-    fn repository_key(&self, create: bool) -> Result<Option<Zeroizing<[u8; 32]>>> {
-        match self
-            .inner
-            .vault
-            .read(QUICKSAVE_VAULT_SERVICE, REPOSITORY_KEY_ACCOUNT)?
-        {
+    fn repository_key(
+        &self,
+        vault: &dyn SecretAccess,
+        create: bool,
+    ) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        match vault.read(QUICKSAVE_VAULT_SERVICE, REPOSITORY_KEY_ACCOUNT)? {
             Some(encoded) => Ok(Some(decode_key(&encoded)?)),
             None if create => {
                 let mut key = Zeroizing::new([0u8; 32]);
@@ -1547,14 +1901,9 @@ impl WorkspaceStore {
                     .try_fill_bytes(key.as_mut())
                     .map_err(|_| anyhow::anyhow!("OS randomness unavailable"))?;
                 let encoded = Zeroizing::new(hex::encode(key.as_ref()));
-                self.inner.vault.write(
-                    QUICKSAVE_VAULT_SERVICE,
-                    REPOSITORY_KEY_ACCOUNT,
-                    &encoded,
-                )?;
+                vault.write(QUICKSAVE_VAULT_SERVICE, REPOSITORY_KEY_ACCOUNT, &encoded)?;
                 ensure!(
-                    self.inner
-                        .vault
+                    vault
                         .read(QUICKSAVE_VAULT_SERVICE, REPOSITORY_KEY_ACCOUNT)?
                         .as_deref()
                         .map(String::as_str)
@@ -1567,17 +1916,19 @@ impl WorkspaceStore {
         }
     }
 
-    fn write_secret(&self, account: &str, secret: &SecretProfile) -> Result<()> {
+    fn write_secret(
+        &self,
+        vault: &dyn SecretAccess,
+        account: &str,
+        secret: &SecretProfile,
+    ) -> Result<()> {
         let encoded = Zeroizing::new(
             serde_json::to_string(secret)
                 .map_err(|_| anyhow::anyhow!("protected profile encoding failed"))?,
         );
-        self.inner
-            .vault
-            .write(QUICKSAVE_VAULT_SERVICE, account, &encoded)?;
+        vault.write(QUICKSAVE_VAULT_SERVICE, account, &encoded)?;
         ensure!(
-            self.inner
-                .vault
+            vault
                 .read(QUICKSAVE_VAULT_SERVICE, account)?
                 .as_deref()
                 .map(String::as_str)
@@ -1587,10 +1938,12 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    fn read_secret(&self, provider: &ProviderRecord) -> Result<SecretProfile> {
-        let encoded = self
-            .inner
-            .vault
+    fn read_secret_with_access(
+        &self,
+        vault: &dyn SecretAccess,
+        provider: &ProviderRecord,
+    ) -> Result<SecretProfile> {
+        let encoded = vault
             .read(QUICKSAVE_VAULT_SERVICE, &provider.credential_ref)?
             .context("provider credentials are missing; reconnect explicitly")?;
         ensure!(
@@ -1602,6 +1955,21 @@ impl WorkspaceStore {
         secret.verify_binding(provider)?;
         Ok(secret)
     }
+
+    #[cfg(test)]
+    fn read_secret(&self, provider: &ProviderRecord) -> Result<SecretProfile> {
+        self.transaction_with_secrets(|_, vault| self.read_secret_with_access(vault, provider))
+    }
+}
+
+fn grant_signature_well_formed(signature: &Value) -> Result<bool> {
+    bounded_json(signature, 1024)?;
+    Ok(signature.get("version").and_then(Value::as_u64) == Some(1)
+        && signature.get("algorithm").and_then(Value::as_str) == Some("hmac-sha256")
+        && signature
+            .get("mac")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() == 64))
 }
 
 fn normalize_scope(scope: &Value) -> Result<(String, &Value)> {
@@ -1874,3 +2242,133 @@ pub(crate) fn zeroize_json(value: &mut Value) {
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod locked_secret_integration_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, MemoryVault, WorkspaceStore) {
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        let approved = base.join("opencode");
+        let temp = tempfile::Builder::new()
+            .prefix("quicksave-locked-secrets-")
+            .tempdir_in(if approved.is_dir() { approved } else { base })
+            .unwrap();
+        let vault = MemoryVault::default();
+        let store = WorkspaceStore::open_with_vault(
+            &temp.path().join("workspace"),
+            Arc::new(vault.clone()),
+        )
+        .unwrap();
+        (temp, vault, store)
+    }
+
+    fn initialize(store: &WorkspaceStore, vault: &MemoryVault) {
+        let mut contents = encrypted_vault::VaultContents {
+            entries: BTreeMap::new(),
+        };
+        for account in vault.accounts(QUICKSAVE_VAULT_SERVICE).unwrap() {
+            let value = vault
+                .read(QUICKSAVE_VAULT_SERVICE, &account)
+                .unwrap()
+                .unwrap();
+            contents.entries.insert(account, value.to_string());
+        }
+        let locked = store.inner.file.lock().unwrap();
+        secret_store::LockedSecretAccess::initialize(
+            &locked,
+            vault,
+            store.encrypted_workspace_binding().unwrap(),
+            contents,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn encrypted_metadata_and_open_stay_vault_free_and_preserve_slots() {
+        let (temp, vault, store) = fixture();
+        initialize(&store, &vault);
+        let slots = store.document().unwrap().encrypted_secrets;
+        vault.deny_access(true).unwrap();
+        let reopened = WorkspaceStore::open_with_vault(
+            &temp.path().join("workspace"),
+            Arc::new(vault.clone()),
+        )
+        .unwrap();
+        reopened
+            .transaction(|document| {
+                document.settings.launch_at_login = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reopened.document().unwrap().encrypted_secrets, slots);
+        let public = reopened.sanitized().unwrap();
+        assert!(public.get("encryptedSecrets").is_none());
+        assert!(!reopened
+            .verify_grant("tracking", &json!({}), &Value::Null)
+            .unwrap());
+        assert!(reopened
+            .transaction(|document| {
+                document.encrypted_secrets = None;
+                Ok(())
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn independently_durable_revocation_survives_failed_metadata_closure() {
+        let (_temp, vault, store) = fixture();
+        let scope = json!({"softwareId":"synthetic-app"});
+        let signature = store.issue_grant("tracking", &scope).unwrap();
+        initialize(&store, &vault);
+        let before = store.document().unwrap();
+        let failure: Result<()> = store.transaction_with_secrets(|document, access| {
+            store.revoke_bound(access, "tracking", &scope)?;
+            document.settings.launch_at_login = true;
+            bail!("synthetic metadata failure")
+        });
+        assert!(failure.is_err());
+        let after = store.document().unwrap();
+        assert_eq!(after.generation, before.generation);
+        assert!(!after.settings.launch_at_login);
+        assert_ne!(after.encrypted_secrets, before.encrypted_secrets);
+        assert!(!store.verify_grant("tracking", &scope, &signature).unwrap());
+    }
+
+    #[test]
+    fn encrypted_verification_reads_fresh_anchor_without_republishing_metadata() {
+        let (_temp, vault, store) = fixture();
+        let scope = json!({"softwareId":"synthetic-app"});
+        let signature = store.issue_grant("tracking", &scope).unwrap();
+        initialize(&store, &vault);
+        let snapshot = store.read_snapshot().unwrap();
+        assert!(snapshot
+            .verify_grant("tracking", &scope, &signature)
+            .unwrap());
+        assert!(snapshot.is_current().unwrap());
+        vault
+            .seed(
+                QUICKSAVE_VAULT_SERVICE,
+                secret_store::ENCRYPTED_VAULT_ACCOUNT,
+                "{}",
+            )
+            .unwrap();
+        assert!(snapshot
+            .verify_grant("tracking", &scope, &signature)
+            .is_err());
+    }
+
+    #[test]
+    fn old_legacy_document_cannot_resurrect_retained_native_authority() {
+        let (temp, vault, store) = fixture();
+        let scope = json!({"softwareId":"synthetic-app"});
+        let signature = store.issue_grant("tracking", &scope).unwrap();
+        let legacy = encode_document(&store.document().unwrap()).unwrap();
+        initialize(&store, &vault);
+        std::fs::write(temp.path().join("workspace/state.json"), legacy).unwrap();
+        // Metadata remains readable, but retained source native items are not
+        // usable as a rollback fallback after explicit initialization.
+        assert!(store.document().unwrap().encrypted_secrets.is_none());
+        assert!(store.verify_grant("tracking", &scope, &signature).is_err());
+    }
+}

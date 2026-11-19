@@ -3,6 +3,150 @@
 
 use super::*;
 
+#[test]
+fn explicit_refresh_can_reapprove_only_pristine_deferred_metadata_scopes() {
+    for history in [false, true] {
+        let h = full_harness();
+        let base = h.root("legacy-refresh");
+        let root = h.root("legacy-refresh/App.app");
+        fs::write(root.join("actual"), b"isolated metadata only").unwrap();
+        let plan = candidate("synthetic.deferred-refresh", &root);
+        let sealed = authority(&h, &base, &[plan.clone()], true);
+        let initial = h
+            .tracker
+            .materialize_bundles(&[plan.clone()], &sealed)
+            .unwrap();
+        let id = id_from(&initial);
+        if history {
+            h.tracker
+                .shared
+                .apps()
+                .unwrap()
+                .get_mut(&id)
+                .unwrap()
+                .record
+                .last_saved_at = Some("2026-11-18T12:00:00Z".into());
+        }
+        let before = h.store.records.lock().unwrap()[&id].clone();
+        h.store.deferred_tracking.lock().unwrap().insert(id.clone());
+        assert_eq!(
+            h.tracker.software().unwrap()[0]["authorizationPending"],
+            true
+        );
+        let issued = h.store.issued_grants.load(Ordering::Acquire);
+        let automatic = h
+            .tracker
+            .materialize_bundles(&[plan.clone()], &sealed)
+            .unwrap();
+        assert!(automatic["bundles"].as_array().unwrap().is_empty());
+        assert_eq!(h.store.issued_grants.load(Ordering::Acquire), issued);
+        let explicit = h.tracker.refresh_bundles(&[plan], &sealed).unwrap();
+        if history {
+            assert!(
+                explicit["bundles"].as_array().unwrap().is_empty(),
+                "{explicit}"
+            );
+            assert_eq!(h.store.issued_grants.load(Ordering::Acquire), issued);
+            assert!(h.store.deferred_tracking.lock().unwrap().contains(&id));
+        } else {
+            assert_eq!(
+                explicit["bundles"].as_array().unwrap().len(),
+                1,
+                "{explicit}"
+            );
+            assert!(!h.store.deferred_tracking.lock().unwrap().contains(&id));
+            let after = h.store.records.lock().unwrap()[&id].clone();
+            assert_eq!(after["roots"], before["roots"]);
+            assert!(after["baseline"].is_null());
+            assert!(after["previousBundleManifest"].is_null());
+            assert_eq!(after["authorizationPending"], false);
+            assert_eq!(after["autosave"], false);
+            assert_ne!(after["status"], "saved");
+        }
+        assert_eq!(h.tracker.performance_counters()["bytesRead"], 0);
+        assert_eq!(h.tracker.performance_counters()["filesHashed"], 0);
+    }
+}
+
+#[test]
+fn deferred_metadata_refresh_cannot_widen_roots_or_replace_native_identity() {
+    let h = full_harness();
+    let base = h.root("legacy-exact");
+    let root = h.root("legacy-exact/App.app");
+    let extra = h.root("legacy-exact/Other.app");
+    fs::write(root.join("actual"), b"unchanged").unwrap();
+    let mut plan = candidate("synthetic.deferred-exact", &root);
+    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let initial = h
+        .tracker
+        .materialize_bundles(&[plan.clone()], &sealed)
+        .unwrap();
+    let id = id_from(&initial);
+    let before = h.store.records.lock().unwrap()[&id].clone();
+    h.store.deferred_tracking.lock().unwrap().insert(id.clone());
+    h.tracker.software().unwrap();
+    let mut another = candidate("synthetic.deferred-exact", &extra)["sourceRoots"][0].clone();
+    another["rootId"] = json!("different-native-root");
+    plan["sourceRoots"].as_array_mut().unwrap().push(another);
+    let widened = authority(&h, &base, &[plan.clone()], true);
+    let issued = h.store.issued_grants.load(Ordering::Acquire);
+    let rejected = h.tracker.refresh_bundles(&[plan], &widened).unwrap();
+    assert!(
+        rejected["bundles"].as_array().unwrap().is_empty(),
+        "{rejected}"
+    );
+    assert_eq!(h.store.issued_grants.load(Ordering::Acquire), issued);
+    assert_eq!(
+        h.store.records.lock().unwrap()[&id]["roots"],
+        before["roots"]
+    );
+    assert!(h.store.deferred_tracking.lock().unwrap().contains(&id));
+}
+
+#[test]
+fn only_explicit_refresh_rechecks_paused_app_authority_and_reconciles_metadata() {
+    let h = full_harness();
+    let base = h.root("refresh-base");
+    let root = h.root("refresh-base/App.app");
+    fs::write(root.join("save"), b"synthetic saved bytes").unwrap();
+    let plan = candidate("synthetic.explicit-refresh", &root);
+    let sealed = authority(&h, &base, &[plan.clone()], true);
+    let initial = h
+        .tracker
+        .materialize_bundles(&[plan.clone()], &sealed)
+        .unwrap();
+    let id = id_from(&initial);
+    let before = h.store.records.lock().unwrap()[&id].clone();
+    *h.store.failing_verification.lock().unwrap() = Some(("tracking".into(), id.clone()));
+    assert_eq!(
+        h.tracker.software().unwrap()[0]["authorizationPending"],
+        true
+    );
+    *h.store.failing_verification.lock().unwrap() = None;
+    let automatic = h
+        .tracker
+        .materialize_bundles(&[plan.clone()], &sealed)
+        .unwrap();
+    assert!(automatic["bundles"].as_array().unwrap().is_empty());
+    assert_eq!(
+        h.tracker.software().unwrap()[0]["authorizationPending"],
+        true
+    );
+    let explicit = h.tracker.refresh_bundles(&[plan], &sealed).unwrap();
+    assert_eq!(
+        explicit["bundles"].as_array().unwrap().len(),
+        1,
+        "{explicit}"
+    );
+    let after = h.store.records.lock().unwrap()[&id].clone();
+    assert_eq!(after["authorizationPending"], false);
+    assert_eq!(after["trackingGrant"], before["trackingGrant"]);
+    assert_eq!(after["baseline"], before["baseline"]);
+    assert_ne!(after["status"], "saved");
+    assert_eq!(h.tracker.performance_counters()["bytesRead"], 0);
+    assert_eq!(h.tracker.performance_counters()["filesHashed"], 0);
+}
+
 #[path = "container_scope_tests.rs"]
 mod container_scope_tests;
 #[path = "index_access_tests.rs"]
@@ -32,7 +176,7 @@ fn candidate(app_id: &str, root: &Path) -> Value {
     }]);
     json!({
         "appId": app_id, "productId": app_id, "displayName": "Isolated real app",
-        "source": "isolated_native_fixture", "platform": "macos",
+        "source": "isolated_native_fixture", "platform": "mac_os",
         "installationIdentity": native, "identityEvidence": evidence,
         "sourceRoots": [{
             "rootId": format!("native:{app_id}"), "path": root,
@@ -2205,7 +2349,11 @@ fn frozen_native_index_rejects_changed_revisions_and_original_mac_revocation() {
         let before = h.tracker.performance_counters();
         let grants = h.store.issued_grants.load(Ordering::Acquire);
         h.store.revoke_grant(kind, &scope).unwrap();
-        assert!(frozen.revalidate().is_err(), "accepted revoked {kind}");
+        let failure = frozen.revalidate().unwrap_err();
+        assert!(
+            !failure.is::<crate::MetadataIndexRevisionChanged>(),
+            "revoked {kind} must not be classified as an ordinary revision race"
+        );
         assert!(frozen.header().is_err());
         assert!(frozen.node_page(0, 1).is_err());
         assert!(h.tracker.freeze_metadata_index(&id).is_err());
@@ -2230,7 +2378,10 @@ fn frozen_native_index_rejects_changed_revisions_and_original_mac_revocation() {
     let header = old.header().unwrap();
     fs::write(root.join("data"), b"actually changed native file").unwrap();
     h.tracker.scan_metadata(&id).unwrap();
-    assert!(old.header().is_err());
+    assert!(old
+        .header()
+        .unwrap_err()
+        .is::<crate::MetadataIndexRevisionChanged>());
     let current = h.tracker.freeze_metadata_index(&id).unwrap();
     assert_ne!(
         current.header().unwrap()["revisionId"],

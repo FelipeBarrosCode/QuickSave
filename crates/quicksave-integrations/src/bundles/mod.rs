@@ -4,6 +4,8 @@
 mod approved;
 mod backend;
 #[cfg(target_os = "macos")]
+pub(crate) mod mac_inventory;
+#[cfg(target_os = "macos")]
 mod mac_security;
 mod planner;
 #[cfg(test)]
@@ -15,9 +17,10 @@ pub use approved::{
     NativeApprovedBundleBackend,
 };
 pub use backend::{
-    BackendKind, DirectoryEntries, FixtureBundleBackend, MacSigningEvidence, MetadataDocument,
-    NativeIdentity, NativeNode, NativeNodeKind, SoftwareBundleBackend, WindowsInstallation,
-    WindowsKnownFolder, WindowsProductIdentity, WindowsReviewedMapping,
+    BackendKind, DirectoryEntries, FixtureBundleBackend, MacApplicationInventory,
+    MacSigningEvidence, MetadataDocument, NativeIdentity, NativeNode, NativeNodeKind,
+    SoftwareBundleBackend, WindowsInstallation, WindowsKnownFolder, WindowsProductIdentity,
+    WindowsReviewedMapping,
 };
 pub use planner::{
     discover_software_bundles, discover_software_bundles_in_scope,

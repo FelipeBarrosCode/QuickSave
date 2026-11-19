@@ -16,7 +16,7 @@ mod scan;
 pub mod scheduler;
 mod trackingresume;
 
-pub use metadata_index::NativeMetadataIndex;
+pub use metadata_index::{MetadataIndexRevisionChanged, NativeMetadataIndex};
 pub use model::{
     file_id, ApprovedRoot, RootIdentity, TrackedSoftware, TrackingClock, TrackingPolicy,
 };
@@ -29,6 +29,18 @@ use scheduler::Scheduler;
 pub use trackingresume::NativeFrozenWork;
 
 use anyhow::{bail, ensure, Context, Result};
+
+/// Denial-only marker supplied by a native store, not renderer input. A spent
+/// explicit refresh can renew a pristine metadata-only enrollment after fully
+/// revalidating its unchanged roots under the current native policy.
+#[derive(Debug)]
+pub struct DeferredLegacyAuthority;
+impl std::fmt::Display for DeferredLegacyAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The prior local approval is deferred. Explicit credential import is required unless an unchanged, never-captured metadata scope can be reapproved.")
+    }
+}
+impl std::error::Error for DeferredLegacyAuthority {}
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -107,6 +119,9 @@ pub(crate) struct Shared {
 }
 
 struct Runtime {
+    // Runtime uncertainty is not consent revocation. Only an explicit scan may
+    // clear it after checking current authority; polling must never resume work.
+    authorization_paused: bool,
     record: TrackedSoftware,
     scheduler: Scheduler,
     baseline: Option<Arc<Snapshot>>,
@@ -199,14 +214,18 @@ impl Tracker {
                 record.last_confirmed_uploaded_generation,
                 0,
             )?;
-            let tracking_valid = store
+            let tracking_check = store
                 .verify_grant("tracking", &record.tracking_scope(), &record.tracking_grant)
-                .unwrap_or(false)
-                && record.auto_enrollment.as_ref().is_none_or(|enrollment| {
-                    enrollment
-                        .verify_record(&record, store.as_ref(), &policy)
-                        .is_ok()
+                .and_then(|valid| {
+                    if valid {
+                        if let Some(enrollment) = &record.auto_enrollment {
+                            enrollment.verify_record(&record, store.as_ref(), &policy)?;
+                        }
+                    }
+                    Ok(valid)
                 });
+            let mut authorization_paused = record.authorization_pending || tracking_check.is_err();
+            let tracking_valid = matches!(tracking_check, Ok(true));
             let mut policy_pending = false;
             if record.pending_work.is_some() {
                 record.unknown_generation = record
@@ -215,7 +234,7 @@ impl Tracker {
                     .context("native restart unknown generation exhausted")?;
                 scheduler.hint(0)?;
             }
-            let baseline = if tracking_valid {
+            let baseline = if tracking_valid && !authorization_paused {
                 for root in &record.roots {
                     let check = scan::PinnedRoot::open(root).and_then(|pinned| {
                         scan::check_policy(&root.path, &policy, root.allowed_files.is_some())?;
@@ -239,6 +258,8 @@ impl Tracker {
                     Ok(baseline) => baseline.map(Arc::new),
                     Err(_) => {
                         // Fail closed: missing/corrupt baseline is not a clean source.
+                        authorization_paused = true;
+                        scheduler.revoke();
                         record.error = Some(
                             "Confirmed baseline is unavailable; reconciliation is required.".into(),
                         );
@@ -247,26 +268,32 @@ impl Tracker {
                 }
             } else {
                 scheduler.revoke();
-                record.autosave = false;
-                record.error = Some(
-                    "Tracking approval is invalid or revoked; approve these roots again.".into(),
-                );
+                if authorization_paused {
+                    record.error = Some("Native approval is temporarily unavailable; explicit verification and reconciliation are required.".into());
+                } else {
+                    record.autosave = false;
+                    record.error = Some(
+                        "Tracking approval is invalid or revoked; approve these roots again."
+                            .into(),
+                    );
+                }
                 None
             };
-            if baseline.is_none() {
-                record.baseline_full_scope = false;
-                record.baseline = None;
-            }
             if record.autosave {
-                let valid = record.autosave_grant.as_ref().is_some_and(|grant| {
-                    store
-                        .verify_grant("autosave", &record.autosave_scope(), grant)
-                        .unwrap_or(false)
-                });
-                if !valid {
-                    record.autosave = false;
-                    record.autosave_grant = None;
-                    record.error = Some("Autosave approval is invalid or revoked.".into());
+                match record.autosave_grant.as_ref().map_or(Ok(false), |grant| {
+                    store.verify_grant("autosave", &record.autosave_scope(), grant)
+                }) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        record.autosave = false;
+                        record.autosave_grant = None;
+                        record.error = Some("Autosave approval is invalid or revoked.".into());
+                    }
+                    Err(_) => {
+                        authorization_paused = true;
+                        scheduler.revoke();
+                        record.error = Some("Native approval is temporarily unavailable; explicit verification and reconciliation are required.".into());
+                    }
                 }
             }
             record.dirty = true;
@@ -296,13 +323,15 @@ impl Tracker {
                 baseline_path_bytes <= model::MAX_PATH_BYTES,
                 "workspace baseline path memory exceeds bounded limit"
             );
-            let current = if tracking_valid {
+            // An unavailable historical proof quarantines the entire current
+            // index, even if the tracking grant itself is presently valid.
+            // Only explicit recovery may reload retained private references.
+            let current = if tracking_valid && !authorization_paused {
                 match bundle::load_index(&record, store.as_ref(), &policy) {
                     Ok(snapshot) => snapshot.map(Arc::new),
                     Err(_) => {
-                        record.tracked = false;
-                        record.bundle_index_source = None;
-                        record.capture_receipt = None;
+                        authorization_paused = true;
+                        scheduler.revoke();
                         record.error = Some("Authenticated bundle index is unavailable; native reconciliation is required.".into());
                         None
                     }
@@ -310,7 +339,7 @@ impl Tracker {
             } else {
                 None
             };
-            if current.is_none() {
+            if current.is_none() && !authorization_paused {
                 record.tracked = false;
             }
             if let Some(source) = current.as_ref().and(record.bundle_index_source.as_ref()) {
@@ -348,6 +377,20 @@ impl Tracker {
                             .to_string()
                     });
             let id = record.id.clone();
+            if authorization_paused && !record.authorization_pending {
+                record.unknown_generation = record
+                    .unknown_generation
+                    .checked_add(1)
+                    .context("native authorization gap generation exhausted")?;
+            }
+            record.authorization_pending = authorization_paused;
+            if authorization_paused {
+                scheduler.revoke();
+                // Failure to persist cannot unpause this running instance.
+                // Source operations remain denied; a later explicit retry
+                // must durably clear the denial latch before work can proceed.
+                let _ = store.save_record(&serde_json::to_value(&record)?);
+            }
             if record.pending_work.is_some() && tracking_valid {
                 // A restart cannot reuse the original zero-valued event/unknown
                 // partition. Persist the checked unknown transition before any
@@ -356,6 +399,7 @@ impl Tracker {
                 store.save_record(&serde_json::to_value(&record)?)?;
             }
             let runtime = Runtime {
+                authorization_paused,
                 record,
                 scheduler,
                 baseline,
@@ -413,10 +457,21 @@ impl Tracker {
         let mut apps = self.shared.apps()?;
         let mut values = Vec::with_capacity(apps.len());
         for app in apps.values_mut() {
-            self.shared.validate_tracking(app)?;
-            self.shared.validate_autosave(app)?;
+            if self.shared.validate_tracking(app).is_ok() {
+                let _ = self.shared.validate_autosave(app);
+            }
             sync_record(app);
-            values.push(app.record.sanitized());
+            let mut value = app.record.sanitized();
+            value["metadataStale"] = json!(app.authorization_paused || app.scheduler.paused);
+            value["authorizationPending"] = json!(app.authorization_paused);
+            if app.authorization_paused {
+                value["tracked"] = json!(false);
+                value["fileCount"] = Value::Null;
+                value["logicalBytes"] = Value::Null;
+                value["roots"] = json!([]);
+                value["bundle"] = Value::Null;
+            }
+            values.push(value);
         }
         Ok(values)
     }
@@ -599,6 +654,7 @@ impl Tracker {
             .map(|r| r.scheduler.last_confirmed_uploaded_generation)
             .unwrap_or(0);
         let mut record = TrackedSoftware {
+            authorization_pending: false,
             id: id.clone(),
             app_id,
             source_identity: input
@@ -669,6 +725,7 @@ impl Tracker {
             .save_record(&serde_json::to_value(&record)?)?;
         let result = record.sanitized();
         let runtime = Runtime {
+            authorization_paused: false,
             scheduler: Scheduler::new(dirty_generation, confirmed, self.shared.now())?,
             record,
             baseline: None,
@@ -936,7 +993,12 @@ impl Tracker {
         let app = apps
             .get_mut(software_id)
             .context("unknown tracked software")?;
-        self.shared.reconcile(app, true)?;
+        self.shared.verify_paused_authority(app)?;
+        let result = self.shared.reconcile(app, true);
+        if result.is_err() && app.record.authorization_pending {
+            let _ = self.shared.pause_authorization(app);
+        }
+        result?;
         Ok(json!({
             "software": app.record.sanitized(),
             "captureSource": self.shared.capture_source(app)?
@@ -950,7 +1012,12 @@ impl Tracker {
         let app = apps
             .get_mut(software_id)
             .context("unknown tracked software")?;
-        self.shared.reconcile_mode(app, false, false)?;
+        self.shared.verify_paused_authority(app)?;
+        let result = self.shared.reconcile_mode(app, false, false);
+        if result.is_err() && app.record.authorization_pending {
+            let _ = self.shared.pause_authorization(app);
+        }
+        result?;
         Ok(json!({"software": app.record.sanitized(),
             "captureSource": self.shared.capture_source(app)?}))
     }
@@ -1393,23 +1460,33 @@ impl Shared {
         if self.uncertainty_epoch.load(Ordering::Acquire) != app.observation_uncertainty_epoch {
             app.force_hash = true;
         }
-        let valid = self
+        let verification = self
             .store
             .verify_grant(
                 "tracking",
                 &app.record.tracking_scope(),
                 &app.record.tracking_grant,
             )
-            .unwrap_or(false)
-            && app
-                .record
-                .auto_enrollment
-                .as_ref()
-                .is_none_or(|enrollment| {
-                    enrollment
-                        .verify_record(&app.record, self.store.as_ref(), &self.policy)
-                        .is_ok()
-                });
+            .and_then(|valid| {
+                if valid {
+                    if let Some(enrollment) = &app.record.auto_enrollment {
+                        enrollment.verify_record(&app.record, self.store.as_ref(), &self.policy)?;
+                    }
+                }
+                Ok(valid)
+            });
+        let valid = match verification {
+            Ok(valid) => valid,
+            Err(error) => {
+                self.pause_authorization(app)?;
+                if error.is::<DeferredLegacyAuthority>() {
+                    return Err(error);
+                }
+                bail!(
+                    "native tracking authority is unavailable; explicit verification is required"
+                );
+            }
+        };
         if !valid {
             let had_watch = !app.scheduler.paused || app.watch_ok;
             app.scheduler.revoke();
@@ -1424,18 +1501,126 @@ impl Shared {
             }
             sync_record(app);
         }
+        ensure!(
+            !app.authorization_paused,
+            "native tracking authority requires explicit verification"
+        );
+        Ok(())
+    }
+
+    fn pause_authorization(&self, app: &mut Runtime) -> Result<()> {
+        if app.authorization_paused {
+            sync_record(app);
+            return Ok(());
+        }
+        app.authorization_paused = true;
+        app.record.authorization_pending = true;
+        app.scheduler.revoke();
+        app.force_hash = true;
+        app.watch_ok = false;
+        app.record.error = Some("Native approval is temporarily unavailable; explicit verification and reconciliation are required.".into());
+        self.reconfigure.store(true, Ordering::Release);
+        sync_record(app);
+        // Exhaustion must leave the denial latch raised, not an authorized DTO.
+        app.record.unknown_generation = app
+            .record
+            .unknown_generation
+            .checked_add(1)
+            .context("native authorization gap generation exhausted")?;
+        self.store.save_record(&serde_json::to_value(&app.record)?)
+    }
+
+    fn verify_paused_authority(&self, app: &mut Runtime) -> Result<()> {
+        if !app.authorization_paused {
+            return Ok(());
+        }
+        // Keep the latch set on every error, including errors in autosave proof.
+        ensure!(
+            self.store.verify_grant(
+                "tracking",
+                &app.record.tracking_scope(),
+                &app.record.tracking_grant
+            )?,
+            "tracking approval is revoked"
+        );
+        if let Some(enrollment) = &app.record.auto_enrollment {
+            enrollment.verify_record(&app.record, self.store.as_ref(), &self.policy)?;
+        }
+        if app.record.autosave {
+            let grant = app
+                .record
+                .autosave_grant
+                .as_ref()
+                .context("autosave approval is missing")?;
+            ensure!(
+                self.store
+                    .verify_grant("autosave", &app.record.autosave_scope(), grant)?,
+                "autosave approval is revoked"
+            );
+        }
+        // Startup during a vault outage deliberately did not load these. Restore
+        // them under the original bounds before any scan may compare/delete.
+        if app.baseline.is_none() && app.record.baseline.is_some() {
+            let baseline = scan::load_baseline(&app.record, self.store.as_ref(), &self.policy)?
+                .context("confirmed baseline is unavailable")?;
+            let entries = self
+                .baseline_entries
+                .load(Ordering::Acquire)
+                .checked_add(baseline.nodes.len())
+                .context("baseline entry count overflow")?;
+            let paths = self
+                .baseline_path_bytes
+                .load(Ordering::Acquire)
+                .checked_add(baseline.path_bytes()?)
+                .context("baseline path count overflow")?;
+            ensure!(
+                entries <= MAX_FILES && paths <= model::MAX_PATH_BYTES,
+                "workspace baseline exceeds bounded limits"
+            );
+            self.baseline_entries.store(entries, Ordering::Release);
+            self.baseline_path_bytes.store(paths, Ordering::Release);
+            app.baseline = Some(Arc::new(baseline));
+        }
+        if app.current.is_none() && app.record.bundle_index_source.is_some() {
+            let current = bundle::load_index(&app.record, self.store.as_ref(), &self.policy)?
+                .context("authenticated bundle index is unavailable")?;
+            self.replace_current(app, Arc::new(current))?;
+        }
+        // The persistent denial latch remains raised until the explicit
+        // reconciliation has completed and its new index is ready to persist.
+        app.authorization_paused = false;
+        app.scheduler.resume(self.now());
+        app.force_hash = true;
+        app.record.error = None;
+        self.reconfigure.store(true, Ordering::Release);
         Ok(())
     }
 
     fn validate_autosave(&self, app: &mut Runtime) -> Result<bool> {
+        ensure!(
+            !app.authorization_paused,
+            "native approval requires explicit verification"
+        );
         if !app.record.autosave {
             return Ok(false);
         }
-        let valid = app.record.autosave_grant.as_ref().is_some_and(|grant| {
-            self.store
-                .verify_grant("autosave", &app.record.autosave_scope(), grant)
-                .unwrap_or(false)
-        });
+        let verification = app
+            .record
+            .autosave_grant
+            .as_ref()
+            .map_or(Ok(false), |grant| {
+                self.store
+                    .verify_grant("autosave", &app.record.autosave_scope(), grant)
+            });
+        let valid = match verification {
+            Ok(valid) => valid,
+            Err(_) => {
+                self.pause_authorization(app)?;
+                bail!(
+                    "native autosave authority is unavailable; explicit verification is required"
+                );
+            }
+        };
         if !valid {
             app.record.autosave = false;
             app.record.autosave_grant = None;
@@ -1586,7 +1771,18 @@ impl Shared {
                     app.scheduler.hint(self.now())?;
                     app.force_hash = true;
                 }
-                self.persist(app)?;
+                if app.record.authorization_pending {
+                    app.record.authorization_pending = false;
+                    sync_record(app);
+                    if let Err(error) = self.store.save_record(&serde_json::to_value(&app.record)?)
+                    {
+                        app.record.authorization_pending = true;
+                        let _ = self.pause_authorization(app);
+                        return Err(error).context("persist explicitly reconciled authority");
+                    }
+                } else {
+                    self.persist(app)?;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2132,7 +2328,9 @@ fn sync_record(app: &mut Runtime) {
     app.record.last_confirmed_uploaded_generation =
         app.scheduler.last_confirmed_uploaded_generation;
     app.record.dirty = app.scheduler.content_dirty || app.scheduler.needs_reconcile;
-    app.record.status = if app.scheduler.paused {
+    app.record.status = if app.authorization_paused {
+        "needs_authorization"
+    } else if app.scheduler.paused {
         "error"
     } else if app.pending.is_some() {
         "uploading"

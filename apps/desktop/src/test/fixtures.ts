@@ -95,6 +95,8 @@ export function respond(command: string, args?: Record<string, unknown>): unknow
   if (command === 'workspace_execute') return dashboard
   if (command !== 'workspace_query') throw new Error(`Unexpected test-only command: ${command}`)
   switch (args?.query) {
+    case 'vault_status': return { format: 'encrypted_state', secretsInPlaintext: false, nativeAuthorizationVerified: false }
+    case 'vault_readiness': return { ready: true }
     case 'dashboard': return dashboard
     case 'provider_types': return providerTypes
     case 'software': return { software: [software] }

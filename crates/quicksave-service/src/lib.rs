@@ -245,6 +245,8 @@ pub struct WorkspaceService {
     previews: Mutex<BTreeMap<String, Preview>>,
     restore_previews: Mutex<BTreeMap<String, RestorePreview>>,
     app_tracking: Mutex<Value>,
+    tracking_authorization_issues: Mutex<Vec<Value>>,
+    history_initialization_failed: AtomicBool,
     healthy: Mutex<BTreeMap<String, String>>,
     catalog: catalog::CatalogCache,
     batch: tokio::sync::OnceCell<Arc<batch::NativeBatchRuntime>>,
@@ -262,6 +264,16 @@ impl WorkspaceService {
     /// locations. Not an IPC option and never selected from browser parameters.
     pub async fn open_isolated(data_dir: &Path, home: &Path) -> Result<Arc<Self>> {
         native::open(data_dir, home, true).await
+    }
+
+    /// Explicit synthetic vault injection shared with an isolated native host.
+    /// Never used by production open; does not access the operating-system vault.
+    pub async fn open_isolated_with_vault(
+        data_dir: &Path,
+        home: &Path,
+        vault: Arc<dyn quicksave_state::CredentialVault>,
+    ) -> Result<Arc<Self>> {
+        native::open_with_vault(data_dir, home, true, Some(vault)).await
     }
 
     /// Isolated integration constructor. These injected implementations are the
@@ -322,6 +334,8 @@ impl WorkspaceService {
             operations: Mutex::new(BTreeMap::new()),
             previews: Mutex::new(BTreeMap::new()),
             restore_previews: Mutex::new(BTreeMap::new()),
+            tracking_authorization_issues: Mutex::new(Vec::new()),
+            history_initialization_failed: AtomicBool::new(false),
             app_tracking: Mutex::new(
                 json!({"enabled":false,"state":"disabled","scanning":false,"canRefresh":false,"diagnostics":[]}),
             ),
@@ -600,6 +614,16 @@ impl WorkspaceService {
             records.len() <= 4096,
             "Tracked software exceeds the bounded limit"
         );
+        let pending = records.iter().filter(|record|record["authorizationPending"] == true)
+            .take(128).map(|record|json!({
+                "appId":record["appId"],"name":record["name"],
+                "code":"tracking_authorization_unavailable",
+                "message":"This stored application's authorization is temporarily unavailable. Its approvals and history are retained; it is not counted as a verified bundle or Saved.",
+            })).collect::<Vec<_>>();
+        *self
+            .tracking_authorization_issues
+            .lock()
+            .map_err(|_| anyhow!("Tracking diagnostic lock failed"))? = pending;
         let output = records
             .iter()
             .filter(|record| record["tracked"] == true)
@@ -633,14 +657,21 @@ impl WorkspaceService {
             })
             .collect::<Result<Vec<_>>>()?;
         let software = self.software().await?;
-        let activity = self.activities().await?;
+        let (activity, activity_unavailable) = match self.activities().await {
+            Ok(activity) => (activity, false),
+            Err(_) => (Vec::new(), true),
+        };
         Ok(json!({
             "summary":{
                 "needsBackup":software.iter().filter(|s| s["tracked"] == true && (s["dirty"] == true || s["status"] == "needs_backup")).count(),
                 "autosaveEnabled":software.iter().filter(|s| s["autosave"] == true).count(),
                 "connectedProviders":providers.iter().filter(|p| p["status"] == "connected").count(),
             },
-            "providers":providers,"software":software,"activity":activity
+            "providers":providers,"software":software,"activity":activity,
+            "activityUnavailable":activity_unavailable,
+            "activityIssue":if activity_unavailable {
+                Some("History could not be authenticated or loaded. Existing work is retained; local tracking is independent. No completion or cancellation is inferred.")
+            } else {None::<&str>},
         }))
     }
 
@@ -1194,6 +1225,10 @@ impl WorkspaceService {
         retry_native: Option<String>,
         expected_capture: Option<Value>,
     ) -> Result<Value> {
+        ensure!(
+            kind == "connect" || !self.history_initialization_failed.load(Ordering::Acquire),
+            "Existing native history is unavailable; new data operations remain blocked"
+        );
         let active = Active::acquire(&self.lifetime, true)?;
         let id = Uuid::new_v4().to_string();
         let name = match kind {
@@ -2181,6 +2216,10 @@ impl WorkspaceService {
     }
 
     async fn activities(&self) -> Result<Vec<Value>> {
+        ensure!(
+            !self.history_initialization_failed.load(Ordering::Acquire),
+            "Native history is unavailable; no existing work was discarded"
+        );
         let mut values = self
             .operations
             .lock()

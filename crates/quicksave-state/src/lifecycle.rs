@@ -42,7 +42,7 @@ impl WorkspaceStore {
     /// Never accept an expected generation supplied by JavaScript as authority.
     pub fn provider_credential_generation(&self, provider_id: &str) -> Result<u64> {
         validate_id(provider_id)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter()
@@ -52,12 +52,14 @@ impl WorkspaceStore {
                 provider.status != "disconnected",
                 "Provider is disconnected"
             );
-            Ok(self.read_secret(provider)?.credential_generation)
+            Ok(self
+                .read_secret_with_access(vault, provider)?
+                .credential_generation)
         })
     }
     pub fn oauth_reauthorization_profile(&self, provider_id: &str) -> Result<NativeOAuthProfile> {
         validate_id(provider_id)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let provider = document
                 .providers
                 .iter()
@@ -71,7 +73,7 @@ impl WorkspaceStore {
                 parse_kind(&provider.kind)?.is_oauth(),
                 "Provider does not use OAuth"
             );
-            let secret = self.read_secret(provider)?;
+            let secret = self.read_secret_with_access(vault, provider)?;
             let client_id = secret
                 .provider_fields
                 .get("client_id")
@@ -123,7 +125,7 @@ impl WorkspaceStore {
     ) -> Result<u64> {
         validate_id(provider_id)?;
         crate::bounded_json(credentials, 1024 * 1024)?;
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let position = document
                 .providers
                 .iter()
@@ -144,9 +146,11 @@ impl WorkspaceStore {
                     "Explicit OAuth reauthorization requires an actual offline refresh token"
                 );
             }
-            let mut secret = self.read_secret(&provider).map_err(|_| {
-                anyhow::anyhow!("Native reauthorization profile is unavailable or changed")
-            })?;
+            let mut secret = self
+                .read_secret_with_access(vault, &provider)
+                .map_err(|_| {
+                    anyhow::anyhow!("Native reauthorization profile is unavailable or changed")
+                })?;
             ensure!(
                 secret.credential_generation == expected_generation,
                 "Provider credentials changed during native reauthorization"
@@ -163,7 +167,7 @@ impl WorkspaceStore {
                 .context("Provider authority revision exhausted")?;
             let mut session = secret.session("native-reauthorization")?;
             crate::zeroize_json(&mut session);
-            self.write_secret(&provider.credential_ref, &secret)
+            self.write_secret(vault, &provider.credential_ref, &secret)
                 .map_err(|_| {
                     anyhow::anyhow!("Native reauthorization persistence failed verification")
                 })?;
@@ -173,7 +177,7 @@ impl WorkspaceStore {
             changed.authority_revision = secret.authority_revision;
             for software in &mut document.software {
                 if software.provider_id.as_deref() == Some(provider_id) {
-                    self.revoke_bound("autosave", &json!({"softwareId":software.id}))?;
+                    self.revoke_bound(vault, "autosave", &json!({"softwareId":software.id}))?;
                     software.autosave = false;
                     software.autosave_grant = None;
                 }
@@ -220,7 +224,7 @@ impl WorkspaceStore {
             root.identity()? == request.parent_identity,
             "Native recovery-export parent changed"
         );
-        self.transaction(|document| {
+        self.transaction_with_secrets(|document, vault| {
             let account = match request.provider_id.as_deref() {
                 Some(id) => {
                     validate_id(id)?;
@@ -230,7 +234,7 @@ impl WorkspaceStore {
                         .find(|provider| provider.id == id)
                         .context("Recovery export provider not found")?;
                     if provider.status != "disconnected" {
-                        self.read_secret(provider)?;
+                        self.read_secret_with_access(vault, provider)?;
                     }
                     // A disconnected import retains its key in this deterministic
                     // QuickSave namespace, independently of deleted credentials.
@@ -272,9 +276,7 @@ impl WorkspaceStore {
                     "Recovery key must be external to QuickSave state and approved capture roots"
                 );
             }
-            let encoded = self
-                .inner
-                .vault
+            let encoded = vault
                 .read(QUICKSAVE_VAULT_SERVICE, &account)?
                 .context("The selected repository key is unavailable in the native vault")?;
             let key = decode_key(&encoded)?;

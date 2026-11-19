@@ -642,9 +642,7 @@ impl NativeEngine {
                 executable.is_absolute(),
                 "application executable identity must be absolute"
             );
-            SourcePath::new(executable)?
-                .open_regular()
-                .map_err(public_source_error)?;
+            verify_application_executable_metadata(executable)?;
         }
         identity.display_name = name.clone();
         self.agent
@@ -1729,6 +1727,27 @@ impl NativeEngine {
         }
         Ok(value)
     }
+}
+
+/// Registration/index import is metadata-only. Actual capture still needs
+/// readable stable handles for every selected payload; executable identity must
+/// not implicitly add its bytes to a data-only policy.
+fn verify_application_executable_metadata(executable: &Path) -> Result<()> {
+    ensure!(
+        executable.is_absolute(),
+        "application executable identity must be absolute"
+    );
+    let parent = SafeRoot::open(executable.parent().context("executable has no parent")?)?;
+    let leaf = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("executable filename is not supported")?;
+    let before = parent.file_metadata(leaf)?;
+    ensure!(
+        parent.file_metadata(leaf)? == before,
+        "application executable identity changed"
+    );
+    Ok(())
 }
 
 fn public_source_error(error: StateError) -> anyhow::Error {

@@ -1,0 +1,72 @@
+name: Windows desktop build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Unsigned Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Preserve audited source bytes
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Verify upstream provenance and repository boundaries
+        run: python scripts/verify_repository.py
+
+      - name: Install locked frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Test frontend
+        working-directory: apps/desktop
+        run: npm test
+
+      - name: Check native Windows test sources
+        run: cargo check --locked --target x86_64-pc-windows-msvc -p quicksave-integrations -p quicksave-service --tests
+
+      - name: Build unsigned NSIS installer
+        working-directory: apps/desktop
+        run: npm run build:native -- --ci --no-sign --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: quicksave-windows-x64-unsigned-${{ github.sha }}
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

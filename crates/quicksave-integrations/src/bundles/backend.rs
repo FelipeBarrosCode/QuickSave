@@ -90,6 +90,40 @@ pub struct DirectoryEntries {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct MacApplicationInventory {
+    pub paths: Vec<PathBuf>,
+    pub incomplete: bool,
+}
+
+/// Static, redacted failure stage; never an OS exception body or app path.
+#[derive(Debug)]
+pub(crate) struct MacInventoryFailure(pub &'static str);
+impl std::fmt::Display for MacInventoryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for MacInventoryFailure {}
+
+impl MacInventoryFailure {
+    pub(crate) fn message(&self) -> &'static str {
+        match self.0 {
+            "native_inventory_approved_base" =>
+                "Native app discovery failed while validating an approved installation base.",
+            "native_inventory_response_decode" =>
+                "Native app discovery returned a response that failed Rust protocol validation.",
+            "native_inventory_workspace" =>
+                "Native app discovery failed in NSWorkspace application URL lookup.",
+            "native_inventory_metadata" =>
+                "Native app discovery failed in Spotlight metadata query setup or result processing.",
+            "native_inventory_encode" =>
+                "Native app discovery failed while encoding its bounded response.",
+            _ => "Native app discovery failed at its bounded bridge or input-validation stage.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacSigningEvidence {
     /// None means an unsigned/unverifiable installation, never a verified empty
@@ -209,6 +243,15 @@ pub trait SoftwareBundleBackend {
     fn inspect_native(&mut self, path: &Path) -> Result<Option<NativeNode>>;
     fn list_directory(&mut self, path: &Path, maximum: usize) -> Result<Option<DirectoryEntries>>;
     fn read_metadata(&mut self, path: &Path, maximum: usize) -> Result<Option<MetadataDocument>>;
+    /// Candidate hints, never ownership or root authority. None permits only
+    /// isolated legacy fixtures, not a production folder-scanning fallback.
+    fn mac_application_inventory(
+        &mut self,
+        _scopes: &[PathBuf],
+        _maximum: usize,
+    ) -> Result<Option<MacApplicationInventory>> {
+        Ok(None)
+    }
     fn mac_signing_evidence(&mut self, _bundle: &Path) -> Result<MacSigningEvidence> {
         Ok(MacSigningEvidence::unavailable())
     }
@@ -266,6 +309,21 @@ pub(crate) struct NativeFilesystemBackend;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl SoftwareBundleBackend for NativeFilesystemBackend {
+    fn mac_application_inventory(
+        &mut self,
+        scopes: &[PathBuf],
+        maximum: usize,
+    ) -> Result<Option<MacApplicationInventory>> {
+        #[cfg(target_os = "macos")]
+        {
+            super::mac_inventory::discover(scopes, maximum).map(Some)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (scopes, maximum);
+            bail!("macOS native application inventory is unsupported")
+        }
+    }
     fn platform(&self) -> Platform {
         Platform::current()
     }
@@ -274,43 +332,26 @@ impl SoftwareBundleBackend for NativeFilesystemBackend {
     }
 
     fn inspect_native(&mut self, path: &Path) -> Result<Option<NativeNode>> {
-        use crate::reader::Directory;
-        use std::os::unix::fs::MetadataExt;
         validate_path(path)?;
-        let metadata = match Directory::open(path) {
-            Ok(directory) => directory.metadata()?,
+        if path.parent().is_none() {
+            let root = quicksave_platform::SafeRoot::open(path)?;
+            return inspect_pinned_node(&root, None);
+        }
+        let parent = match quicksave_platform::SafeRoot::open(
+            path.parent().context("path has no parent")?,
+        ) {
+            Ok(parent) => parent,
             Err(error) if is_missing(&error) => return Ok(None),
-            Err(_) => {
-                let parent = match Directory::open(path.parent().context("path has no parent")?) {
-                    Ok(parent) => parent,
-                    Err(error) if is_missing(&error) => return Ok(None),
-                    Err(error) => return Err(error),
-                };
-                match parent.regular_file_metadata(
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .context("invalid filename")?,
-                ) {
-                    Ok(metadata) => metadata,
-                    Err(error) if is_missing(&error) => return Ok(None),
-                    Err(error) => return Err(error),
-                }
-            }
+            Err(error) => return Err(error),
         };
-        Ok(Some(NativeNode {
-            identity: identity(&metadata)?,
-            byte_length: metadata.len(),
-            executable: metadata.is_file() && metadata.mode() & 0o111 != 0,
-            change_token: format!(
-                "{}:{}:{}:{}:{}:{}",
-                metadata.len(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-                metadata.mode()
+        inspect_pinned_node(
+            &parent,
+            Some(
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .context("invalid filename")?,
             ),
-        }))
+        )
     }
 
     fn list_directory(&mut self, path: &Path, maximum: usize) -> Result<Option<DirectoryEntries>> {
@@ -392,6 +433,119 @@ fn is_missing(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Inspect either supported leaf kind once, without retrying a failed directory
+/// open as a file open. Parent traversal stays inside the retained SafeRoot.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn inspect_pinned_node(
+    root: &quicksave_platform::SafeRoot,
+    relative: Option<&str>,
+) -> Result<Option<NativeNode>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    fn node(metadata: &std::fs::Metadata) -> Result<NativeNode> {
+        Ok(NativeNode {
+            identity: identity(metadata)?,
+            byte_length: metadata.len(),
+            executable: metadata.is_file() && metadata.mode() & 0o111 != 0,
+            change_token: format!(
+                "{}:{}:{}:{}:{}:{}",
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.mode()
+            ),
+        })
+    }
+    let Some(relative) = relative else {
+        return Ok(Some(node(
+            &root.clone_root_directory_handle()?.metadata()?,
+        )?));
+    };
+    let path = Path::new(relative);
+    ensure!(
+        !path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "native leaf must remain below its retained root"
+    );
+    let name = CString::new(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid native leaf")?,
+    )?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let open_parent = || match parent {
+        Some(parent) => root.open_directory(parent.to_str().context("invalid native parent")?),
+        None => root.clone_root_directory_handle(),
+    };
+    let directory = match open_parent() {
+        Ok(directory) => directory,
+        Err(error) if is_missing(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let stat_leaf = || -> Result<libc::stat> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: a live pinned directory, NUL-terminated leaf, and writable stat.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(unsafe { stat.assume_init() })
+    };
+    let before = match stat_leaf() {
+        Ok(stat) => stat,
+        Err(error) if is_missing(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let kind = before.st_mode & libc::S_IFMT;
+    ensure!(
+        kind == libc::S_IFDIR || kind == libc::S_IFREG,
+        "unsupported or linked native leaf"
+    );
+    // SAFETY: no creation/truncation, no link following, and no blocking FIFO
+    // opens if an attacker swaps the validated regular/directory leaf.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    let after = stat_leaf()?;
+    for stat in [&before, &after] {
+        ensure!(
+            stat.st_dev as u64 == metadata.dev()
+                && stat.st_ino as u64 == metadata.ino()
+                && stat.st_mode as u32 == metadata.mode(),
+            "native leaf changed while opening"
+        );
+    }
+    ensure!(
+        identity(&open_parent()?.metadata()?)? == identity(&directory.metadata()?)?,
+        "native parent changed while inspecting leaf"
+    );
+    Ok(Some(node(&metadata)?))
 }
 
 /// Isolated filesystem fixtures only. All paths, including injected installation

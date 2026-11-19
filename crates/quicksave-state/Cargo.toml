@@ -20,15 +20,19 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 zeroize = "1.8"
+chacha20poly1305 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+security-framework = "3"
+core-foundation = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+libdbus-sys = { version = "=0.2.7", features = ["vendored"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["windows-native"] }

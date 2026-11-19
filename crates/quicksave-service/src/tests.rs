@@ -661,6 +661,29 @@ fn upload() -> Value {
 }
 
 #[tokio::test]
+async fn unavailable_history_does_not_hide_local_tracking_or_admit_new_data_operations() {
+    let fixture = Fixture::new(false);
+    fixture
+        .service
+        .history_initialization_failed
+        .store(true, Ordering::Release);
+    let dashboard = fixture.service.dashboard().await.unwrap();
+    assert_eq!(dashboard["activityUnavailable"], true);
+    assert!(dashboard["activityIssue"]
+        .as_str()
+        .unwrap()
+        .contains("retained"));
+    assert!(!dashboard["software"].as_array().unwrap().is_empty());
+    assert!(fixture.service.activities().await.is_err());
+    assert!(fixture
+        .service
+        .execute_authorized("upload", upload())
+        .await
+        .is_err());
+    assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn configuration_is_not_connection_and_discovery_is_not_tracking() {
     let fixture = Fixture::new(false);
     let dashboard = fixture.service.query("dashboard", json!({})).await.unwrap();

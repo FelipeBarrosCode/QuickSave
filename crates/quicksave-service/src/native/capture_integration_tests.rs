@@ -1155,7 +1155,25 @@ fn assert_marker_order(io: &FixtureIo) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_tracker_source_capture_confirms_original_work_and_additive_empty_history(
 ) -> Result<()> {
+    actual_full_capture_history(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_state_migration_preserves_actual_capture_empty_history_and_source_optimizations(
+) -> Result<()> {
+    actual_full_capture_history(true).await
+}
+
+async fn actual_full_capture_history(encrypted_state: bool) -> Result<()> {
     let fixture = Fixture::create()?;
+    if encrypted_state {
+        fixture.store.migrate_to_encrypted_state()?;
+        assert_eq!(
+            fixture.store.encrypted_vault_status()?["format"],
+            "encrypted_state"
+        );
+        assert!(fixture.store.verify_tracking_grant(SOFTWARE)?);
+    }
     let first_work = fixture.prepare(None)?;
     assert_eq!(
         fixture.tracking.tracker()?.performance_counters()["bytesRead"],
@@ -1390,7 +1408,9 @@ async fn actual_selected_capture_is_custom_and_empty_selection_never_grants_full
         )
         .is_err());
     let selected = [fixture.file_id("save.dat")?];
-    let partial_work = fixture.prepare(Some(&selected))?;
+    let partial_work = fixture
+        .prepare(Some(&selected))
+        .context("initial selected capture")?;
     assert_eq!(
         partial_work.work["captureSource"]["selectionKind"],
         "selected_nodes"
@@ -1429,12 +1449,16 @@ async fn actual_selected_capture_is_custom_and_empty_selection_never_grants_full
     let baseline = fixture.assert_baseline(&partial_work, false)?;
     assert_eq!(baseline["nodes"].as_object().unwrap().len(), 1);
 
-    let whole_work = fixture.prepare(None)?;
+    let whole_work = fixture
+        .prepare(None)
+        .context("whole capture after selected completion")?;
     let whole = fixture.execute(&whole_work).await?;
     assert_eq!(whole.mode, BackupMode::CompleteApplication);
     assert_eq!(fixture.complete(&whole_work)?["sourceConfirmed"], true);
     fixture.assert_baseline(&whole_work, true)?;
-    let later_partial_work = fixture.prepare(Some(&selected))?;
+    let later_partial_work = fixture
+        .prepare(Some(&selected))
+        .context("selected capture after whole completion")?;
     let later_partial = fixture.execute(&later_partial_work).await?;
     assert_eq!(later_partial.mode, BackupMode::Custom);
     let catalog = noland_storage::load_catalog(&fixture.storage, &fixture.master).await?;

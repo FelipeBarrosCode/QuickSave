@@ -2275,7 +2275,18 @@ async fn restarted_dashboard_discovers_original_admitted_group_without_execution
         fixture.state.provider_accesses.load(Ordering::SeqCst),
         access
     );
-    assert_eq!(fixture.vault.access_log().unwrap(), vault);
+    let after_vault = fixture.vault.access_log().unwrap();
+    assert_eq!(after_vault["writes"], vault["writes"]);
+    let before_reads = vault["reads"].as_array().unwrap();
+    let after_reads = after_vault["reads"].as_array().unwrap();
+    assert_eq!(&after_reads[..before_reads.len()], before_reads.as_slice());
+    // Historical MAC checks retain their cached device key, but must freshly
+    // reject a legacy-state rollback after another process migrates the vault.
+    // These presence checks never load provider/execution credentials.
+    assert!(after_reads[before_reads.len()..]
+        .iter()
+        .all(|read| read[0] == quicksave_state::QUICKSAVE_VAULT_SERVICE
+            && read[1] == "QuickSaveEncryptedStateVault.v1"));
     assert!(fixture.engine.reauthentications.lock().unwrap().is_empty());
     assert!(fixture
         .engine

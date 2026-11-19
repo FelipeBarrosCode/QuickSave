@@ -3,17 +3,42 @@ use super::*;
 use noland_state_core::{BackupMode, BackupPerformanceMode, OperationRecord, RestoreMode};
 use noland_storage::LocalStorage;
 
+#[test]
+fn registration_executable_check_is_metadata_only_and_rejects_nonfiles_and_aliases() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
+    let executable = temp.path().join("synthetic-executable");
+    std::fs::write(&executable, b"not executed or payload-read")?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o000))?;
+    let result = verify_application_executable_metadata(&executable);
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600))?;
+    result?;
+    let link = temp.path().join("alias");
+    symlink(&executable, &link)?;
+    assert!(verify_application_executable_metadata(&link).is_err());
+    assert!(verify_application_executable_metadata(temp.path()).is_err());
+    assert!(verify_application_executable_metadata(Path::new("relative")).is_err());
+    Ok(())
+}
+
 fn fixture_restore_control(
     plan: &noland_restore::RestorePlan,
     destination: &Path,
 ) -> Result<Arc<noland_restore::NativeRestoreControl>> {
     let identity = SafeRoot::open(destination)?.identity()?;
     let controller = restore_control::NativeRestoreController::new(Arc::new(|bytes| {
-        Ok(*blake3::keyed_hash(&[0x39;32], bytes).as_bytes())
+        Ok(*blake3::keyed_hash(&[0x39; 32], bytes).as_bytes())
     }));
-    let preview = controller.preview(plan.restore_id, &plan.manifest, destination,
-        noland_restore::NativeObjectId { device:identity.device,file_id:identity.file_id },
-        noland_restore::NativeConflictMode::CreateOnly)?;
+    let preview = controller.preview(
+        plan.restore_id,
+        &plan.manifest,
+        destination,
+        noland_restore::NativeObjectId {
+            device: identity.device,
+            file_id: identity.file_id,
+        },
+        noland_restore::NativeConflictMode::CreateOnly,
+    )?;
     // Fixture-owned consent and device key, never an incoming JSON flag.
     controller.approve(preview, Arc::new(|| Ok(())))
 }

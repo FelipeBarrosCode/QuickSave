@@ -374,6 +374,8 @@ mod native {
 }
 
 #[cfg(unix)]
+pub(crate) use native::LockedState;
+#[cfg(unix)]
 pub use native::StateFile;
 
 #[cfg(windows)]
@@ -441,6 +443,8 @@ mod windows {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use windows::LockedState;
 #[cfg(windows)]
 pub use windows::StateFile;
 

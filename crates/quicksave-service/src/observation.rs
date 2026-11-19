@@ -1061,6 +1061,13 @@ impl NativeIndexOwner for SourceMetadataIndexOwner {
         );
         self.frozen.revalidate()?;
         let record = self.tracker.bundle_record(&scope.software_id)?;
+        if record["bundleIndexSource"]["revisionId"] != scope.revision_id
+            || record["bundleIndexSource"]["snapshotIdentity"] != scope.snapshot_identity
+        {
+            // Classify only through the frozen owner's fresh authority checks.
+            // A changed root/grant/policy is not a retryable metadata race.
+            self.frozen.revalidate()?;
+        }
         ensure!(
             record["appId"] == scope.instance_id
                 && record["sourceIdentity"]["app_id"] == scope.app_id
@@ -1227,9 +1234,12 @@ pub(super) fn materialize_source_indices(
                 && !software.chars().any(char::is_control),
             "actual native bundle ID exceeds bound"
         );
-        let result = (|| -> Result<Value> {
+        let mut stage = "load_verified_record";
+        let result = retry_metadata_revision(|| -> Result<Value> {
             let record = tracker.bundle_record(software)?;
+            stage = "bind_index_scope";
             let scope = source_index_scope(&record)?;
+            stage = "verify_current_policy";
             let authority = tracker.root_authority(software)?;
             ensure!(
                 record["autoEnrollment"]["policyScope"] == policy["policyScope"]
@@ -1239,9 +1249,21 @@ pub(super) fn materialize_source_indices(
             );
             // Drop our obsolete read lease, not data, history or root authority,
             // before asking Tracker to charge its current bounded native owner.
+            stage = "release_previous_index_lease";
             engine.native_release_index_owner(software)?;
+            stage = "freeze_metadata_index";
             let frozen = tracker.freeze_metadata_index(software)?;
+            stage = "verify_frozen_header";
             let header = frozen.header()?;
+            if header["softwareId"] == scope.software_id
+                && header["appId"] == scope.app_id
+                && header["instanceId"] == scope.instance_id
+                && header["trackingScopeHash"] == scope.tracking_scope_hash
+                && (header["revisionId"] != scope.revision_id
+                    || header["snapshotIdentity"] != scope.snapshot_identity)
+            {
+                return Err(quicksave_tracking::MetadataIndexRevisionChanged.into());
+            }
             ensure!(
                 header["version"] == 1
                     && header["softwareId"] == scope.software_id
@@ -1270,9 +1292,24 @@ pub(super) fn materialize_source_indices(
                     .map(|id| (id.device, id.file_id))
                     .collect(),
             });
+            stage = "verify_frozen_owner";
             owner.verify_current(&scope)?;
+            stage = "register_source_roots";
             engine.register_materialized(&record)?;
-            let imported = engine.native_materialize_index(record, owner)?;
+            stage = "import_source_index";
+            let imported = engine
+                .native_materialize_index(record, owner)
+                .map_err(|error| {
+                    if let Some(failure) = error.downcast_ref::<
+                    quicksave_noland::observation_control::NativeIndexImportFailure>() {
+                    stage = failure.stage();
+                    // Only a static, redacted stage: never backend bodies,
+                    // paths, record JSON, grant contents or credential errors.
+                    eprintln!("[QuickSave source-index] {}", stage);
+                }
+                    error
+                })?;
+            stage = "verify_source_acknowledgement";
             ensure!(
                 imported["softwareId"] == scope.software_id
                     && imported["sourceAppId"] == scope.app_id
@@ -1289,7 +1326,7 @@ pub(super) fn materialize_source_indices(
                 "actual source DB did not acknowledge frozen metadata import"
             );
             Ok(imported)
-        })();
+        });
         match result {
             Ok(summary) => {
                 canonical.insert(
@@ -1307,9 +1344,11 @@ pub(super) fn materialize_source_indices(
                     .context("native source node count overflow")?;
                 summaries.push(summary);
             }
-            Err(_) => {
+            Err(error) => {
                 if diagnostics.len() < MAX_DIAGNOSTICS {
                     diagnostics.push(json!({"softwareId":software,"code":"native_source_index_unavailable_or_changed",
+                        "stage":stage,"reason":source_index_failure_reason(&error),
+                        "name":bundle["name"],
                         "sourceIndexMaterialized":false,"requiresReconciliation":true}));
                 } else {
                     omitted += 1;
@@ -1324,6 +1363,34 @@ pub(super) fn materialize_source_indices(
         "incomplete":!diagnostics.is_empty() || omitted > 0,
         "fileStateTrust":"VERIFY_REQUIRED","coverageTrusted":false,"complete":false,"saved":false,"cloudWrite":false}),
     )
+}
+
+#[cfg(unix)]
+fn retry_metadata_revision(mut read: impl FnMut() -> Result<Value>) -> Result<Value> {
+    match read() {
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<quicksave_tracking::MetadataIndexRevisionChanged>()) =>
+        {
+            read()
+        }
+        result => result,
+    }
+}
+
+#[cfg(unix)]
+fn source_index_failure_reason(error: &anyhow::Error) -> &'static str {
+    // Never copy source/credential/native error bodies into renderer diagnostics.
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
+    {
+        Some(std::io::ErrorKind::PermissionDenied) => "Native metadata access was denied.",
+        Some(std::io::ErrorKind::NotFound) => "Required native metadata is no longer present.",
+        _ => "The native scope, index, or source acknowledgement could not be validated.",
+    }
 }
 
 #[cfg(unix)]
@@ -1384,6 +1451,40 @@ mod tests {
         },
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn metadata_revision_retry_is_once_only_and_never_retries_other_failures() {
+        let mut calls = 0;
+        let result = retry_metadata_revision(|| {
+            calls += 1;
+            Err(quicksave_tracking::MetadataIndexRevisionChanged.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let result = retry_metadata_revision(|| {
+            calls += 1;
+            anyhow::bail!("revoked authority or unsupported scope")
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn source_index_diagnostics_do_not_expose_backend_bodies_or_guess_permissions() {
+        let unknown = anyhow!("synthetic PRIVATE-CREDENTIAL /private/backend/path");
+        let message = source_index_failure_reason(&unknown);
+        assert!(!message.contains("PRIVATE-CREDENTIAL"));
+        assert!(!message.contains("/private"));
+        assert!(!message.contains("denied"));
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                .context("private diagnostic body");
+        assert_eq!(
+            source_index_failure_reason(&denied),
+            "Native metadata access was denied."
+        );
+    }
 
     // Only temporary local files and MemoryVault. Records remain in this
     // injected Tracker store; all grants still use the real WorkspaceStore MAC
@@ -1847,6 +1948,122 @@ mod tests {
             fixture.tracker.performance_counters(),
             before,
             "explicit reimport must not add a Tracker tree walk, metadata refresh, or content read"
+        );
+    }
+
+    #[test]
+    fn source_import_accepts_real_nested_directories_and_confined_link_metadata() {
+        let fixture = Fixture::new(true, true, false);
+        fixture.wait_for_initial_metadata_audit();
+        let root = fixture.executable.parent().unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(
+            root.join("nested/settings:fixture"),
+            b"isolated owned settings",
+        )
+        .unwrap();
+        for index in 0..300 {
+            fs::write(root.join(format!("nested/owned-{index}")), b"fixture").unwrap();
+        }
+        std::os::unix::fs::symlink("nested", root.join("current")).unwrap();
+        fixture.tracker.scan_metadata(&fixture.software).unwrap();
+        let home = fixture._temp.path().join("source-nested-home");
+        fs::create_dir(&home).unwrap();
+        let engine = Arc::new(
+            quicksave_noland::NativeEngine::open(&fixture._temp.path().join("nested-state"), &home)
+                .unwrap()
+                .with_workspace(fixture.store.clone())
+                .unwrap(),
+        );
+        let result = materialize_source_indices(
+            fixture.store.clone(),
+            fixture.tracker.clone(),
+            engine,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(result["sourceIndexedInstances"], 1, "{result}");
+        assert_eq!(result["sourceIndexedNodes"], 305, "{result}");
+        assert_eq!(result["incomplete"], false);
+        assert_eq!(fixture.tracker.performance_counters()["bytesRead"], 0);
+    }
+
+    #[test]
+    fn actual_source_import_reacquires_once_after_a_metadata_revision_race() {
+        struct ChangingOwner {
+            inner: SourceMetadataIndexOwner,
+            change_once: Arc<AtomicBool>,
+            file: PathBuf,
+        }
+        impl NativeIndexOwner for ChangingOwner {
+            fn root_authority(&self, scope: &NativeIndexScope) -> Result<Value> {
+                self.inner.root_authority(scope)
+            }
+            fn verify_current(&self, scope: &NativeIndexScope) -> Result<()> {
+                self.inner.verify_current(scope)
+            }
+            fn protected_file_ids(&self) -> Result<Vec<(u64, [u64; 2])>> {
+                self.inner.protected_file_ids()
+            }
+            fn node_page(
+                &self,
+                scope: &NativeIndexScope,
+                offset: usize,
+                limit: usize,
+            ) -> Result<Vec<quicksave_noland::capture_control::FrozenCaptureNode>> {
+                if self.change_once.swap(false, Ordering::AcqRel) {
+                    fs::write(
+                        &self.file,
+                        b"changed fixture while original index was being imported",
+                    )?;
+                    self.inner.tracker.scan_metadata(&scope.software_id)?;
+                }
+                self.inner.node_page(scope, offset, limit)
+            }
+        }
+        let fixture = Fixture::new(true, true, false);
+        fixture.wait_for_initial_metadata_audit();
+        let home = fixture._temp.path().join("racing-source-home");
+        fs::create_dir(&home).unwrap();
+        let engine = quicksave_noland::NativeEngine::open(
+            &fixture._temp.path().join("racing-source-state"),
+            &home,
+        )
+        .unwrap()
+        .with_workspace(fixture.store.clone())
+        .unwrap();
+        let change_once = Arc::new(AtomicBool::new(true));
+        let mut attempts = 0;
+        let result = retry_metadata_revision(|| {
+            attempts += 1;
+            let record = fixture.tracker.bundle_record(&fixture.software)?;
+            let scope = source_index_scope(&record)?;
+            engine.native_release_index_owner(&fixture.software)?;
+            let frozen = fixture.tracker.freeze_metadata_index(&fixture.software)?;
+            let owner = ChangingOwner {
+                inner: SourceMetadataIndexOwner {
+                    store: fixture.store.clone(),
+                    tracker: fixture.tracker.clone(),
+                    scope,
+                    protected: vec![],
+                    frozen,
+                },
+                change_once: change_once.clone(),
+                file: fixture.file.clone(),
+            };
+            engine.register_materialized(&record)?;
+            engine.native_materialize_index(record, Arc::new(owner))
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(result["sourceIndexedNodes"], 2);
+        assert_eq!(result["sourceIndexMaterialized"], true);
+        assert_eq!(result["saved"], false);
+        assert_eq!(fixture.tracker.performance_counters()["bytesRead"], 0);
+        assert_eq!(
+            result["revisionId"],
+            fixture.tracker.bundle_record(&fixture.software).unwrap()["bundleIndexSource"]
+                ["revisionId"]
         );
     }
 

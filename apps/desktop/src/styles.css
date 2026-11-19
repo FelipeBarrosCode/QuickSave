@@ -317,3 +317,5 @@ progress { display: block; width: calc(100% - 40px); height: 5px; margin: 0 20px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+.vault-startup { min-height: 100vh; display: grid; place-items: center; padding: 32px; }
+.vault-startup > section { width: min(680px, 100%); padding: 28px; }

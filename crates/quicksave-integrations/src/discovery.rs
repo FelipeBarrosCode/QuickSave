@@ -136,8 +136,8 @@ pub(crate) fn capabilities() -> serde_json::Value {
                 "platforms": [Platform::MacOs],
                 "status": "implemented",
                 "available_on_current_platform": cfg!(target_os = "macos"),
-                "search": ["/Applications/*.app", "~/Applications/*.app"],
-                "detail": "Top level only, bundle ID from bounded XML/binary Info.plist using Rust plist. Missing IDs are not replaced with title ownership.",
+                "search": ["NSWorkspace runningApplications", "NSWorkspace Launch Services URL lookup", "scoped Spotlight application-bundle metadata"],
+                "detail": "Native application URL hints, not folder crawling. Original no-follow bundle/Info.plist identity validation remains mandatory. Unindexed/unregistered inactive apps may be absent; native records are not data-access authority.",
                 "reference": "https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/"
             },
             {
@@ -204,6 +204,12 @@ mod scanning {
             match platform {
                 Platform::MacOs => {
                     locations.bundles.push(PathBuf::from("/Applications"));
+                    locations
+                        .bundles
+                        .push(PathBuf::from("/System/Applications"));
+                    locations
+                        .bundles
+                        .push(PathBuf::from("/System/Library/CoreServices/Applications"));
                     if let Some(home) = home {
                         locations.bundles.push(home.join("Applications"));
                         locations
@@ -491,6 +497,82 @@ mod scanning {
 
     fn scan_bundles(roots: &[PathBuf], collector: &mut Collector) {
         let source = DiscoverySource::MacApplicationBundle;
+        if roots.is_empty() {
+            return;
+        }
+        #[cfg(all(target_os = "macos", not(test)))]
+        {
+            let inventory = match crate::bundles::mac_inventory::discover(
+                roots,
+                collector.report.limits.max_applications,
+            ) {
+                Ok(inventory) => inventory,
+                Err(_) => {
+                    collector.diagnostic(source,None,"native_application_inventory_unavailable",
+                        "Apple application inventory is unavailable; no folder-scan fallback was used.");
+                    return;
+                }
+            };
+            if inventory.incomplete {
+                collector.diagnostic(source,None,"native_application_inventory_incomplete",
+                    "Apple application metadata gathering was incomplete; native records are not a complete installed inventory.");
+            }
+            let bases = roots
+                .iter()
+                .filter_map(|path| collector.open(path, source).map(|base| (path, base)))
+                .collect::<Vec<_>>();
+            for path in inventory.paths {
+                if collector.remaining_entries == 0 {
+                    collector.diagnostic(
+                        source,
+                        None,
+                        "entry_limit",
+                        "Native application hints exhausted the inventory entry budget.",
+                    );
+                    break;
+                }
+                collector.remaining_entries -= 1;
+                collector.report.examined_entries += 1;
+                let Some((base, relative)) = bases.iter().find_map(|(path_root, base)| {
+                    path.strip_prefix(path_root)
+                        .ok()
+                        .map(|relative| (base, relative))
+                }) else {
+                    collector.diagnostic(source,None,"native_application_candidate_outside_scope",
+                        "A native application record is outside the installation scope; it was not opened.");
+                    continue;
+                };
+                if collector.full() {
+                    break;
+                }
+                let mut current = None;
+                let mut valid = true;
+                for part in relative.components() {
+                    let std::path::Component::Normal(name) = part else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(name) = name.to_str() else {
+                        valid = false;
+                        break;
+                    };
+                    let parent = current.as_ref().unwrap_or(base);
+                    let Some(child) = collector.child(parent, name, source) else {
+                        valid = false;
+                        break;
+                    };
+                    current = Some(child);
+                }
+                if valid {
+                    if let Some(bundle) = current {
+                        inspect_bundle(bundle, collector);
+                    }
+                }
+            }
+            return;
+        }
+        // Synthetic legacy fixtures (and non-macOS portable fixtures) only.
+        #[cfg(any(not(target_os = "macos"), test))]
         for root in roots {
             let Some(directory) = collector.open(root, source) else {
                 continue;
@@ -511,49 +593,53 @@ mod scanning {
                 let Some(bundle) = collector.child(&directory, &name, source) else {
                     continue;
                 };
-                let Some(contents) = collector.child(&bundle, "Contents", source) else {
-                    continue;
-                };
-                let Some(bytes) =
-                    collector.read(&contents, "Info.plist", macos::MAX_PLIST_BYTES, source)
-                else {
-                    continue;
-                };
-                let metadata = match macos::parse_info_plist(&bytes) {
-                    Ok(metadata) => metadata,
-                    Err(_) => {
-                        collector.diagnostic(source, Some(&contents.path().join("Info.plist")), "invalid_bundle_metadata",
-                            "Bundle metadata is invalid or lacks a stable bundle identifier; use manual folder selection.");
-                        continue;
-                    }
-                };
-                let location = bundle.path().to_path_buf();
-                collector.add(DiscoveredApplication {
-                    display_name: metadata
-                        .display_name
-                        .unwrap_or_else(|| metadata.bundle_identifier.clone()),
-                    identity: AppIdentity {
-                        product: ProductIdentity::MacBundleIdentifier(metadata.bundle_identifier),
-                        install: InstallIdentity {
-                            kind: InstallKind::MacApplicationBundle,
-                            location: Some(location.clone()),
-                            metadata_path: contents.path().join("Info.plist"),
-                        },
-                        platform: collector.report.platform,
-                        architecture: Architecture::Unknown,
-                    },
-                    source,
-                    profile_id: "unknown-manual-folder-v1",
-                    root_candidates: vec![DiscoveredRoot {
-                        path: location,
-                        scope: RootScope::Installation,
-                        evidence: source,
-                        requires_explicit_approval: true,
-                    }],
-                    backup_authority: DiscoveryAuthority::NotGranted,
-                });
+                inspect_bundle(bundle, collector);
             }
         }
+    }
+
+    fn inspect_bundle(bundle: Directory, collector: &mut Collector) {
+        let source = DiscoverySource::MacApplicationBundle;
+        let Some(contents) = collector.child(&bundle, "Contents", source) else {
+            return;
+        };
+        let Some(bytes) = collector.read(&contents, "Info.plist", macos::MAX_PLIST_BYTES, source)
+        else {
+            return;
+        };
+        let metadata = match macos::parse_info_plist(&bytes) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                collector.diagnostic(source, Some(&contents.path().join("Info.plist")), "invalid_bundle_metadata",
+                            "Bundle metadata is invalid or lacks a stable bundle identifier; use manual folder selection.");
+                return;
+            }
+        };
+        let location = bundle.path().to_path_buf();
+        collector.add(DiscoveredApplication {
+            display_name: metadata
+                .display_name
+                .unwrap_or_else(|| metadata.bundle_identifier.clone()),
+            identity: AppIdentity {
+                product: ProductIdentity::MacBundleIdentifier(metadata.bundle_identifier),
+                install: InstallIdentity {
+                    kind: InstallKind::MacApplicationBundle,
+                    location: Some(location.clone()),
+                    metadata_path: contents.path().join("Info.plist"),
+                },
+                platform: collector.report.platform,
+                architecture: Architecture::Unknown,
+            },
+            source,
+            profile_id: "unknown-manual-folder-v1",
+            root_candidates: vec![DiscoveredRoot {
+                path: location,
+                scope: RootScope::Installation,
+                evidence: source,
+                requires_explicit_approval: true,
+            }],
+            backup_authority: DiscoveryAuthority::NotGranted,
+        });
     }
 
     fn scan_desktop(roots: &[PathBuf], collector: &mut Collector) {

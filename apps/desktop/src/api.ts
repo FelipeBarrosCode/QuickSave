@@ -97,6 +97,7 @@ export type Activity = {
 }
 export type Dashboard = {
   providers: Provider[]; software: Software[]; activity: Activity[]
+  activityUnavailable?: boolean; activityIssue?: string
   summary: { needsBackup: number; autosaveEnabled: number; connectedProviders: number }
 }
 export type ProviderField = {
@@ -127,6 +128,9 @@ export type RestorePreview = {
 export type PageResult<T> = { items: T[]; nextCursor: string | null }
 type Inputs = Record<string, string>
 export type ActionParams = {
+  migrate_vault: Record<string, never>
+  setup_local_tracking: Record<string, never>
+  authorize_tracking_storage: Record<string, never>
   connect_provider: {
     kind: string; name: string; bucket?: string; prefix?: string; fields?: Inputs
     credentials?: { type: string; value: Inputs }
@@ -165,6 +169,44 @@ export const MAX_SELECTION = 512
 export const MAX_APP_SELECTION = 512
 const MAX_CURSOR = 8_192
 export const nativeRuntime = () => isTauri()
+
+// Format metadata only: never credentials, encrypted payloads, or unlock proof.
+export type VaultStatus = {
+  format: 'legacy' | 'encrypted_state'
+  secretsInPlaintext: false
+  nativeAuthorizationVerified: false
+  legacyInventorySupported?: boolean
+  legacyMigrationLimitation?: string
+  credentialSetupPending?: boolean
+}
+export function normalizeVaultStatus(value: unknown): VaultStatus {
+  const item = record(value)
+  if (!item || !['legacy', 'encrypted_state'].includes(String(item.format))
+    || item.secretsInPlaintext !== false || item.nativeAuthorizationVerified !== false) {
+    throw new Error('The local vault format could not be verified. Workspace startup remains paused.')
+  }
+  return {
+    format: item.format as VaultStatus['format'],
+    secretsInPlaintext: false, nativeAuthorizationVerified: false,
+    ...(typeof item.credentialSetupPending === 'boolean' ? { credentialSetupPending: item.credentialSetupPending } : {}),
+    ...(typeof item.legacyInventorySupported === 'boolean' ? { legacyInventorySupported: item.legacyInventorySupported } : {}),
+    ...(typeof item.legacyMigrationLimitation === 'string'
+      ? { legacyMigrationLimitation: item.legacyMigrationLimitation.slice(0, MAX_TEXT) } : {}),
+  }
+}
+
+export type VaultReadiness = { ready: boolean; issue?: string }
+export function normalizeVaultReadiness(value: unknown): VaultReadiness {
+  const item = record(value)
+  if (!item || typeof item.ready !== 'boolean') {
+    throw new Error('Local tracking storage readiness could not be verified. Workspace startup remains paused.')
+  }
+  // Backend diagnostics are not authority and are never reflected verbatim.
+  return {
+    ready: item.ready,
+    ...(!item.ready ? { issue: 'Local tracking storage is unavailable. Native authorization may be required; damaged storage cannot be reset here.' } : {}),
+  }
+}
 
 export function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -277,6 +319,8 @@ export function normalizeDashboard(value: unknown): Dashboard {
     providers: list(item.providers, 128, provider),
     software: list(item.software, 10_000, software),
     activity: list(item.activity, 128, normalizeActivity),
+    activityUnavailable: item.activityUnavailable == null ? false : bool(item.activityUnavailable),
+    activityIssue: text(item.activityIssue),
     summary: {
       needsBackup: requiredCount(summary.needsBackup),
       autosaveEnabled: requiredCount(summary.autosaveEnabled),
@@ -568,6 +612,9 @@ async function action<A extends Action>(name: A, params: ActionParams[A], signal
   // Clone the exact plan before awaiting consent. Execute receives only a one-use
   // ticket, never a replacement path, credential, subset, or dependency checkbox.
   const captured = captureParams(params)
+  if (['migrate_vault', 'setup_local_tracking', 'authorize_tracking_storage'].includes(name) && Object.keys(captured).length !== 0) {
+    throw new Error('Local vault actions accept no caller-supplied parameters.')
+  }
   if ('fileIds' in captured && (!Array.isArray(captured.fileIds)
     || captured.fileIds.length === 0 || captured.fileIds.length > MAX_SELECTION
     || !captured.fileIds.every((id) => text(id)) || new Set(captured.fileIds).size !== captured.fileIds.length)) {
@@ -628,6 +675,8 @@ async function action<A extends Action>(name: A, params: ActionParams[A], signal
   }
 }
 export const api = {
+  vaultStatus: async () => normalizeVaultStatus(await query('vault_status')),
+  vaultReadiness: async () => normalizeVaultReadiness(await query('vault_readiness')),
   dashboard: async () => normalizeDashboard(await query('dashboard')),
   providerTypes: async () => normalizeProviderTypes(await query('provider_types')),
   software: async () => list(record(await query('software'))?.software, 10_000, software),

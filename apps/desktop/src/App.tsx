@@ -13,6 +13,7 @@ import { Icon, type IconName } from './Icon'
 import { ProviderDialog } from './ProviderDialog'
 import { Button, Dialog, InlineError } from './ui'
 import { useQuickSave, type QuickSave } from './useQuickSave'
+import { VaultStartupGate } from './VaultStartupGate'
 
 type Page = 'overview' | 'backup' | 'restore'
 const pages: { id: Page; label: string; icon: IconName }[] = [
@@ -126,6 +127,7 @@ function ActivityList({ model }: { model: QuickSave }) {
 }
 
 function TrackingPanel({ model }: { model: QuickSave }) {
+  const [includeInstallation, setIncludeInstallation] = useState(false)
   const tracking = model.tracking
   const defaultProviderId = connected(model).find((provider) => !provider.readOnly)?.id
   return <section className="card tracking-panel" aria-label="App tracking">
@@ -143,9 +145,17 @@ function TrackingPanel({ model }: { model: QuickSave }) {
         : <Button icon="monitor" disabled={!canUse(model) || !tracking}
           onClick={() => { void model.run('enable_app_tracking', {
             enabled: true, ...(defaultProviderId ? { defaultProviderId } : {}),
-            roles: ['installation', 'save', 'config', 'runtime'],
+            roles: includeInstallation ? ['installation', 'save', 'config', 'runtime'] : ['save', 'config'],
           }) }}>Enable app tracking</Button>}
     </div>
+    {!tracking?.enabled && <div>
+      <p className="muted">Start with verified app-owned saves and settings. Restricted or unavailable roots remain explicit gaps; this is not complete-application coverage.</p>
+      <label className="acknowledgement">
+        <input type="checkbox" checked={includeInstallation} disabled={!canUse(model)}
+          onChange={(event) => setIncludeInstallation(event.target.checked)} />
+        <span>Also include installation and runtime files (may require additional access)</span>
+      </label>
+    </div>}
     {tracking?.scanning && tracking.totalApps > 0 && <progress aria-label="Apps checked"
       max={tracking.totalApps} value={tracking.completedApps} />}
     {model.trackingError && <InlineError message={model.trackingError} onRetry={() => { void model.refreshTracking() }} />}
@@ -511,6 +521,10 @@ function RestorePage({ model, onConnect }: { model: QuickSave; onConnect: () => 
 }
 
 export default function App() {
+  return <VaultStartupGate><WorkspaceApp /></VaultStartupGate>
+}
+
+function WorkspaceApp() {
   const model = useQuickSave()
   const [page, setPage] = useState<Page>('overview')
   const [providersOpen, setProvidersOpen] = useState(false)

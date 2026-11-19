@@ -323,6 +323,39 @@ impl NativeApprovedBundleBackend {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl SoftwareBundleBackend for NativeApprovedBundleBackend {
+    fn mac_application_inventory(
+        &mut self,
+        scopes: &[PathBuf],
+        maximum: usize,
+    ) -> Result<Option<MacApplicationInventory>> {
+        for path in scopes {
+            let base = self
+                .select(path)
+                .context(super::backend::MacInventoryFailure(
+                    "native_inventory_approved_base",
+                ))?;
+            base.check_current()
+                .context(super::backend::MacInventoryFailure(
+                    "native_inventory_approved_base",
+                ))?;
+        }
+        #[cfg(all(target_os = "macos", not(test)))]
+        let result = super::mac_inventory::discover(scopes, maximum).map(Some);
+        #[cfg(any(not(target_os = "macos"), test))]
+        let result = {
+            let _ = maximum;
+            Err(anyhow::anyhow!(
+                "native application records require an injected fixture in this configuration"
+            ))
+        };
+        for base in &self.bases {
+            base.check_current()
+                .context(super::backend::MacInventoryFailure(
+                    "native_inventory_approved_base",
+                ))?;
+        }
+        result
+    }
     fn platform(&self) -> crate::profiles::Platform {
         crate::profiles::Platform::current()
     }
@@ -333,21 +366,7 @@ impl SoftwareBundleBackend for NativeApprovedBundleBackend {
     fn inspect_native(&mut self, path: &Path) -> Result<Option<NativeNode>> {
         let base = self.select(path)?;
         let relative = base.relative(path)?;
-        let result = (|| {
-            let file = match open_pinned_directory(&base.root, relative) {
-                Ok(file) => file,
-                Err(error) if is_missing(&error) => return Ok(None),
-                Err(_) => {
-                    let relative = relative.context("approved base is not a directory")?;
-                    match base.root.read_file(relative) {
-                        Ok((file, _stamp)) => file,
-                        Err(error) if is_missing(&error) => return Ok(None),
-                        Err(error) => return Err(error),
-                    }
-                }
-            };
-            Ok(Some(native_node(&file.metadata()?)?))
-        })();
+        let result = super::backend::inspect_pinned_node(&base.root, relative);
         base.check_current()?;
         result
     }
@@ -583,6 +602,40 @@ mod tests {
             application_directories: vec![applications.to_owned()],
             ..BundleInventoryScope::default()
         }
+    }
+
+    #[test]
+    fn native_leaf_inspection_accepts_files_and_directories_but_not_aliases() {
+        let temp = temporary();
+        let applications = temp.path().join("Applications");
+        let path = info(&applications.join("One.app"), b"bounded metadata fixture");
+        let linked = applications.join("Linked.app");
+        symlink(applications.join("One.app"), &linked).unwrap();
+        let mut backend =
+            NativeApprovedBundleBackend::new(&scope(&applications), &[pin(&applications)]).unwrap();
+        assert_eq!(
+            backend
+                .inspect_native(&applications.join("One.app"))
+                .unwrap()
+                .unwrap()
+                .identity
+                .kind(),
+            NativeNodeKind::Directory
+        );
+        assert_eq!(
+            backend
+                .inspect_native(&path)
+                .unwrap()
+                .unwrap()
+                .identity
+                .kind(),
+            NativeNodeKind::RegularFile
+        );
+        assert!(backend.inspect_native(&linked).is_err());
+        assert!(backend
+            .inspect_native(&linked.join("Contents/Info.plist"))
+            .is_err());
+        assert_eq!(backend.metadata_content_reads, 0);
     }
 
     #[test]

@@ -119,6 +119,7 @@ pub enum DirectoryIdentityInspectionStage {
     RevalidateRootIdentity,
     RevalidatePinnedRoot,
     UnsupportedPlatform,
+    NativeNamespaceProof,
 }
 
 impl std::fmt::Display for DirectoryIdentityInspectionStage {
@@ -130,6 +131,7 @@ impl std::fmt::Display for DirectoryIdentityInspectionStage {
             Self::RevalidateRootIdentity => "revalidate root ID",
             Self::RevalidatePinnedRoot => "revalidate pinned root after census",
             Self::UnsupportedPlatform => "native inspection unsupported",
+            Self::NativeNamespaceProof => "validate native namespace proof",
         })
     }
 }
@@ -482,6 +484,52 @@ impl SafeRoot {
         }
     }
 
+    /// Approval-only overlap check. On certified macOS boot APFS Data layouts,
+    /// use native capability/topology and pinned physical ancestry without
+    /// enumerating either tree. Unknown layouts use the complete directory-ID
+    /// census; no missing proof or access denial becomes a negative result.
+    /// This does not grant payload readability, capture consistency, or Saved.
+    pub fn overlaps_for_approval(&self, protected: &SafeRoot) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            use DirectoryIdentityInspectionSide::{Protected, Selected};
+            use DirectoryIdentityInspectionStage::{
+                NativeNamespaceProof, RevalidatePinnedRoot, ValidatePinnedRoot,
+            };
+            DirectoryIdentityInspectionFailure::attach(
+                self.inner.check(),
+                Selected,
+                ValidatePinnedRoot,
+            )?;
+            DirectoryIdentityInspectionFailure::attach(
+                protected.inner.check(),
+                Protected,
+                ValidatePinnedRoot,
+            )?;
+            let proof = DirectoryIdentityInspectionFailure::attach(
+                self.inner.apfs_data_overlap_proof(&protected.inner),
+                Protected,
+                NativeNamespaceProof,
+            );
+            let selected_check = DirectoryIdentityInspectionFailure::attach(
+                self.inner.check(),
+                Selected,
+                RevalidatePinnedRoot,
+            );
+            let protected_check = DirectoryIdentityInspectionFailure::attach(
+                protected.inner.check(),
+                Protected,
+                RevalidatePinnedRoot,
+            );
+            selected_check?;
+            protected_check?;
+            if let Some(overlap) = proof? {
+                return Ok(overlap);
+            }
+        }
+        self.overlaps_directory_identities(protected)
+    }
+
     /// Finds a regular file with the same native device/file ID anywhere in this
     /// bounded tree, including hard-link and bind-mounted namespace aliases.
     ///
@@ -713,6 +761,15 @@ pub(crate) fn validate_component(component: &str) -> Result<()> {
 
 /// This is lexical logical-root confinement, not target resolution. Resolving a
 /// target here would widen capture and reject useful dangling framework links.
+#[derive(Debug)]
+pub struct LinkOutsideLogicalRoot;
+impl std::fmt::Display for LinkOutsideLogicalRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("symlink target escapes logical root")
+    }
+}
+impl std::error::Error for LinkOutsideLogicalRoot {}
+
 pub(crate) fn validate_link_target(relative: &str, target: &str) -> Result<()> {
     let components = validate_relative(relative)?;
     anyhow::ensure!(
@@ -731,9 +788,7 @@ pub(crate) fn validate_link_target(relative: &str, target: &str) -> Result<()> {
         match component {
             "." => {}
             ".." => {
-                depth = depth
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("symlink target escapes logical root"))?;
+                depth = depth.checked_sub(1).ok_or(LinkOutsideLogicalRoot)?;
             }
             "" => bail!("symlink target contains an empty path component"),
             normal => {

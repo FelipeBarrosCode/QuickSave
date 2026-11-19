@@ -96,11 +96,18 @@ impl AutoEnrollment {
             })
     }
 
+    fn unavailable_roots(&self) -> impl Iterator<Item = &Value> {
+        self.failed_roots()
+            .filter(|root| !intentional_omission(root))
+    }
+
     pub(crate) fn root_failure_message(&self) -> Option<String> {
-        let first = self.failed_roots().next()?;
+        // A signed policy omission still prevents complete-application capture,
+        // but is not a native permission/integrity error.
+        let first = self.unavailable_roots().next()?;
         Some(diagnostics::bounded_message(format_args!(
             "{} native application root scope(s) unresolved; explicitly partial coverage. {}",
-            self.failed_roots().count(),
+            self.unavailable_roots().count(),
             first["message"]
                 .as_str()
                 .unwrap_or("Native root indexing failed.")
@@ -182,6 +189,17 @@ impl AutoEnrollment {
         );
         Ok(())
     }
+}
+
+fn intentional_omission(root: &Value) -> bool {
+    matches!(
+        root["code"].as_str(),
+        Some(
+            "unselected_role"
+                | "data_only_container_boundary_omitted"
+                | "container_boundary_indexed_via_verified_children"
+        )
+    )
 }
 
 impl EnrollmentPolicy {
@@ -369,6 +387,100 @@ fn native_role(classification: &str) -> &str {
         "container" | "group_container" | "data" => "save",
         "installer" => "installation",
         other => other,
+    }
+}
+
+/// Coverage decisions operate on authenticated declarations only. They neither
+/// inspect the filesystem nor turn an omitted root into native authority.
+struct RootDeclaration {
+    classification: String,
+    roles: BTreeSet<String>,
+}
+
+impl RootDeclaration {
+    fn parse(root: &Value) -> Result<Self> {
+        ensure!(root.is_object(), "invalid candidate root declaration");
+        ensure!(
+            root["status"] == "verified_candidate",
+            "a proposed/unresolved root is not native authority"
+        );
+        validate_id(
+            root["rootId"]
+                .as_str()
+                .context("candidate root ID is missing")?,
+        )?;
+        validate_absolute(Path::new(
+            root["path"]
+                .as_str()
+                .context("candidate root path is missing")?,
+        ))?;
+        let classification = role(
+            root["classification"]
+                .as_str()
+                .context("root classification is missing")?,
+        )?;
+        let roles = match root.get("roles") {
+            None => BTreeSet::from([native_role(classification).to_owned()]),
+            Some(value) => {
+                let values = value
+                    .as_array()
+                    .context("invalid source roles declaration")?;
+                ensure!(
+                    !values.is_empty() && values.len() <= 10,
+                    "invalid source role count"
+                );
+                values
+                    .iter()
+                    .map(|value| {
+                        role(value.as_str().context("invalid source role")?)
+                            .map(|role| native_role(role).to_owned())
+                    })
+                    .collect::<Result<BTreeSet<_>>>()?
+            }
+        };
+        candidate_identity(&root["nativeIdentity"])?;
+        evidence_kinds(&root["evidence"])?;
+        let ownership = root["ownership"]
+            .as_str()
+            .context("source root lacks native ownership evidence")?;
+        ensure!(
+            !matches!(
+                ownership,
+                "" | "unresolved" | "excluded" | "unknown" | "user_review"
+            ),
+            "unowned root cannot be automatically enrolled"
+        );
+        Ok(Self {
+            classification: classification.into(),
+            roles,
+        })
+    }
+
+    fn unselected(&self, selected: &BTreeSet<String>) -> bool {
+        !selected.contains(native_role(&self.classification)) && self.roles.is_disjoint(selected)
+    }
+}
+
+enum RootOmission {
+    UnselectedRole,
+    DataOnlyContainerBoundary,
+}
+
+impl RootOmission {
+    fn diagnostic(&self, root: &Value) -> Value {
+        let (code, message) = match self {
+            Self::UnselectedRole => ("unselected_role",
+                "This known root role was not selected by native policy; it was not opened or indexed."),
+            Self::DataOnlyContainerBoundary => ("data_only_container_boundary_omitted",
+                "Data-only policy does not capture a whole macOS container; only independently verified selected child roots may be indexed."),
+        };
+        json!({
+            "rootId":root["rootId"], "path":root["path"],
+            "classification":root["classification"], "roles":root["roles"],
+            "code":code, "message":message, "omitted":true,
+            "preventsFullScopeCapture":true, "complete":false,
+            "trackingAuthorized":false, "uploadAuthorized":false,
+        })
     }
 }
 
@@ -931,6 +1043,21 @@ impl Tracker {
     /// Native-only: both grants must originate after consent/trusted discovery.
     /// Each failed candidate is a diagnostic, never an empty synthetic bundle.
     pub fn materialize_bundles(&self, candidates: &[Value], authority: &Value) -> Result<Value> {
+        self.materialize_bundles_impl(candidates, authority, false)
+    }
+
+    /// Only the native service's spent explicit refresh ticket may enter here.
+    /// Background discovery/status must not clear a persisted authorization gap.
+    pub fn refresh_bundles(&self, candidates: &[Value], authority: &Value) -> Result<Value> {
+        self.materialize_bundles_impl(candidates, authority, true)
+    }
+
+    fn materialize_bundles_impl(
+        &self,
+        candidates: &[Value],
+        authority: &Value,
+        explicit_recheck: bool,
+    ) -> Result<Value> {
         self.shared.check_running()?;
         ensure!(
             candidates.len() <= MAX_SOFTWARE,
@@ -974,7 +1101,13 @@ impl Tracker {
             let result = if !seen.insert(app.to_owned()) {
                 Err(anyhow::anyhow!("duplicate native application candidate"))
             } else {
-                self.materialize_candidate(candidate, &parsed, &bases, &enrollment)
+                self.materialize_candidate(
+                    candidate,
+                    &parsed,
+                    &bases,
+                    &enrollment,
+                    explicit_recheck,
+                )
             };
             match result {
                 Ok((bundle, root_diagnostics)) => {
@@ -991,7 +1124,11 @@ impl Tracker {
                                 "appId":app,"displayName":candidate["displayName"],
                                 "code":"bundle_materialization_partial",
                                 "materialized":true,"rootDiagnostics":root_diagnostics,
-                                "message":"Only complete independently verified roots were indexed; unavailable roots remain unresolved.",
+                                "message":if root_diagnostics.iter().all(intentional_omission) {
+                                    "Selected independently verified roots were indexed; other roles were intentionally omitted. Coverage remains partial."
+                                } else {
+                                    "Only complete independently verified roots were indexed; unavailable roots remain unresolved."
+                                },
                             }),
                         );
                     }
@@ -1013,7 +1150,9 @@ impl Tracker {
                         json!({
                             "appId": if app.len() <= 512 { app } else { "" },
                             "displayName":candidate["displayName"],
-                            "code": "bundle_materialization_rejected",
+                            "code": if error.is::<diagnostics::NoSelectedRoots>() {
+                                "no_selected_source_roots"
+                            } else { "bundle_materialization_rejected" },
                             "message": bounded_error(&error),
                             "materialized": false,
                             "rootDiagnostics":diagnostics::failures(&error),
@@ -1034,6 +1173,7 @@ impl Tracker {
         policy: &EnrollmentPolicy,
         bases: &[(BaseDirectory, scan::PinnedRoot)],
         template: &AutoEnrollment,
+        explicit_recheck: bool,
     ) -> Result<(Value, Vec<Value>)> {
         model::bounded_json(candidate, 512 * 1024)?;
         let app_id = candidate["appId"]
@@ -1063,22 +1203,96 @@ impl Tracker {
         );
         let id = format!("software-{}", blake3::hash(app_id.as_bytes()).to_hex());
         let candidate_hash = digest(candidate)?;
+        let mut renew_deferred_metadata = false;
         {
             let mut apps = self.shared.apps()?;
             if let Some(old) = apps.get_mut(&id) {
-                self.shared.validate_tracking(old)?;
+                if explicit_recheck {
+                    let replacement = old
+                        .record
+                        .auto_enrollment
+                        .as_ref()
+                        .filter(|previous| {
+                            previous.policy_scope == template.policy_scope
+                                && previous.discovery_scope == template.discovery_scope
+                                && previous.candidate_hash == candidate_hash
+                                && (previous.policy_grant != template.policy_grant
+                                    || previous.discovery_grant != template.discovery_grant)
+                        })
+                        .cloned();
+                    if let Some(mut replacement) = replacement {
+                        // A fresh explicit discovery can renew the certificate
+                        // for the SAME bound scope, never tracking/root/history
+                        // authority. Its nonce is deliberately not in binding().
+                        if matches!(
+                            self.shared.store.verify_grant(
+                                "tracking",
+                                &old.record.tracking_scope(),
+                                &old.record.tracking_grant
+                            ),
+                            Ok(true)
+                        ) {
+                            replacement.policy_grant = template.policy_grant.clone();
+                            replacement.discovery_grant = template.discovery_grant.clone();
+                            ensure!(
+                                replacement.binding()
+                                    == old.record.auto_enrollment.as_ref().unwrap().binding(),
+                                "fresh discovery cannot change an enrolled scope"
+                            );
+                            replacement.verify_record(
+                                &old.record,
+                                self.shared.store.as_ref(),
+                                &self.shared.policy,
+                            )?;
+                            self.shared.pause_authorization(old)?;
+                            old.record.auto_enrollment = Some(replacement);
+                        }
+                    }
+                }
+                if explicit_recheck && old.authorization_paused {
+                    let result = self
+                        .shared
+                        .verify_paused_authority(old)
+                        .and_then(|_| self.shared.reconcile_mode(old, false, false));
+                    if result.is_err() && old.record.authorization_pending {
+                        let _ = self.shared.pause_authorization(old);
+                    }
+                    if let Err(error) = result {
+                        if error.is::<crate::DeferredLegacyAuthority>()
+                            && pristine_metadata_enrollment(old)
+                        {
+                            renew_deferred_metadata = true;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+                if !renew_deferred_metadata {
+                    match self.shared.validate_tracking(old) {
+                        Ok(()) => {}
+                        Err(error)
+                            if explicit_recheck
+                                && error.is::<crate::DeferredLegacyAuthority>()
+                                && pristine_metadata_enrollment(old) =>
+                        {
+                            renew_deferred_metadata = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 let same_policy_candidate =
                     old.record.auto_enrollment.as_ref().is_some_and(|old| {
                         old.policy_scope == template.policy_scope
                             && old.candidate_hash == candidate_hash
                     });
-                if !old.scheduler.paused
+                if !renew_deferred_metadata
+                    && !old.scheduler.paused
                     && same_policy_candidate
                     && !old
                         .record
                         .auto_enrollment
                         .as_ref()
-                        .is_some_and(AutoEnrollment::has_failed_roots)
+                        .is_some_and(|enrollment| enrollment.unavailable_roots().next().is_some())
                     && old.record.tracked
                     && old.current.is_some()
                     && old.record.bundle_index_source.is_some()
@@ -1118,8 +1332,34 @@ impl Tracker {
         let mut native_ids = BTreeMap::new();
         let mut normalization_notes = Vec::new();
         let mut root_errors = Vec::new();
+        let mut root_omissions = Vec::new();
+        let selected_roles = policy
+            .base_directories
+            .iter()
+            .flat_map(|base| {
+                base.allowed_roles
+                    .iter()
+                    .map(|role| native_role(role).to_owned())
+            })
+            .collect::<BTreeSet<_>>();
+        // Platform::MacOs serializes as "mac_os" in the native planner.
+        // Retain the earlier internal "macos" spelling for authenticated legacy
+        // candidates; both receive the same strictly narrower data-only policy.
+        let mac_data_only = matches!(candidate["platform"].as_str(), Some("mac_os" | "macos"))
+            && !selected_roles.is_empty()
+            && selected_roles
+                .iter()
+                .all(|role| matches!(role.as_str(), "save" | "config"));
         let refreshing = self.shared.apps()?.contains_key(&id);
         for root in roots_input {
+            let declaration = RootDeclaration::parse(root)
+                .with_context(|| RootContext::candidate(root, "validate_root_declaration"))?;
+            if declaration.unselected(&selected_roles) {
+                let omission = RootOmission::UnselectedRole.diagnostic(root);
+                normalization_notes.push(omission.clone());
+                root_omissions.push(omission);
+                continue;
+            }
             let prepared: Result<(ApprovedRoot,scan::PinnedRoot)> =
                 RootContext::candidate(root,"prepare_native_root").run(&effective,|| {
             ensure!(
@@ -1297,6 +1537,20 @@ impl Tracker {
                 }
                 Err(error) => return Err(error),
             };
+            if mac_data_only
+                && matches!(
+                    declaration.classification.as_str(),
+                    "container" | "group_container"
+                )
+            {
+                // A selected boundary still passes base, protected-path and
+                // native identity checks above. It never receives a tree audit,
+                // index, or grant, even when no independently owned child exists.
+                let omission = RootOmission::DataOnlyContainerBoundary.diagnostic(root);
+                normalization_notes.push(omission.clone());
+                root_omissions.push(omission);
+                continue;
+            }
             normalize_root(
                 &mut roots,
                 &mut pins,
@@ -1307,6 +1561,10 @@ impl Tracker {
             .with_context(|| RootContext::candidate(root, "normalize_approved_roots"))?;
         }
         if roots.is_empty() {
+            if root_errors.is_empty() {
+                return Err(diagnostics::NoSelectedRoots(root_omissions).into());
+            }
+            root_errors.extend(root_omissions);
             return Err(RootFailures(root_errors).into());
         }
         let approved_pins = roots
@@ -1339,6 +1597,10 @@ impl Tracker {
         }
         let roots = audited_roots;
         if roots.is_empty() {
+            if root_errors.is_empty() {
+                return Err(diagnostics::NoSelectedRoots(root_omissions).into());
+            }
+            root_errors.extend(root_omissions);
             return Err(RootFailures(root_errors).into());
         }
         for (index, root) in roots.iter().enumerate() {
@@ -1396,19 +1658,30 @@ impl Tracker {
                 old.record.auto_enrollment.is_some(),
                 "automatic discovery cannot replace manual software authority"
             );
+            if renew_deferred_metadata {
+                ensure!(pristine_metadata_enrollment(old)
+                    && roots.len() == old.record.roots.len()
+                    && candidate.get("sourceIdentity").filter(|value| !value.is_null())
+                        == old.record.source_identity.as_ref(),
+                    "deferred metadata reapproval cannot replace history or widen/change source identity");
+            }
             for old_root in &old.record.roots {
                 ensure!(roots.iter().any(|root| root.id == old_root.id
                     && root.identity == old_root.identity && root.allowed_files == old_root.allowed_files),
                     "discovery omitted a previously approved root; cannot silently shrink full scope");
             }
         }
-        let previous = old.and_then(|old| {
+        // Never authenticate/reuse a deferred old index as a capture receipt or
+        // historical baseline. Its immutable file remains untouched. Renewal is
+        // permitted only when there is no capture/history/flight to replace.
+        let previous = old.filter(|_| !renew_deferred_metadata).and_then(|old| {
             old.record
                 .bundle_index_source
                 .as_ref()
                 .map(|source| source.certificate(&old.record))
         });
         let mut record = TrackedSoftware {
+            authorization_pending: false,
             id: id.clone(),
             app_id: Some(app_id.into()),
             source_identity: candidate
@@ -1503,7 +1776,13 @@ impl Tracker {
                             "root refresh failed; prior authority, index and baseline are retained",
                         );
                     }
-                    if !diagnostics::unavailable(&error) {
+                    // An unsupported link layout rejects this WHOLE independent
+                    // root, never just a troublesome leaf or its target. Only
+                    // initial automatic enrollment may retain other roots.
+                    // Refresh/manual scopes cannot silently shrink authority.
+                    if !diagnostics::unavailable(&error)
+                        && !error.is::<quicksave_platform::LinkOutsideLogicalRoot>()
+                    {
                         return Err(error);
                     }
                     root_errors.extend(diagnostics::root_failure(&error));
@@ -1619,6 +1898,7 @@ impl Tracker {
         let generation = record.dirty_generation;
         let confirmed = record.last_confirmed_uploaded_generation;
         let runtime = Runtime {
+            authorization_paused: false,
             record,
             scheduler: Scheduler::new(generation, confirmed, self.shared.now())?,
             baseline: None,
@@ -1656,6 +1936,7 @@ impl Tracker {
             .index_path_bytes
             .store(total_paths, Ordering::Release);
         self.shared.reconfigure.store(true, Ordering::Release);
+        root_errors.extend(root_omissions);
         Ok((value, root_errors))
     }
 
@@ -1665,7 +1946,11 @@ impl Tracker {
         let mut apps = self.shared.apps()?;
         let mut bundles = Vec::new();
         for app in apps.values_mut() {
-            self.shared.validate_tracking(app)?;
+            if self.shared.validate_tracking(app).is_err() {
+                // A quarantined app is not a verified bundle; it must not
+                // prevent independent applications from being listed.
+                continue;
+            }
             crate::sync_record(app);
             if !app.scheduler.paused
                 && app.record.tracked
@@ -1886,7 +2171,16 @@ impl Tracker {
             .values_mut()
             .filter(|app| app.record.auto_enrollment.is_some())
         {
-            self.shared.validate_tracking(app)?;
+            if self.shared.validate_tracking(app).is_err() {
+                inactive += 1;
+                dirty += 1;
+                if diagnostics.len() < MAX_DIAGNOSTICS {
+                    diagnostics.push(json!({"softwareId":app.record.id,
+                        "code":"tracking_authorization_unavailable",
+                        "message":"Tracking authorization is unavailable; approvals and history are retained. This app is not counted as verified or Saved."}));
+                }
+                continue;
+            }
             crate::sync_record(app);
             if app.record.tracked
                 && !app.scheduler.paused
@@ -1912,6 +2206,20 @@ impl Tracker {
             "diagnostics": diagnostics, "io": self.shared.io.value(),
         }))
     }
+}
+
+fn pristine_metadata_enrollment(app: &crate::Runtime) -> bool {
+    app.record.auto_enrollment.is_some()
+        && app.record.last_saved_at.is_none()
+        && app.record.last_confirmed_uploaded_generation == 0
+        && app.record.baseline.is_none()
+        && !app.record.baseline_full_scope
+        && app.baseline.is_none()
+        && app.record.capture_receipt.is_none()
+        && app.record.pending_work.is_none()
+        && app.pending.is_none()
+        && app.scheduler.flight.is_none()
+        && app.record.previous_bundle_manifest.is_none()
 }
 
 fn container_boundary(root: &ApprovedRoot) -> bool {
@@ -2060,7 +2368,9 @@ fn roots_overlap(left: &ApprovedRoot, right: &ApprovedRoot) -> Result<bool> {
     // Handle-based overlap includes aliases; no positive path-prefix fallback.
     let left_pin = scan::PinnedRoot::open(left)?;
     let right_pin = scan::PinnedRoot::open(right)?;
-    left_pin.safe.overlaps(&right_pin.safe)
+    // Anti-alias approval is not a capture/link-readability walk. The actual
+    // independent root indexes still apply strict link confinement afterwards.
+    left_pin.safe.overlaps_for_approval(&right_pin.safe)
 }
 
 fn bounded_error(error: &anyhow::Error) -> String {

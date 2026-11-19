@@ -19,6 +19,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(target_os = "macos")]
+mod apfs_approval;
 mod overlap;
 mod privacy;
 
@@ -61,11 +63,24 @@ impl Root {
     }
 
     fn open_impl(path: &Path, create_missing: bool) -> Result<Self> {
+        Self::open_impl_flags(path, create_missing, DIR_FLAGS)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_metadata(path: &Path) -> Result<Self> {
+        Self::open_impl_flags(
+            path,
+            false,
+            libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    }
+
+    fn open_impl_flags(path: &Path, create_missing: bool, flags: libc::c_int) -> Result<Self> {
         let absolute = absolute_path(path)?;
         let slash = CString::new("/")?;
         // SAFETY: slash is a live NUL-terminated string; no variadic mode is
         // needed because O_CREAT is absent.
-        let fd = unsafe { libc::open(slash.as_ptr(), DIR_FLAGS) };
+        let fd = unsafe { libc::open(slash.as_ptr(), flags) };
         let file = file_from_result(fd).context("open filesystem root without following links")?;
         let stat = fstat(&file)?;
         require_directory(&stat)?;
@@ -93,14 +108,14 @@ impl Root {
                     root.check()?;
                     let parent = root.file();
                     let mut created = false;
-                    let child = match openat_file(parent, &name, DIR_FLAGS, 0) {
+                    let child = match openat_file(parent, &name, flags, 0) {
                         Ok(file) => file,
                         Err(error)
                             if create_missing && error.raw_os_error() == Some(libc::ENOENT) =>
                         {
                             mkdirat(parent, &name)?;
                             created = true;
-                            openat_file(parent, &name, DIR_FLAGS, 0)
+                            openat_file(parent, &name, flags, 0)
                                 .context("open newly created private directory")?
                         }
                         Err(error) => return Err(error).context("open no-follow root component"),

@@ -492,7 +492,7 @@ fn check_policy_mode(
                 InspectionSide::Both,
                 "inspect_policy_overlap",
             )
-            .run(policy, || safe.overlaps_directory_identities(&excluded))?;
+            .run(policy, || safe.overlaps_for_approval(&excluded))?;
             ensure!(
                 !overlap,
                 ScopeGrantViolation("selected native root aliases an excluded root")

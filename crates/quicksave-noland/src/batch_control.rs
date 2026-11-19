@@ -3118,7 +3118,7 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let data = temp.path().join("quicksave");
         let home = temp.path().join("home");
         let source = temp.path().join("synthetic-application");
@@ -3375,8 +3375,13 @@ mod tests {
             frozen_native_roots_fingerprint(&app, &[wrong_kind]).unwrap(),
             actual_file,
         );
+        // Windows device names are valid literal Unix filenames. Native source
+        // fingerprints must preserve them, not impose Windows target rules.
+        let mut unix_leaf = direct_file.clone();
+        unix_leaf["path"] = json!("/isolated-fixture/CON");
+        assert!(frozen_native_roots_fingerprint(&app, &[unix_leaf]).is_ok());
         let mut invalid_leaf = direct_file;
-        invalid_leaf["path"] = json!("/isolated-fixture/CON");
+        invalid_leaf["path"] = json!("/isolated-fixture/invalid\0leaf");
         assert!(frozen_native_roots_fingerprint(&app, &[invalid_leaf]).is_err());
         assert!(fixture.engine.runtime.get().is_none());
     }

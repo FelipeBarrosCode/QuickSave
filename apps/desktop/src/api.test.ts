@@ -5,7 +5,7 @@ import {
   api, chooseFiles, chooseFolder, chooseNoLandState, chooseRecoveryDestination, FILE_PAGE_SIZE, MAX_SELECTION,
   normalizeActivity, normalizeAppTracking, normalizeBatchStatus, normalizeBundles, normalizeDashboard, normalizeDeletePreview,
   normalizeFiles, normalizeNoLandDiscovery, normalizePendingDeletions, normalizeProviderTypes, normalizeRestorePreview,
-  normalizeUploadBatchPreview, type ActionParams, type RestorePlan,
+  normalizeUploadBatchPreview, normalizeVaultReadiness, type ActionParams, type RestorePlan,
 } from './api'
 import { activity, appTracking, batchPreview, batchStatus, dashboard, files, importDiscovery, paths, preview, provider, providerTypes, respond, restorePreview, type Call } from './test/fixtures'
 
@@ -22,6 +22,23 @@ beforeEach(() => {
 })
 
 describe('workspace gateway and native consent', () => {
+  it('checks local readiness without preparing consent and drops untrusted diagnostic details', async () => {
+    expect(await api.vaultReadiness()).toEqual({ ready: true })
+    expect(calls).toEqual([{ command: 'workspace_query', args: { query: 'vault_readiness', params: {} } }])
+    expect(normalizeVaultReadiness({ ready: false, issue: 'sensitive backend detail' }).issue).not.toContain('sensitive')
+    expect(() => normalizeVaultReadiness({ ready: 'true' })).toThrow()
+    expect(() => normalizeVaultReadiness({ format: 'encrypted_state' })).toThrow()
+  })
+  it('uses only the existing prepare/execute commands for both parameterless local actions', async () => {
+    for (const action of ['setup_local_tracking', 'authorize_tracking_storage'] as const) {
+      calls = []
+      await api.action(action, {})
+      expect(calls).toEqual([
+        { command: 'workspace_prepare', args: { action, params: {} } },
+        { command: 'workspace_execute', args: { ticketId: 'test-ticket' } },
+      ])
+    }
+  })
   it('queries only workspace_query with exact camelCase file scope and a bounded page', async () => {
     expect((await api.softwareFiles('software-test', 'cursor-test')).items).toEqual(files)
     expect(invoke).toHaveBeenCalledWith('workspace_query', {

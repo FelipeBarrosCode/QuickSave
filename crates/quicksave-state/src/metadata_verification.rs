@@ -95,7 +95,9 @@ pub(crate) fn verify(
     })?;
     // The original verifier still authenticates the actual HMAC and reads the
     // current persistent vault nonce on EVERY call. A snapshot creates no key.
-    Some(store.verify_bound(&frame.snapshot.document, scope, signature))
+    Some(frame.snapshot.with_secret_access(|vault| {
+        store.verify_bound(vault, &frame.snapshot.document, scope, signature)
+    }))
 }
 
 impl WorkspaceStore {

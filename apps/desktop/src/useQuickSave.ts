@@ -9,6 +9,15 @@ export const POLL_INTERVAL_MS = 2_000
 export const MAX_POLL_REQUESTS = 600
 const MAX_POLL_ERRORS = 3
 
+function mergeActivity(previous: Activity[], next: Activity[]) {
+  const missing = previous.filter((item) => !terminal(item.state)
+    && !next.some((current) => current.id === item.id))
+  // Do not let a full page of newer history evict unfinished known work.
+  const combined = [...missing, ...next.filter((item) => !terminal(item.state)),
+    ...next.filter((item) => terminal(item.state))]
+  return { items: combined.slice(0, 128), missing: missing.length > 0, truncated: combined.length > 128 }
+}
+
 export function useQuickSave() {
   const [native] = useState(nativeRuntime)
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
@@ -29,7 +38,9 @@ export function useQuickSave() {
   const pendingConsent = useRef<AbortController | null>(null)
   const refreshPromise = useRef<Promise<void> | null>(null)
   const trackingPromise = useRef<Promise<AppTracking> | null>(null)
+  const activityPromise = useRef<Promise<Activity[]> | null>(null)
   const lastActivity = useRef<Activity[]>([])
+  const activityBudget = useRef({ round: -1, requests: 0, errors: 0 })
 
   const rememberBatches = useCallback((references: BatchReference[]) => {
     if (!mounted.current || !references.length) return
@@ -43,18 +54,30 @@ export function useQuickSave() {
 
   const acceptDashboard = useCallback((next: Dashboard) => {
     if (!mounted.current) return
-    setDashboard(next)
-    setActivity(next.activity)
-    rememberBatches(next.activity.filter((item) => item.planSetId).map((item) => ({
+    const merged = mergeActivity(lastActivity.current, next.activity)
+    const nextActivity = next.activityUnavailable ? lastActivity.current : merged.items
+    setDashboard({ ...next, activity: nextActivity })
+    setActivity(nextActivity)
+    if (next.activityUnavailable) setPollIssue(next.activityIssue ?? 'History is unavailable; existing work is retained. Local tracking can continue.')
+    else if (merged.missing) setPollIssue('Some unfinished work is absent from the latest status. Its last known state is retained; nothing was cancelled.'
+      + (merged.truncated ? ' The display is limited to 128 rows; native history is retained.' : ''))
+    else if (merged.truncated) setPollIssue('Activity exceeds the 128-row display limit. Native history is retained; no completion is inferred from omitted rows.')
+    rememberBatches(nextActivity.filter((item) => item.planSetId).map((item) => ({
       planSetId: item.planSetId!, operationId: item.id, providerId: item.providerId,
     })))
-    lastActivity.current = next.activity
+    lastActivity.current = nextActivity
     setError(null)
   }, [rememberBatches])
   const readTracking = useCallback(() => {
     if (trackingPromise.current) return trackingPromise.current
     const pending = api.appTracking().finally(() => { trackingPromise.current = null })
     trackingPromise.current = pending
+    return pending
+  }, [])
+  const readActivity = useCallback(() => {
+    if (activityPromise.current) return activityPromise.current
+    const pending = api.activity().finally(() => { activityPromise.current = null })
+    activityPromise.current = pending
     return pending
   }, [])
   const refreshTracking = useCallback(async () => {
@@ -82,7 +105,13 @@ export function useQuickSave() {
     try { await pending } finally { refreshPromise.current = null }
   }, [acceptDashboard, native])
 
-  useEffect(() => { void refresh(); void refreshTracking() }, [refresh, refreshTracking])
+  useEffect(() => { void refresh() }, [refresh])
+  // The initial dashboard may be waiting on native Keychain consent. Do not
+  // queue independent reads behind that dialog or exhaust the native workers.
+  const workspaceReady = dashboard !== null && !loading
+  useEffect(() => {
+    if (workspaceReady) void refreshTracking()
+  }, [workspaceReady, refreshTracking])
 
   useEffect(() => {
     if (!native || !tracking?.scanning) return
@@ -122,36 +151,53 @@ export function useQuickSave() {
     }
   }, [native, tracking?.scanning, trackingRound, refresh, readTracking])
 
+  const hasActiveActivity = activity.some((item) => !terminal(item.state))
   useEffect(() => {
-    if (!native) return
+    if (!native || !workspaceReady) return
     let disposed = false
-    let requests = 0
-    let errors = 0
+    if (activityBudget.current.round !== pollRound) {
+      activityBudget.current = { round: pollRound, requests: 0, errors: 0 }
+    }
+    const budget = activityBudget.current
     let timer: ReturnType<typeof setTimeout> | undefined
     async function poll() {
       if (disposed) return
-      if (requests >= MAX_POLL_REQUESTS) {
+      if (budget.requests >= MAX_POLL_REQUESTS) {
         setPollIssue('Activity checks paused after 600 requests. Resume to check native work; nothing was cancelled.')
         return
       }
-      requests += 1
+      budget.requests += 1
       try {
-        const next = await api.activity()
+        const next = await readActivity()
         if (disposed) return
-        errors = 0
+        budget.errors = 0
         setPollIssue(null)
         const completed = next.some((item) => terminal(item.state)
           && lastActivity.current.find((previous) => previous.id === item.id)?.state !== item.state)
-        lastActivity.current = next
-        setActivity(next)
+        const merged = mergeActivity(lastActivity.current, next)
+        lastActivity.current = merged.items
+        setActivity(merged.items)
         rememberBatches(next.filter((item) => item.planSetId).map((item) => ({
           planSetId: item.planSetId!, operationId: item.id, providerId: item.providerId,
         })))
         if (completed) await refresh()
+        if (merged.missing) {
+          setPollIssue('Some unfinished work is absent from the latest status. Its last known state is retained; resume checks to review it. Nothing was cancelled.'
+            + (merged.truncated ? ' The display is limited to 128 rows; native history is retained.' : ''))
+          return
+        }
+        if (merged.truncated) {
+          setPollIssue('Activity exceeds the 128-row display limit. Native history is retained; no completion is inferred from omitted rows.')
+          return
+        }
+        // An idle/terminal workspace needs no 20-minute request countdown.
+        // Poll again only for native-reported unfinished work, a new operation,
+        // an explicit resume, or a new dashboard that discovers active work.
+        if (!next.some((item) => !terminal(item.state))) return
       } catch (reason) {
         if (disposed) return
-        errors += 1
-        if (errors >= MAX_POLL_ERRORS) {
+        budget.errors += 1
+        if (budget.errors >= MAX_POLL_ERRORS) {
           setPollIssue(`Activity is unavailable after three checks. Native work may still be running. ${safeError(reason)}`)
           return
         }
@@ -164,7 +210,7 @@ export function useQuickSave() {
       disposed = true
       if (timer !== undefined) clearTimeout(timer)
     }
-  }, [native, pollRound, refresh, rememberBatches])
+  }, [native, workspaceReady, hasActiveActivity, pollRound, refresh, rememberBatches, readActivity])
 
   const reportError = useCallback((reason: unknown) => {
     if (mounted.current) setNotice(safeError(reason))
@@ -182,6 +228,9 @@ export function useQuickSave() {
       if (!mounted.current) return undefined
       if (action === 'preview_delete' || action === 'preview_restore' || action === 'preview_upload_all'
         || action === 'discover_noland_import') return result
+      // A newly accepted user operation gets its own bounded status budget.
+      setPollIssue(null)
+      setPollRound((round) => round + 1)
       if (action === 'upload_all') {
         const operationId = record(result)?.operationId
         if (typeof operationId === 'string' && operationId.length > 0 && operationId.length <= 4_096
@@ -203,7 +252,10 @@ export function useQuickSave() {
           try {
             const operation = await api.operation(id)
             if (mounted.current) {
-              setActivity((current) => [operation, ...current.filter((item) => item.id !== operation.id)].slice(0, 128))
+              const merged = mergeActivity([], [operation, ...lastActivity.current.filter((item) => item.id !== operation.id)])
+              lastActivity.current = merged.items
+              setActivity(merged.items)
+              if (merged.truncated) setPollIssue('Activity exceeds the 128-row display limit. Native history is retained; no completion is inferred from omitted rows.')
             }
           } catch (reason) {
             reportError(`The request was accepted; its status is unknown. ${safeError(reason)}`)

@@ -167,8 +167,6 @@ impl NativeMetadataIndex {
         ensure!(
             app.record.tracking_scope() == self.tracking_scope
                 && app.record.tracking_grant == self.tracking_grant
-                && app.record.bundle_index_source.as_ref() == Some(&self.source)
-                && app.index_identity.as_deref() == Some(self.index_identity.as_str())
                 && match (&app.record.auto_enrollment, &self.enrollment_grants) {
                     (Some(current), Some((policy, discovery))) =>
                         &current.policy_grant == policy && &current.discovery_grant == discovery,
@@ -186,10 +184,27 @@ impl NativeMetadataIndex {
         if let Some(enrollment) = &app.record.auto_enrollment {
             enrollment.verify_record(&app.record, shared.store.as_ref(), &shared.policy)?;
         }
+        if app.record.bundle_index_source.as_ref() != Some(&self.source)
+            || app.index_identity.as_deref() != Some(self.index_identity.as_str())
+        {
+            return Err(MetadataIndexRevisionChanged.into());
+        }
         self.source
             .verify_reference_grants(&self.tracking_scope, shared.store.as_ref())
     }
 }
+
+/// A new cached metadata revision under the SAME freshly verified authority.
+/// Never denotes revoked/replaced tracking, roots or policy. Readers may retry
+/// one fresh index acquisition, not accept the obsolete index as current.
+#[derive(Debug)]
+pub struct MetadataIndexRevisionChanged;
+impl std::fmt::Display for MetadataIndexRevisionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native metadata index revision changed under unchanged authority")
+    }
+}
+impl std::error::Error for MetadataIndexRevisionChanged {}
 
 impl Tracker {
     /// Freeze the real current materialized index for a native source graph

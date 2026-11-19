@@ -586,6 +586,9 @@ pub struct TrackedSoftware {
     pub tracked: bool,
     pub provider_id: Option<String>,
     pub autosave: bool,
+    /// A denial-only recovery latch. Never grants authority or changes opt-in.
+    #[serde(default)]
+    pub(crate) authorization_pending: bool,
     pub dirty: bool,
     pub status: String,
     pub last_saved_at: Option<String>,

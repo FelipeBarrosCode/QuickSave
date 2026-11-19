@@ -35,6 +35,28 @@ const MAX_PATH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EVENT: usize = 16 * 1024 * 1024;
 const PAGE: usize = 256;
 
+/// Redacted native import phase. Backend bodies/paths remain private causes.
+#[derive(Debug)]
+pub struct NativeIndexImportFailure {
+    stage: &'static str,
+    cause: anyhow::Error,
+}
+impl NativeIndexImportFailure {
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+}
+impl std::fmt::Display for NativeIndexImportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native metadata import failed at {}", self.stage)
+    }
+}
+impl std::error::Error for NativeIndexImportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 /// Callback capability over an ACTUAL immutable Tracker metadata index.
 /// Neither method may reenter NativeEngine. No renderer-provided nodes, scans,
 /// predicted content hashes, provider sessions or successful default verifier.
@@ -503,17 +525,33 @@ impl NativeEngine {
         record: Value,
         owner: Arc<dyn NativeIndexOwner>,
     ) -> Result<Value> {
+        let mut stage = "source_import_admission";
+        self.materialize_index_inner(record, owner, &mut stage)
+            .map_err(|cause| NativeIndexImportFailure { stage, cause }.into())
+    }
+
+    fn materialize_index_inner(
+        &self,
+        record: Value,
+        owner: Arc<dyn NativeIndexOwner>,
+        stage: &mut &'static str,
+    ) -> Result<Value> {
         bounded(&record, MAX_EVENT)?;
         let _submission = self
             .submission
             .try_lock()
             .context("native source index admission is busy")?;
         let mut scope = index_scope(&record)?;
+        *stage = "source_import_verify_owner_authority";
         let authority = owner.root_authority(&scope)?;
-        let approved = Arc::new(ApprovedRecord::verify(self, &record, &authority)?);
+        let approved = Arc::new(ApprovedRecord::verify_with_registration_staged(
+            self, &record, &authority, None, stage,
+        )?);
         scope.tracking_scope_hash = approved.scope_hash.clone();
+        *stage = "source_import_recheck_owner_authority";
         owner.verify_current(&scope)?;
         let protected = owner.protected_file_ids()?;
+        *stage = "source_import_reserve_index_capacity";
         ensure!(
             protected.len() <= 256,
             "native frozen index protection bound exceeded"
@@ -553,6 +591,7 @@ impl NativeEngine {
             retained_roots <= MAX_REGISTERED_ROOTS && retained_bytes <= MAX_REGISTRATION_BYTES,
             "native source per-instance root-handle/metadata retention limit reached"
         );
+        *stage = "source_import_mark_dirty";
         self.agent
             .db
             .mark_dirty(&approved.app, None, true)
@@ -572,8 +611,10 @@ impl NativeEngine {
         let now = Utc::now();
         let mut offset = 0usize;
         while offset < scope.node_count {
+            *stage = "source_import_revalidate_owner";
             owner.verify_current(&scope)?;
             approved.check_native(self)?;
+            *stage = "source_import_read_frozen_page";
             let nodes = owner.node_page(&scope, offset, PAGE)?;
             ensure!(
                 !nodes.is_empty()
@@ -584,6 +625,7 @@ impl NativeEngine {
             let mut entries = Vec::with_capacity(nodes.len());
             let mut states = Vec::with_capacity(nodes.len());
             for node in &nodes {
+                *stage = "source_import_validate_node";
                 ensure!(
                     node.id.len() <= 512
                         && node.logical_root.len() <= 4096
@@ -620,6 +662,7 @@ impl NativeEngine {
                     !protected.contains(&(stamp.device, stamp.file_id)),
                     "native frozen index includes a protected marker/key alias"
                 );
+                *stage = "source_import_project_path";
                 entries.push(make_entry(
                     self,
                     &approved,
@@ -631,28 +674,35 @@ impl NativeEngine {
                     now,
                     vec![],
                 )?);
+                *stage = "source_import_project_file_state";
                 states.push(make_state(
                     &approved, root, &node.path, &node.kind, node.size, &stamp, now,
                 )?);
             }
+            *stage = "source_import_verify_before_write";
             owner.verify_current(&scope)?;
             ApprovedRecord::verify(self, &record, &owner.root_authority(&scope)?)?;
+            *stage = "source_import_write_paths";
             self.agent
                 .db
                 .upsert_scanned_paths(&entries)
                 .map_err(public_source_error)?;
+            *stage = "source_import_write_file_states";
             self.agent
                 .db
                 .reconcile_file_states(&states, false)
                 .map_err(public_source_error)?;
+            *stage = "source_import_verify_written_paths";
             verify_written(self, &approved.app, &entries)?;
             offset += nodes.len();
             state.indices.get_mut(&scope.software_id).unwrap().imported = offset;
         }
+        *stage = "source_import_verify_terminal_page";
         ensure!(
             owner.node_page(&scope, offset, 1)?.is_empty(),
             "native frozen index has undeclared trailing nodes"
         );
+        *stage = "source_import_verify_final_authority";
         owner.verify_current(&scope)?;
         approved.check_native(self)?;
         ApprovedRecord::verify(self, &record, &owner.root_authority(&scope)?)?;
@@ -722,6 +772,23 @@ impl ApprovedRecord {
         authority: &Value,
         registration: Option<Arc<ApprovedRecord>>,
     ) -> Result<Self> {
+        Self::verify_with_registration_staged(
+            engine,
+            record,
+            authority,
+            registration,
+            &mut "source_authority_admission",
+        )
+    }
+
+    fn verify_with_registration_staged(
+        engine: &NativeEngine,
+        record: &Value,
+        authority: &Value,
+        registration: Option<Arc<ApprovedRecord>>,
+        stage: &mut &'static str,
+    ) -> Result<Self> {
+        *stage = "source_import_verify_record_identity";
         bounded(record, MAX_EVENT)?;
         bounded(authority, MAX_EVENT)?;
         let store = engine
@@ -763,6 +830,7 @@ impl ApprovedRecord {
             );
         }
         let scope = &authority["scope"];
+        *stage = "source_import_verify_tracking_mac";
         ensure!(
             scope["version"] == 1
                 && scope["softwareId"] == software
@@ -776,6 +844,7 @@ impl ApprovedRecord {
             "source graph tracking MAC or identity is invalid"
         );
         let enrollment = &record["autoEnrollment"];
+        *stage = "source_import_verify_discovery_policy";
         let policy = &enrollment["policyScope"];
         let policy_grant = &enrollment["policyGrant"];
         let current = store
@@ -798,12 +867,18 @@ impl ApprovedRecord {
             "source graph discovery/current native policy admission failed"
         );
         let scope_hash = digest(scope)?;
+        *stage = "source_import_verify_index_scope_hash";
         let index = &record["bundleIndexSource"];
         ensure!(
             index["version"] == 1 && index["trackingScopeHash"] == scope_hash,
             "source graph requires a real authenticated materialized index"
         );
         for kind in ["index", "manifest"] {
+            *stage = if kind == "index" {
+                "source_import_verify_index_sidecar_mac"
+            } else {
+                "source_import_verify_manifest_sidecar_mac"
+            };
             let part = &index[kind];
             let name = text(&part["name"])?;
             ensure!(
@@ -820,6 +895,7 @@ impl ApprovedRecord {
         let input = record["roots"]
             .as_array()
             .context("source graph roots missing")?;
+        *stage = "source_import_verify_exact_roots";
         let signed = scope["roots"]
             .as_array()
             .context("signed source graph roots missing")?;
@@ -2008,6 +2084,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.tracker.shutdown();
         }
+    }
+
+    #[tokio::test]
+    async fn source_import_reports_tracking_mac_stage_without_exposing_private_cause() {
+        let fixture = Fixture::new().await;
+        let mut record = fixture.record.clone();
+        record["trackingGrant"] = json!({"privateFixture":"must-not-be-logged"});
+        let error = fixture
+            .engine
+            .native_materialize_index(record, Arc::new(fixture.owner()))
+            .unwrap_err();
+        let failure = error.downcast_ref::<NativeIndexImportFailure>().unwrap();
+        assert_eq!(failure.stage(), "source_import_verify_tracking_mac");
+        assert!(!failure.to_string().contains("must-not-be-logged"));
     }
 
     #[tokio::test]

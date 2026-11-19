@@ -22,12 +22,28 @@ use std::{
 #[cfg(all(test, unix))]
 #[path = "native/capture_integration_tests.rs"]
 mod capture_integration_tests;
+#[cfg(all(test, unix))]
+#[path = "native/encrypted_vault_integration_tests.rs"]
+mod encrypted_vault_integration_tests;
 
 pub(super) async fn open(
     data_dir: &Path,
     home: &Path,
     isolated: bool,
 ) -> Result<Arc<WorkspaceService>> {
+    open_with_vault(data_dir, home, isolated, None).await
+}
+
+pub(super) async fn open_with_vault(
+    data_dir: &Path,
+    home: &Path,
+    isolated: bool,
+    injected_vault: Option<Arc<dyn quicksave_state::CredentialVault>>,
+) -> Result<Arc<WorkspaceService>> {
+    ensure!(
+        isolated || injected_vault.is_none(),
+        "native vault injection is restricted to isolated workspaces"
+    );
     let discovery = Arc::new(NativeDiscovery::new(home, data_dir, isolated)?);
     let import_dirs = isolated.then(|| quicksave_state::KnownDataDirs {
         bases: vec![home_application_data(home)],
@@ -38,7 +54,7 @@ pub(super) async fn open(
         let store = if isolated {
             WorkspaceStore::open_with_vault(
                 &data,
-                Arc::new(quicksave_state::MemoryVault::default()),
+                injected_vault.unwrap_or_else(|| Arc::new(quicksave_state::MemoryVault::default())),
             )?
         } else {
             WorkspaceStore::open(&data)?
@@ -143,12 +159,24 @@ pub(super) async fn open(
             signer,
             adapters.clone(),
             adapters,
-        )?;
-        runtime.confirm_core_hooks_installed();
-        service
-            .batch
-            .set(runtime)
-            .map_err(|_| anyhow!("Native batch ownership was already installed"))?;
+        );
+        match runtime {
+            Ok(runtime) => {
+                runtime.confirm_core_hooks_installed();
+                service
+                    .batch
+                    .set(runtime)
+                    .map_err(|_| anyhow!("Native batch ownership was already installed"))?;
+            }
+            Err(_) => {
+                // Opening authenticated cloud-history metadata is not local
+                // tracking authority. Quarantine this capability; never delete
+                // its records or fabricate an empty/completed history.
+                service
+                    .history_initialization_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
     if resume_tracking {
         // Plain settings only schedule verification; they never authorize
@@ -168,7 +196,13 @@ struct StoreAdapter(WorkspaceStore, Option<quicksave_state::KnownDataDirs>);
 
 impl ServiceStore for StoreAdapter {
     fn snapshot(&self) -> Result<Value> {
-        Ok(serde_json::to_value(self.0.document()?)?)
+        let mut value = serde_json::to_value(self.0.document()?)?;
+        // Persisted encrypted credentials are native storage, not service/IPC
+        // output. Public metadata keeps references only.
+        if let Some(document) = value.as_object_mut() {
+            document.remove("encryptedSecrets");
+        }
+        Ok(value)
     }
     fn provider_types(&self) -> Value {
         self.0.provider_types()
@@ -301,6 +335,9 @@ impl TrackingStore for StoreAdapter {
             .collect())
     }
     fn save_record(&self, record: &Value) -> Result<()> {
+        if record["authorizationPending"] == true {
+            return self.0.pause_tracking_authorization(record);
+        }
         // Tracker writes a complete native record. State's public patch API
         // preserves omitted fields, so retirement must explicitly clear this
         // opaque pointer rather than resurrect the previous pending frame.
@@ -317,7 +354,13 @@ impl TrackingStore for StoreAdapter {
         self.0.issue_grant(kind, scope)
     }
     fn verify_grant(&self, kind: &str, scope: &Value, grant: &Value) -> Result<bool> {
-        self.0.verify_grant(kind, scope, grant)
+        self.0.verify_grant(kind, scope, grant).map_err(|error| {
+            if quicksave_state::is_legacy_credential_deferred(&error) {
+                quicksave_tracking::DeferredLegacyAuthority.into()
+            } else {
+                error
+            }
+        })
     }
     fn revoke_grant(&self, kind: &str, scope: &Value) -> Result<()> {
         self.0.revoke_grant(kind, scope)
@@ -563,6 +606,18 @@ impl TrackingAdapter {
                                     diagnostics.push(json!({"code":"native_source_graph_incomplete",
                                         "message":"Some native source indices could not be imported. Existing data is retained and coverage remains unconfirmed."}));
                                 }
+                                for detail in status["sourceGraph"]["diagnostics"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .take(256usize.saturating_sub(diagnostics.len()))
+                                {
+                                    diagnostics.push(json!({"softwareId":detail["softwareId"],
+                                        "name":detail["name"],"code":"native_source_index_reconciliation_required",
+                                        "message":format!("Native source-index stage {}: {} Existing revisions are retained; upload readiness is not confirmed.",
+                                            detail["stage"].as_str().unwrap_or("unavailable"),
+                                            detail["reason"].as_str().unwrap_or("Native validation failed."))}));
+                                }
                             }
                         }
                         result["observation"] = status;
@@ -731,6 +786,14 @@ impl TrackingAdapter {
             }
             "scan_metadata" => {
                 let software = dto::id(input, "softwareId")?;
+                if self.store.software_record(software)?["authorizationPending"] == true {
+                    // Only an explicit scan may attempt recovery. Tracker checks
+                    // the original signed scope and historical proofs before
+                    // source IO, then clears the latch only after reconciliation.
+                    let value = self.tracker()?.scan_metadata(software)?;
+                    self.verified(software)?;
+                    return Ok(value);
+                }
                 self.verified(software)?;
                 self.tracker()?.scan_metadata(software)
             }
@@ -1175,6 +1238,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn producer_platform_wire_value_enforces_data_only_container_policy() {
+        use quicksave_platform::SafeRoot;
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let base = temporary.path().canonicalize().unwrap();
+        let data = base.join("private-data");
+        let owned = base.join("approved");
+        let app = owned.join("Fixture.app");
+        let container = owned.join("Containers/synthetic.fixture");
+        let documents = container.join("Data/Documents");
+        let outside = base.join("outside");
+        for directory in [&app, &documents, &outside] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(documents.join("save"), b"owned save").unwrap();
+        symlink(&outside, container.join("Data/Desktop")).unwrap();
+        let vault = Arc::new(quicksave_state::MemoryVault::default());
+        let store = WorkspaceStore::open_with_vault(&data, vault.clone()).unwrap();
+        let tracker = Tracker::open(
+            Arc::new(StoreAdapter(store.clone(), None)),
+            Arc::new(|_| bail!("no autosave in this fixture")),
+            TrackingPolicy::new(&data),
+        )
+        .unwrap();
+        let identity = |path: &Path| {
+            let id = SafeRoot::open(path).unwrap().identity().unwrap();
+            json!({"platform":"unix","device":id.device,"inode":id.file_id[0],"kind":"directory"})
+        };
+        let root = |id: &str, path: &Path, classification: &str| {
+            json!({
+                "rootId":id,"path":path,"classification":classification,"roles":[classification],
+                "nativeIdentity":identity(path),"status":"verified_candidate",
+                "ownership":"reviewed_exact_product_mapping",
+                "evidence":[{"kind":"reviewed_exact_product_mapping","identifier":"synthetic.fixture"}],
+            })
+        };
+        let producer_platform =
+            serde_json::to_value(quicksave_integrations::profiles::Platform::MacOs).unwrap();
+        let report = json!({"bundlePlans":[{
+            "platform":producer_platform,"appId":"mac-bundle:synthetic.fixture","productId":"synthetic.fixture",
+            "displayName":"Synthetic fixture",
+            "sourceIdentity":{"app_id":"mac-bundle:synthetic.fixture","display_name":"Synthetic fixture",
+                "canonical_executable":null,"desktop_entry_id":null,"steam_app_id":null,
+                "launcher":"native","aliases":[],"identity_confidence":1.0,"icon_path":null},
+            "identityEvidence":[{"kind":"native_installation_handle","identifier":"synthetic.fixture"}],
+            "sourceRoots":[root("installation",&app,"install"),root("container",&container,"container"),
+                root("documents",&documents,"save")],
+            "rootsComplete":true,"unresolvedRoots":[],"unresolvedReasons":[],
+        }],"diagnostics":[],"unresolvedApplications":[],"inventoryIncomplete":false});
+        let result = crate::enrollment::materialize(&store,&tracker,&json!({
+            "report":report,"roles":["save","config"],"replacePolicy":true,
+            "nativeScope":{"baseDirectories":[owned],"excludedPaths":[data]},
+            "_approvedPaths":[{"path":owned,"kind":"directory","identity":SafeRoot::open(&owned).unwrap().identity().unwrap()}],
+        })).unwrap();
+        assert_eq!(result["bundles"].as_array().unwrap().len(), 1, "{result}");
+        let id = result["bundles"][0]["id"].as_str().unwrap();
+        let record = store.software_record(id).unwrap();
+        assert_eq!(record["roots"].as_array().unwrap().len(), 1);
+        assert_eq!(record["roots"][0]["path"], json!(documents));
+        assert_eq!(record["fileCount"], 1);
+        assert!(record["error"].is_null(), "{record}");
+        assert_eq!(result["partialBundles"], 1);
+        assert!(tracker
+            .prepare_upload_scope(id, "provider-a", None)
+            .is_err());
+        assert_eq!(tracker.performance_counters()["bytesRead"], 0);
+        assert_eq!(tracker.performance_counters()["filesHashed"], 0);
+        tracker.shutdown().unwrap();
+
+        // Real deferred-state protocol, still MemoryVault and temporary roots.
+        // Refresh may renew this never-captured exact local scope, not demand a
+        // bulk credential import or treat deferred repository keys as absent.
+        let scope = store.encrypted_vault_migration_scope().unwrap();
+        store
+            .setup_local_tracking_scoped(
+                scope["generation"].as_u64().unwrap(),
+                scope["workspaceIdentity"].as_str().unwrap(),
+            )
+            .unwrap();
+        let read_offset = vault.access_log().unwrap()["reads"]
+            .as_array()
+            .unwrap()
+            .len();
+        let refreshed = Tracker::open(
+            Arc::new(StoreAdapter(store.clone(), None)),
+            Arc::new(|_| bail!("no autosave in this fixture")),
+            TrackingPolicy::new(&data),
+        )
+        .unwrap();
+        let result = crate::enrollment::materialize(&store,&refreshed,&json!({
+            "report":report,"roles":["save","config"],"replacePolicy":true,
+            "explicitAuthorizationRecheck":true,
+            "nativeScope":{"baseDirectories":[owned],"excludedPaths":[data]},
+            "_approvedPaths":[{"path":owned,"kind":"directory","identity":SafeRoot::open(&owned).unwrap().identity().unwrap()}],
+        })).unwrap();
+        assert_eq!(result["bundles"].as_array().unwrap().len(), 1, "{result}");
+        let renewed = store.software_record(id).unwrap();
+        assert_eq!(renewed["roots"][0]["id"], record["roots"][0]["id"]);
+        assert_eq!(
+            renewed["roots"][0]["identity"],
+            record["roots"][0]["identity"]
+        );
+        assert_eq!(renewed["authorizationPending"], false);
+        assert_eq!(renewed["autosave"], false);
+        assert!(renewed["baseline"].is_null());
+        assert_ne!(renewed["status"], "saved");
+        let reads = vault.access_log().unwrap();
+        assert!(
+            reads["reads"].as_array().unwrap()[read_offset..]
+                .iter()
+                .all(|entry| entry[1] == "QuickSaveEncryptedStateVault.v1"),
+            "refresh must read only the active encryption item, never old credentials"
+        );
+        refreshed.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn native_enrollment_persists_real_index_and_polling_never_hashes_app_data() {
         let temporary = tempfile::tempdir().unwrap();
         let base = temporary.path().canonicalize().unwrap();
@@ -1254,8 +1434,55 @@ mod tests {
         assert_eq!(before["filesHashed"], after["filesHashed"]);
         assert_eq!(before["fsWalks"], after["fsWalks"]);
         assert_eq!(after["bytesRead"], 0);
+        for _ in 0..2 {
+            let refreshed = crate::enrollment::materialize(
+                &store,
+                &tracker,
+                &json!({
+                    "report":report,"replacePolicy":false,"explicitAuthorizationRecheck":true,
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                refreshed["bundles"].as_array().unwrap().len(),
+                1,
+                "{refreshed}"
+            );
+            let next = store.software_record(id).unwrap();
+            assert_eq!(next["trackingGrant"], record["trackingGrant"]);
+            assert_eq!(
+                next["autoEnrollment"]["discoveryGrant"],
+                record["autoEnrollment"]["discoveryGrant"]
+            );
+        }
+        // Reproduce the former refresh bug: issue the same batch scope again,
+        // invalidating its old certificate but NOT the original tracking grant.
+        store
+            .issue_grant(
+                "bundle_discovery",
+                &record["autoEnrollment"]["discoveryScope"],
+            )
+            .unwrap();
+        tracker.software().unwrap();
+        let recovered = crate::enrollment::materialize(
+            &store,
+            &tracker,
+            &json!({
+                "report":report,"replacePolicy":false,"explicitAuthorizationRecheck":true,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered["bundles"].as_array().unwrap().len(),
+            1,
+            "{recovered}"
+        );
+        let retained = store.software_record(id).unwrap();
+        assert_eq!(retained["trackingGrant"], record["trackingGrant"]);
+        assert_eq!(retained["roots"], record["roots"]);
+        assert_eq!(retained["authorizationPending"], false);
         let engine = NativeEngine::open(&data, &home).unwrap();
-        engine.register(&record).await.unwrap();
+        engine.register(&retained).await.unwrap();
         tracker.shutdown().unwrap();
     }
 

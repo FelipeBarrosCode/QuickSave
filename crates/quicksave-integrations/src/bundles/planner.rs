@@ -292,6 +292,12 @@ impl<'a> Planner<'a> {
 
     fn diagnostic(&mut self, code: &'static str, path: Option<&Path>, message: &'static str) {
         self.report.inventory_incomplete = true;
+        self.notice(code, path, message);
+    }
+
+    // Expected policy exclusions are not missing inventory coverage. Dropped
+    // notices still make the report incomplete rather than hiding truncation.
+    fn notice(&mut self, code: &'static str, path: Option<&Path>, message: &'static str) {
         if self.report.diagnostics.len() < self.report.limits.max_diagnostics {
             self.report.diagnostics.push(BundlePlanDiagnostic {
                 code,
@@ -300,6 +306,7 @@ impl<'a> Planner<'a> {
             });
         } else {
             self.report.omitted_diagnostics += 1;
+            self.report.inventory_incomplete = true;
         }
     }
 
@@ -321,7 +328,7 @@ impl<'a> Planner<'a> {
             return Vec::new();
         }
         if self.excluded(path) {
-            self.diagnostic(
+            self.notice(
                 "protected_inventory_path",
                 Some(path),
                 "Inventory does not enter protected state, caches, logs or vaults.",
@@ -391,7 +398,7 @@ impl<'a> Planner<'a> {
             return None;
         }
         if self.excluded(path) {
-            self.diagnostic(
+            self.notice(
                 "protected_metadata",
                 Some(path),
                 "Protected metadata is not read.",
@@ -808,6 +815,7 @@ impl<'a> Planner<'a> {
         }
         self.remaining_plan_bytes -= cost;
         if plan.source_roots.is_empty() {
+            self.report.inventory_incomplete = true;
             self.report.unresolved_applications.push(plan);
         } else {
             self.report.bundle_plans.push(plan);
@@ -815,54 +823,160 @@ impl<'a> Planner<'a> {
     }
 
     fn scan_mac(&mut self) {
-        let mut queue: VecDeque<(PathBuf, usize)> = self
-            .scope
-            .application_directories
-            .iter()
-            .cloned()
-            .map(|p| (p, 0))
-            .collect();
-        let mut seen = BTreeSet::new();
-        let mut installations = Vec::new();
-        while let Some((root, depth)) = queue.pop_front() {
-            if !seen.insert(root.clone()) {
-                continue;
+        if self.scope.application_directories.is_empty() {
+            return;
+        }
+        let inventory = self.backend.mac_application_inventory(
+            &self.scope.application_directories,
+            self.report.limits.max_applications,
+        );
+        let native = match inventory {
+            Ok(Some(inventory)) => {
+                if inventory.incomplete {
+                    self.diagnostic("native_application_inventory_incomplete",None,
+                        "Apple application metadata gathering was incomplete, limited or unavailable; running/registered candidates do not prove a complete installed inventory.");
+                }
+                self.notice("native_application_inventory_sources",None,
+                    "Candidates come from Spotlight and NSWorkspace/Launch Services. Unindexed, unregistered and non-running installations may be absent; discovery grants no data access.");
+                Some(inventory.paths)
             }
-            for name in self.entries(&root) {
-                let path = root.join(&name);
-                if name.to_ascii_lowercase().ends_with(".app") {
-                    if self.report.discovered_applications + installations.len()
-                        >= self.report.limits.max_applications
-                    {
-                        self.diagnostic("application_limit", Some(&path), "Application bound reached; remaining discovered names are not fake bundles.");
-                        break;
-                    }
+            Ok(None) if self.backend.kind() == BackendKind::IsolatedFixture => None,
+            Err(error)
+                if error
+                    .downcast_ref::<super::backend::MacInventoryFailure>()
+                    .is_some() =>
+            {
+                let failure = error
+                    .downcast_ref::<super::backend::MacInventoryFailure>()
+                    .unwrap();
+                self.diagnostic(failure.0, None, failure.message());
+                return;
+            }
+            _ => {
+                self.diagnostic("native_application_inventory_unavailable",None,
+                    "Apple application inventory is unavailable. No recursive folder-scan fallback or placeholder apps were created.");
+                return;
+            }
+        };
+        let mut installations = Vec::new();
+        if let Some(paths) = native {
+            if paths.len() > self.report.limits.max_applications {
+                self.diagnostic(
+                    "native_application_inventory_limit",
+                    None,
+                    "Native application inventory exceeds its bound; no candidates were admitted.",
+                );
+                return;
+            }
+            let mut seen = BTreeSet::new();
+            let mut bytes = 0usize;
+            for path in paths {
+                if self.remaining_entries == 0 {
+                    self.diagnostic(
+                        "native_application_inventory_limit",
+                        None,
+                        "Native application hints exhausted the inventory entry budget.",
+                    );
+                    break;
+                }
+                self.remaining_entries -= 1;
+                self.report.examined_entries += 1;
+                if validate_path(&path).is_err()
+                    || !path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+                    || !self
+                        .scope
+                        .application_directories
+                        .iter()
+                        .any(|base| path != *base && path.starts_with(base))
+                    || self.excluded(&path)
+                {
+                    self.diagnostic("native_application_candidate_rejected",None,
+                        "A native application hint was invalid, protected or outside approved bases; it was not opened.");
+                    continue;
+                }
+                bytes = bytes.saturating_add(path.as_os_str().len());
+                if bytes > 2 * 1024 * 1024 {
+                    self.diagnostic(
+                        "native_application_inventory_limit",
+                        None,
+                        "Native application path bytes exceed their bound.",
+                    );
+                    break;
+                }
+                if seen.insert(path.clone()) {
                     installations.push(self.mac_installation(&path));
-                } else if depth < self.report.limits.max_installation_depth {
-                    // Only installation scopes, never a recursive home/data scan.
-                    if self
+                }
+            }
+        } else {
+            // Isolated synthetic legacy fixtures only; never production discovery.
+            let mut queue: VecDeque<(PathBuf, usize)> = self
+                .scope
+                .application_directories
+                .iter()
+                .cloned()
+                .map(|p| (p, 0))
+                .collect();
+            let mut seen = BTreeSet::new();
+            while let Some((root, depth)) = queue.pop_front() {
+                if !seen.insert(root.clone()) {
+                    continue;
+                }
+                for name in self.entries(&root) {
+                    let path = root.join(&name);
+                    if name.to_ascii_lowercase().ends_with(".app") {
+                        if self.report.discovered_applications + installations.len()
+                            >= self.report.limits.max_applications
+                        {
+                            self.diagnostic("application_limit", Some(&path), "Application bound reached; remaining discovered names are not fake bundles.");
+                            break;
+                        }
+                        installations.push(self.mac_installation(&path));
+                    } else if depth < self.report.limits.max_installation_depth {
+                        // Only installation scopes, never a recursive home/data scan.
+                        if self
+                            .inspect(&path)
+                            .is_some_and(|node| node.identity.kind() == NativeNodeKind::Directory)
+                        {
+                            if queue.len() + self.directories < self.report.limits.max_directories {
+                                queue.push_back((path, depth + 1));
+                            } else {
+                                self.diagnostic("installation_directory_limit", Some(&path),
+                                "The bounded installation queue is full; nested app coverage is incomplete.");
+                            }
+                        }
+                    } else if self
                         .inspect(&path)
                         .is_some_and(|node| node.identity.kind() == NativeNodeKind::Directory)
                     {
-                        if queue.len() + self.directories < self.report.limits.max_directories {
-                            queue.push_back((path, depth + 1));
-                        } else {
-                            self.diagnostic("installation_directory_limit", Some(&path),
-                                "The bounded installation queue is full; nested app coverage is incomplete.");
-                        }
-                    }
-                } else if self
-                    .inspect(&path)
-                    .is_some_and(|node| node.identity.kind() == NativeNodeKind::Directory)
-                {
-                    self.diagnostic(
+                        self.diagnostic(
                         "installation_depth_limit",
                         Some(&path),
                         "Nested installation scope exceeds depth bound; coverage is incomplete.",
                     );
+                    }
                 }
             }
         }
+        // Registry, metadata and running-app sources may spell the SAME native
+        // installation differently. Only native identities plus the observed
+        // product/executable can deduplicate it; distinct installations remain
+        // ambiguous even when Launch Services prefers one of their URLs.
+        let mut native_installations = BTreeSet::new();
+        installations.retain(|installation| {
+            installation
+                .plan
+                .installation_identity
+                .as_ref()
+                .is_none_or(|identity| {
+                    native_installations.insert((
+                        identity.stable_key(),
+                        installation.bundle_id.clone(),
+                        installation.plan.executable_identity.clone(),
+                    ))
+                })
+        });
         let mut ids = BTreeMap::<String, usize>::new();
         for installation in &installations {
             if let Some(id) = &installation.bundle_id {
@@ -872,7 +986,7 @@ impl<'a> Planner<'a> {
         for mut installation in installations {
             if let Some(id) = &installation.bundle_id {
                 if protected_mac_bundle(id) {
-                    self.diagnostic(
+                    self.notice(
                         "protected_application_excluded",
                         None,
                         "QuickSave and No Land are excluded from automatic application tracking. No Land import requires its separate read-only consent.",

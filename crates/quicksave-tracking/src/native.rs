@@ -219,7 +219,9 @@ fn rebuild(
     let mut routes = Vec::new();
     let mut desired = BTreeMap::new();
     for app in apps.values_mut() {
-        shared.validate_tracking(app)?;
+        if shared.validate_tracking(app).is_err() {
+            continue;
+        }
         if app.scheduler.paused {
             continue;
         }
@@ -329,6 +331,32 @@ pub(crate) fn tick(
             break;
         }
         let now = shared.now();
+        // A denial latch/revocation requires explicit recovery, not another
+        // expensive vault/state verification on every idle timer wake.
+        if app.authorization_paused || app.scheduler.paused {
+            continue;
+        }
+        let uncertainty =
+            shared.uncertainty_epoch.load(Ordering::Acquire) != app.observation_uncertainty_epoch;
+        if audit_due
+            || uncertainty
+            || app.event_epoch.load(Ordering::Acquire) != app.observation_event_epoch
+        {
+            // Scheduling hints grant no source access or cleanliness.
+            app.scheduler.require_reconcile();
+            if uncertainty {
+                app.force_hash = true;
+            }
+        }
+        let hinted = overflowed || hints.contains(&app.record.id);
+        let upload_due = app
+            .scheduler
+            .ready(now, app.record.autosave && app.watch_ok);
+        if !hinted && !app.scheduler.can_reconcile(now) && !upload_due {
+            continue;
+        }
+        // Always verify fresh native authority before actual source work,
+        // persistence of a hint, or upload admission. Never cache a valid grant.
         if shared.validate_tracking(app).is_err() {
             continue;
         }

@@ -468,11 +468,21 @@ describe('software backup and exact file subsets', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Enable app tracking' }))
     await waitFor(() => expect(preparations()).toHaveLength(1))
     expect(preparations()[0].args).toEqual({ action: 'enable_app_tracking', params: {
-      enabled: true, defaultProviderId: provider.id, roles: ['installation', 'save', 'config', 'runtime'],
+      enabled: true, defaultProviderId: provider.id, roles: ['save', 'config'],
     } })
     expect(calls.find((call) => call.command === 'workspace_execute')?.args).toEqual({ ticketId: 'ticket-enable_app_tracking' })
     expect(open).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Enable app tracking' })).toBeTruthy()
+  })
+  it('keeps installation and runtime coverage available by explicit opt-in', async () => {
+    nativeTracking.enabled = false
+    await backup()
+    fireEvent.click(screen.getByRole('checkbox', { name: /Also include installation and runtime files/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Enable app tracking' }))
+    await waitFor(() => expect(preparations()).toHaveLength(1))
+    expect(preparations()[0].args).toEqual({ action: 'enable_app_tracking', params: {
+      enabled: true, defaultProviderId: provider.id, roles: ['installation', 'save', 'config', 'runtime'],
+    } })
   })
   it('never renders metadata-only discovery as a bundle or offers a per-app Track button', async () => {
     nativeDashboard.software[0].tracked = false

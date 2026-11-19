@@ -26,6 +26,9 @@ const MAX_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    MigrateVault,
+    SetupLocalTracking,
+    AuthorizeTrackingStorage,
     ConnectProvider,
     ConnectOauth,
     DisconnectProvider,
@@ -56,6 +59,9 @@ pub enum Action {
 impl Action {
     pub fn parse(name: &str) -> Result<Self> {
         Ok(match name {
+            "migrate_vault" => Self::MigrateVault,
+            "setup_local_tracking" => Self::SetupLocalTracking,
+            "authorize_tracking_storage" => Self::AuthorizeTrackingStorage,
             "connect_provider" => Self::ConnectProvider,
             "connect_oauth" => Self::ConnectOauth,
             "disconnect_provider" => Self::DisconnectProvider,
@@ -87,6 +93,9 @@ impl Action {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::MigrateVault => "migrate_vault",
+            Self::SetupLocalTracking => "setup_local_tracking",
+            Self::AuthorizeTrackingStorage => "authorize_tracking_storage",
             Self::ConnectProvider => "connect_provider",
             Self::ConnectOauth => "connect_oauth",
             Self::DisconnectProvider => "disconnect_provider",
@@ -117,6 +126,9 @@ impl Action {
 
     fn description(self) -> &'static str {
         match self {
+            Self::MigrateVault => "Authorize native Keychain access ONLY during this explicit migration. macOS may ask for several one-time approvals of old QuickSave items. Encrypt secrets in state.json using ONE active native-vault key/rollback-anchor item; keep old credential values and delete no old items. Background access remains noninteractive. This does not connect an account, upload data, or grant file access",
+            Self::SetupLocalTracking => "Set up encrypted local tracking storage. Read legacy account attributes and only the old device signing key, if present; macOS may request approval for that one old signing key. Create one encrypted vault anchor and local signing key. Leave cloud credentials pending and locked; do not read provider passwords, connect accounts, upload data, enable tracking, or delete old items",
+            Self::AuthorizeTrackingStorage => "Authorize access to only QuickSave's existing native encryption-key/rollback-anchor item for local tracking storage. macOS may require Always Allow for background access. Verify noninteractive access before reporting readiness. Do not import cloud credentials, replace keys, reset storage, or enable tracking",
             Self::ConnectProvider => "Connect this cloud storage account",
             Self::ConnectOauth => "Open this provider's sign-in flow",
             Self::DisconnectProvider => "Disconnect this provider (keep backups and recovery keys)",
@@ -210,7 +222,11 @@ impl Request {
             | Action::AuthorizeProviderWrites => &["providerId"],
             Action::ReauthorizeProvider => &["providerId", "credentials"],
             Action::ExportRecoveryKey => &["providerId", "destination"],
-            Action::DiscoverNolandImport | Action::RefreshAppTracking => &[],
+            Action::MigrateVault
+            | Action::SetupLocalTracking
+            | Action::AuthorizeTrackingStorage
+            | Action::DiscoverNolandImport
+            | Action::RefreshAppTracking => &[],
             Action::ImportNoland => &["sourceId", "stateFile", "profileIds"],
             Action::EnableAppTracking => &["enabled", "defaultProviderId", "roles"],
             Action::TrackSoftware => &["appId", "name", "roots", "providerId"],
@@ -398,6 +414,32 @@ impl Request {
             scope.is_object(),
             "Native authority scope must be an object"
         );
+        if matches!(
+            self.action,
+            Action::MigrateVault | Action::SetupLocalTracking | Action::AuthorizeTrackingStorage
+        ) {
+            fields(&scope, &["generation", "workspaceIdentity", "format"])?;
+            ensure!(
+                scope["generation"].as_u64().is_some(),
+                "Missing native state generation"
+            );
+            let identity = required_text(&scope, "workspaceIdentity", 64)?;
+            ensure!(
+                identity.len() == 64
+                    && identity
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "Invalid native workspace identity"
+            );
+            ensure!(
+                match self.action {
+                    Action::SetupLocalTracking => scope["format"] == "legacy",
+                    Action::AuthorizeTrackingStorage => scope["format"] == "encrypted_state",
+                    _ => scope["format"] == "legacy" || scope["format"] == "encrypted_state",
+                },
+                "Local vault format does not match the requested native action"
+            );
+        }
         if self.action == Action::DeleteCloud {
             let deletion = scope
                 .get("deletion")
@@ -576,6 +618,11 @@ impl Request {
             } else {
                 "Stop automatic app enrollment and observation. Keep local data and existing backup history.\n"
             });
+        }
+        if self.action == Action::RefreshAppTracking
+            || (self.action == Action::EnableAppTracking && self.params["enabled"] == true)
+        {
+            message.push_str("Explicitly recheck paused local tracking approvals and reconcile their metadata. A deferred legacy approval may be renewed only for a never-captured, metadata-only app with unchanged exact roots and no pending work or history. Other unavailable/revoked approvals remain blocked. This does not import cloud credentials, enable autosave, or start uploads.\n");
         }
         if self.action == Action::Download {
             message.push_str(if self.params["overwriteAcknowledgement"] == true {
@@ -942,6 +989,8 @@ pub fn validate_query(name: &str, params: &Value) -> Result<()> {
     validate_document(params)?;
     let allowed: &[&str] = match name {
         "dashboard"
+        | "vault_status"
+        | "vault_readiness"
         | "provider_types"
         | "software"
         | "activity"
@@ -1248,6 +1297,104 @@ mod tests {
 
     fn request() -> Request {
         Request::new("upload", json!({"softwareId":"app-one","providerId":"provider-one","fileIds":["root-a/save.dat"]})).unwrap()
+    }
+
+    #[test]
+    fn local_storage_actions_are_parameterless_format_bound_single_use_tickets() {
+        assert!(validate_query("vault_readiness", &json!({})).is_ok());
+        assert!(validate_query("vault_readiness", &json!({"authorize":true})).is_err());
+        for (action, format) in [
+            ("setup_local_tracking", "legacy"),
+            ("authorize_tracking_storage", "encrypted_state"),
+        ] {
+            for field in [
+                "generation",
+                "workspaceIdentity",
+                "approved",
+                "reset",
+                "rootKey",
+            ] {
+                let mut params = json!({});
+                params[field] = json!("forged");
+                assert!(Request::new(action, params).is_err());
+            }
+            let scope = json!({"generation":4,"workspaceIdentity":"a".repeat(64),"format":format});
+            let mut request = Request::new(action, json!({})).unwrap();
+            let mut wrong_format = scope.clone();
+            wrong_format["format"] = json!(if format == "legacy" {
+                "encrypted_state"
+            } else {
+                "legacy"
+            });
+            assert!(request.bind_scope(wrong_format).is_err());
+            request.bind_scope(scope.clone()).unwrap();
+            let proof = WorkspaceProofs::pin(&request).unwrap();
+            assert_eq!(proof.worker_identities().unwrap(), json!([]));
+            let now = Instant::now();
+            let mut tickets = TicketStore::default();
+            let id = tickets.issue(request, proof, now).unwrap().parse().unwrap();
+            let ticket = tickets.consume(id, now).unwrap();
+            assert!(tickets.consume(id, now).is_err());
+            ticket.verify(&scope).unwrap();
+            for field in ["generation", "workspaceIdentity"] {
+                let mut changed = scope.clone();
+                changed[field] = if field == "generation" {
+                    json!(5)
+                } else {
+                    json!("b".repeat(64))
+                };
+                assert!(ticket.verify(&changed).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_migration_accepts_no_caller_authority_and_binds_exact_local_scope() {
+        assert!(validate_query("vault_status", &json!({})).is_ok());
+        assert!(validate_query("vault_status", &json!({"unlock":true})).is_err());
+        for field in [
+            "approved",
+            "generation",
+            "workspaceIdentity",
+            "format",
+            "paths",
+            "_scopeFingerprint",
+            "_approvedPaths",
+        ] {
+            let mut params = json!({});
+            params[field] = json!("forged");
+            assert!(Request::new("migrate_vault", params).is_err());
+        }
+        let mut request = Request::new("migrate_vault", json!({})).unwrap();
+        let scope = json!({"generation":4,"workspaceIdentity":"a".repeat(64),"format":"legacy"});
+        request.bind_scope(scope.clone()).unwrap();
+        assert!(request.directory_paths().unwrap().is_empty());
+        let text = request.confirmation_message().unwrap();
+        for expected in [
+            "state.json",
+            "ONLY during this explicit migration",
+            "ONE active native-vault",
+            "keep old credential values and delete no old items",
+            "Background access remains noninteractive",
+            "does not connect an account, upload data, or grant file access",
+        ] {
+            assert!(text.contains(expected));
+        }
+        let now = Instant::now();
+        let proof = WorkspaceProofs::pin(&request).unwrap();
+        assert_eq!(proof.worker_identities().unwrap(), json!([]));
+        let mut tickets = TicketStore::default();
+        let id = tickets.issue(request, proof, now).unwrap().parse().unwrap();
+        let ticket = tickets.consume(id, now).unwrap();
+        ticket.verify(&scope).unwrap();
+        for changed in [
+            json!({"generation":5,"workspaceIdentity":"a".repeat(64),"format":"legacy"}),
+            json!({"generation":4,"workspaceIdentity":"b".repeat(64),"format":"legacy"}),
+            json!({"generation":4,"workspaceIdentity":"a".repeat(64),"format":"encrypted_state"}),
+        ] {
+            assert!(ticket.verify(&changed).is_err());
+        }
+        assert!(tickets.consume(id, now).is_err());
     }
 
     #[test]

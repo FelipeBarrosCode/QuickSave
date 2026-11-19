@@ -13,6 +13,9 @@ struct FakeVaultStore {
     offline: AtomicBool,
     fail_writes: AtomicBool,
     issued_grants: AtomicUsize,
+    verification_calls: AtomicUsize,
+    failing_verification: Mutex<Option<(String, String)>>,
+    deferred_tracking: Mutex<BTreeSet<String>>,
 }
 
 impl FakeVaultStore {
@@ -56,9 +59,35 @@ impl TrackingStore for FakeVaultStore {
     }
     fn issue_grant(&self, kind: &str, scope: &Value) -> Result<Value> {
         self.issued_grants.fetch_add(1, Ordering::AcqRel);
+        if kind == "tracking" {
+            if let Some(id) = scope["softwareId"].as_str() {
+                self.deferred_tracking.lock().unwrap().remove(id);
+            }
+        }
         Ok(self.proof(kind, scope))
     }
     fn verify_grant(&self, kind: &str, scope: &Value, grant: &Value) -> Result<bool> {
+        self.verification_calls.fetch_add(1, Ordering::Relaxed);
+        if kind == "tracking"
+            && scope["softwareId"]
+                .as_str()
+                .is_some_and(|id| self.deferred_tracking.lock().unwrap().contains(id))
+        {
+            return Err(DeferredLegacyAuthority.into());
+        }
+        if self
+            .failing_verification
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(failed_kind, id)| {
+                failed_kind == kind
+                    && (scope["softwareId"].as_str() == Some(id.as_str())
+                        || scope["tracking"]["softwareId"].as_str() == Some(id.as_str()))
+            })
+        {
+            bail!("synthetic locked keychain");
+        }
         Ok(grant == &self.proof(kind, scope))
     }
     fn revoke_grant(&self, kind: &str, scope: &Value) -> Result<()> {
@@ -82,6 +111,211 @@ struct Harness {
     store: Arc<FakeVaultStore>,
     tracker: Tracker,
     receiver: Receiver<native::Hint>,
+}
+
+#[test]
+fn temporary_authority_failure_is_redacted_isolated_and_requires_explicit_recheck() {
+    let h = Harness::new();
+    let root = h.root("temporary-authority");
+    fs::write(root.join("save"), b"synthetic bytes").unwrap();
+    let id = h.approve(&root);
+    h.tracker.scan(&id).unwrap();
+    let work = h.tracker.begin_upload(&id, "provider-a", None).unwrap();
+    h.finish(&work, true);
+    h.tracker
+        .configure_autosave(&id, "provider-a", true)
+        .unwrap();
+    let other = h.approve(&h.root("independent-authority"));
+    let before = {
+        let apps = h.tracker.shared.apps().unwrap();
+        serde_json::to_value(&apps[&id].record).unwrap()
+    };
+    *h.store.failing_verification.lock().unwrap() = Some(("tracking".into(), id.clone()));
+    let counters = h.tracker.performance_counters();
+    let list = h.tracker.software().unwrap();
+    let paused = list.iter().find(|value| value["id"] == id).unwrap();
+    assert_eq!(paused["authorizationPending"], true);
+    assert_eq!(paused["tracked"], false);
+    assert_eq!(paused["status"], "needs_authorization");
+    assert!(paused["bundle"].is_null());
+    assert_eq!(paused["roots"], json!([]));
+    assert!(list
+        .iter()
+        .any(|value| value["id"] == other && value["authorizationPending"] == false));
+    assert!(h.tracker.file_listing(&id, None, 10).is_err());
+    assert!(h.tracker.scan(&id).is_err());
+    assert_eq!(h.tracker.performance_counters(), counters);
+    {
+        let apps = h.tracker.shared.apps().unwrap();
+        let after = serde_json::to_value(&apps[&id].record).unwrap();
+        for key in [
+            "trackingGrant",
+            "autosaveGrant",
+            "autosave",
+            "baseline",
+            "baselineFullScope",
+            "bundleIndexSource",
+            "lastConfirmedUploadedGeneration",
+        ] {
+            assert_eq!(after[key], before[key], "{key}");
+        }
+    }
+    *h.store.failing_verification.lock().unwrap() = None;
+    // A successful poll is not permission to resume background uploads.
+    assert_eq!(
+        h.tracker
+            .software()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == id)
+            .unwrap()["authorizationPending"],
+        true
+    );
+    assert!(h.tracker.file_listing(&id, None, 10).is_err());
+    h.tracker.scan(&id).unwrap();
+    assert!(!h.tracker.shared.apps().unwrap()[&id].authorization_paused);
+}
+
+#[test]
+fn temporary_autosave_verification_failure_keeps_native_opt_in() {
+    let h = Harness::new();
+    let id = h.approve(&h.root("autosave-authority"));
+    h.tracker
+        .configure_autosave(&id, "provider-a", true)
+        .unwrap();
+    *h.store.failing_verification.lock().unwrap() = Some(("autosave".into(), id.clone()));
+    assert_eq!(
+        h.tracker.software().unwrap()[0]["authorizationPending"],
+        true
+    );
+    let apps = h.tracker.shared.apps().unwrap();
+    assert!(apps[&id].record.autosave);
+    assert!(apps[&id].record.autosave_grant.is_some());
+    assert!(apps[&id].scheduler.paused);
+}
+
+#[test]
+fn restart_with_unavailable_authority_retains_persisted_references() {
+    let h = Harness::new();
+    let root = h.root("restart-authority");
+    fs::write(root.join("save"), b"restart fixture").unwrap();
+    let id = h.approve(&root);
+    h.tracker.scan(&id).unwrap();
+    let work = h.tracker.begin_upload(&id, "provider-a", None).unwrap();
+    h.finish(&work, true);
+    h.tracker
+        .configure_autosave(&id, "provider-a", true)
+        .unwrap();
+    let before = h.store.records.lock().unwrap()[&id].clone();
+    *h.store.failing_verification.lock().unwrap() = Some(("tracking".into(), id.clone()));
+    let reopened = Tracker::open_impl(
+        h.store.clone(),
+        Arc::new(|_| Ok(())),
+        h.tracker.shared.policy.clone(),
+        false,
+    )
+    .unwrap();
+    let list = reopened.software().unwrap();
+    assert_eq!(list[0]["authorizationPending"], true);
+    let apps = reopened.shared.apps().unwrap();
+    let after = serde_json::to_value(&apps[&id].record).unwrap();
+    for key in [
+        "trackingGrant",
+        "autosaveGrant",
+        "autosave",
+        "baseline",
+        "baselineFullScope",
+        "bundleIndexSource",
+        "lastConfirmedUploadedGeneration",
+    ] {
+        assert_eq!(after[key], before[key], "{key}");
+    }
+}
+
+#[test]
+fn deferred_historical_authority_preserves_references_with_valid_current_tracking() {
+    for kind in ["tracking_baseline", "bundle_manifest", "bundle_index"] {
+        let h = Harness::new();
+        let root = h.root("deferred-history");
+        fs::write(root.join("save"), b"historical confirmed bytes").unwrap();
+        let id = h.approve(&root);
+        h.tracker.scan(&id).unwrap();
+        let work = h.tracker.begin_upload(&id, "provider-a", None).unwrap();
+        h.finish(&work, true);
+        h.tracker
+            .configure_autosave(&id, "provider-a", true)
+            .unwrap();
+        let before = h.store.records.lock().unwrap()[&id].clone();
+        assert!(!before["baseline"].is_null());
+        assert!(!before["bundleIndexSource"].is_null());
+        *h.store.failing_verification.lock().unwrap() = Some((kind.into(), id.clone()));
+        {
+            let apps = h.tracker.shared.apps().unwrap();
+            let record = &apps[&id].record;
+            assert!(h
+                .store
+                .verify_grant("tracking", &record.tracking_scope(), &record.tracking_grant)
+                .unwrap());
+        }
+        let reopened = Tracker::open_impl(
+            h.store.clone(),
+            Arc::new(|_| Ok(())),
+            h.tracker.shared.policy.clone(),
+            false,
+        )
+        .unwrap();
+        let list = reopened.software().unwrap();
+        assert_eq!(list[0]["authorizationPending"], true, "{kind}");
+        assert_eq!(list[0]["tracked"], false);
+        assert_ne!(list[0]["status"], "saved");
+        assert!(list[0]["bundle"].is_null());
+        {
+            let apps = reopened.shared.apps().unwrap();
+            let app = &apps[&id];
+            assert!(app.authorization_paused && app.scheduler.paused);
+            assert!(app.current.is_none(), "{kind}");
+            if kind == "tracking_baseline" {
+                assert!(app.baseline.is_none());
+            }
+        }
+        assert!(reopened.file_listing(&id, None, 10).is_err());
+        assert!(reopened.root_authority(&id).is_err());
+        assert!(reopened.begin_upload(&id, "provider-a", None).is_err());
+        assert!(reopened.scan(&id).is_err());
+        let after = h.store.records.lock().unwrap()[&id].clone();
+        for key in [
+            "roots",
+            "trackingGrant",
+            "autosaveGrant",
+            "autosave",
+            "baseline",
+            "baselineFullScope",
+            "bundleIndexSource",
+            "captureReceipt",
+            "lastSavedAt",
+            "lastConfirmedUploadedGeneration",
+        ] {
+            assert_eq!(after[key], before[key], "{kind}: {key}");
+        }
+        *h.store.failing_verification.lock().unwrap() = None;
+        assert_eq!(
+            reopened.software().unwrap()[0]["authorizationPending"],
+            true
+        );
+        assert!(reopened.file_listing(&id, None, 10).is_err());
+        reopened.scan(&id).unwrap();
+        assert_eq!(
+            reopened.software().unwrap()[0]["authorizationPending"],
+            false
+        );
+        assert!(reopened.file_listing(&id, None, 10).is_ok());
+        assert!(
+            !h.store.records.lock().unwrap()[&id]["authorizationPending"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(reopened.performance_counters()["filesHashed"], 1);
+    }
 }
 
 impl Harness {
@@ -180,6 +414,31 @@ fn scans_never_confirm_uploads_and_changed_dirty_is_since_last_confirmed_snapsho
     assert_eq!(h.scan(&id)["captureSource"]["changedDirty"], true);
     assert_eq!(h.scan(&id)["captureSource"]["changedDirty"], true);
     assert_eq!(fs::read(root.join("save.dat")).unwrap(), b"two");
+}
+
+#[test]
+fn idle_native_ticks_skip_authority_io_but_audit_still_checks_denial() {
+    let mut h = Harness::new();
+    let root = h.root("idle-source");
+    fs::write(root.join("save.dat"), b"one").unwrap();
+    let id = h.approve(&root);
+    h.scan(&id);
+    let before = h.store.verification_calls.load(Ordering::Relaxed);
+    for _ in 0..100 {
+        assert!(native::tick(&h.tracker.shared, BTreeSet::new(), false, false).is_empty());
+    }
+    assert_eq!(h.store.verification_calls.load(Ordering::Relaxed), before);
+    // Advance the injected worker clock beyond enrollment's quiet period.
+    Arc::get_mut(&mut h.tracker.shared).unwrap().origin =
+        Instant::now() - std::time::Duration::from_secs(10);
+    *h.store.failing_verification.lock().unwrap() = Some(("tracking".into(), id));
+    assert!(native::tick(&h.tracker.shared, BTreeSet::new(), false, true).is_empty());
+    assert!(h.store.verification_calls.load(Ordering::Relaxed) > before);
+    let after = h.store.verification_calls.load(Ordering::Relaxed);
+    for _ in 0..10 {
+        native::tick(&h.tracker.shared, BTreeSet::new(), false, true);
+    }
+    assert_eq!(h.store.verification_calls.load(Ordering::Relaxed), after);
 }
 
 #[test]
@@ -537,9 +796,12 @@ fn startup_requires_reconciliation_and_baseline_tampering_cannot_mark_clean() {
     let baseline_name = raw["baseline"]["name"].as_str().unwrap();
     fs::write(policy.baseline_dir().join(baseline_name), b"{}").unwrap();
     let corrupt = Tracker::open_impl(h.store.clone(), Arc::new(|_| Ok(())), policy, false).unwrap();
+    assert!(corrupt.scan(&id).is_err());
+    assert_eq!(corrupt.software().unwrap()[0]["authorizationPending"], true);
+    assert_ne!(corrupt.software().unwrap()[0]["status"], "saved");
     assert_eq!(
-        corrupt.scan(&id).unwrap()["captureSource"]["changedDirty"],
-        true
+        h.store.records.lock().unwrap()[&id]["baseline"],
+        raw["baseline"]
     );
     corrupt.shutdown().unwrap();
     assert_eq!(fs::read(root.join("save.dat")).unwrap(), b"confirmed");
@@ -831,10 +1093,13 @@ fn an_old_provider_baseline_cannot_be_rebound_through_plaintext_state() {
         false,
     )
     .unwrap();
+    assert!(restarted.scan(&id).is_err());
     assert_eq!(
-        restarted.scan(&id).unwrap()["captureSource"]["changedDirty"],
+        restarted.software().unwrap()[0]["authorizationPending"],
         true
     );
+    assert_ne!(restarted.software().unwrap()[0]["status"], "saved");
+    assert!(restarted.begin_upload(&id, "provider-b", None).is_err());
 }
 
 fn directory_proof(path: &Path) -> Value {

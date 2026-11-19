@@ -50,6 +50,8 @@ fn project_diagnostics(input: &Value) -> Vec<Value> {
         })
     }
     let mut output = Vec::new();
+    let mut shared_protection =
+        std::collections::BTreeMap::<(String, String, String, String), usize>::new();
     for diagnostic in input.as_array().into_iter().flatten().take(256) {
         if output.len() == 256 {
             break;
@@ -62,8 +64,21 @@ fn project_diagnostics(input: &Value) -> Vec<Value> {
         {
             item["name"] = json!(name);
         }
-        item["message"] = json!(diagnostic_message(diagnostic));
+        let shared_failure = diagnostic["rootDiagnostics"]
+            .as_array()
+            .is_some_and(|roots| {
+                roots
+                    .iter()
+                    .take(48)
+                    .any(|root| root["inspectionSide"] == "protected")
+            });
+        item["message"] = if shared_failure {
+            json!("Indexing is blocked by a shared protected-folder safety check. Existing revisions are retained; affected roots remain unverified.")
+        } else {
+            json!(diagnostic_message(diagnostic))
+        };
         output.push(item.clone());
+        let mut counted = BTreeSet::new();
         for root in diagnostic["rootDiagnostics"]
             .as_array()
             .into_iter()
@@ -73,10 +88,66 @@ fn project_diagnostics(input: &Value) -> Vec<Value> {
             if output.len() == 256 {
                 break;
             }
+            let omitted = matches!(
+                root["code"].as_str(),
+                Some(
+                    "unselected_role"
+                        | "data_only_container_boundary_omitted"
+                        | "container_boundary_indexed_via_verified_children"
+                )
+            );
+            if omitted {
+                let mut detail = super::boundary::copy_fields(&item, &["appId", "name"]);
+                detail["code"] = root["code"].clone();
+                detail["message"] = json!(clean(&root["message"], 1024).unwrap_or(
+                    "This root was intentionally omitted; application coverage remains partial."
+                ));
+                detail["severity"] = json!("info");
+                if let Some(path) = clean(&root["path"], 4096) {
+                    detail["path"] = json!(path);
+                }
+                output.push(detail);
+                continue;
+            }
             let role = clean(&root["role"], 64).unwrap_or("application");
             let stage = clean(&root["stage"], 128).unwrap_or("native metadata");
             let reason = clean(&root["reason"], 1024)
                 .unwrap_or("Native access or root identity could not be verified.");
+            if root["inspectionSide"] == "protected" {
+                let path = clean(&root["protectedRootPath"], 4096)
+                    .or_else(|| clean(&root["path"], 4096))
+                    .unwrap_or("");
+                let relative = clean(&root["relativePath"], 1024).unwrap_or("");
+                let key = (
+                    path.to_owned(),
+                    stage.to_owned(),
+                    relative.to_owned(),
+                    reason.to_owned(),
+                );
+                if let Some(index) = shared_protection.get(&key).copied() {
+                    if counted.insert(key) {
+                        let count = output[index]["affectedApplications"].as_u64().unwrap_or(1);
+                        output[index]["affectedApplications"] = json!(count + 1);
+                    }
+                    continue;
+                }
+                counted.insert(key.clone());
+                let mut detail = json!({
+                    "code":"tracking_policy_protection_unavailable",
+                    "name":"Shared tracking safety rule",
+                    "message":format!("Protected-folder safety check, {stage}: {reason}. Do not change secret-folder permissions; affected roots remain blocked."),
+                    "affectedApplications":1,"stage":stage,
+                });
+                if !path.is_empty() {
+                    detail["path"] = json!(path);
+                }
+                if !relative.is_empty() {
+                    detail["relativePath"] = json!(relative);
+                }
+                shared_protection.insert(key, output.len());
+                output.push(detail);
+                continue;
+            }
             let subject = match clean(&root["inspectionSide"], 32) {
                 Some("protected") => "Protected-folder safety check".to_owned(),
                 Some("both" | "undetermined") => "Folder-overlap safety check".to_owned(),
@@ -122,10 +193,48 @@ pub(super) fn materialize(
         "policyHash":blake3::hash(&serde_json::to_vec(scope)?).to_hex().to_string(),
         "candidatesHash":blake3::hash(&serde_json::to_vec(candidates)?).to_hex().to_string(),
     });
-    let grant = store.issue_grant("bundle_discovery", &discovery_scope)?;
+    // Reissuing an identical scope rotates its native nonce and revokes every
+    // enrollment referencing the previous batch attestation. Reuse only an
+    // exact, still-native-verified attestation; metadata alone is not authority.
+    let mut retained = None;
+    let mut seen = BTreeSet::new();
+    for software in &store.document()?.software {
+        if let Some(enrollment) = &software.auto_enrollment {
+            if enrollment.policy_scope == *scope
+                && enrollment.discovery_scope == discovery_scope
+                && seen.insert(
+                    blake3::hash(&serde_json::to_vec(&enrollment.discovery_grant)?)
+                        .to_hex()
+                        .to_string(),
+                )
+            {
+                match store.verify_grant(
+                    "bundle_discovery",
+                    &discovery_scope,
+                    &enrollment.discovery_grant,
+                ) {
+                    Ok(true) => {
+                        retained = Some(enrollment.discovery_grant.clone());
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) if quicksave_state::is_legacy_credential_deferred(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    let grant = match retained {
+        Some(grant) => grant,
+        None => store.issue_grant("bundle_discovery", &discovery_scope)?,
+    };
     let authority = json!({"policyScope":scope,"policyGrant":policy["policyGrant"],
         "discoveryScope":discovery_scope,"discoveryGrant":grant});
-    let mut output = tracker.materialize_bundles(candidates, &authority)?;
+    let mut output = if input["explicitAuthorizationRecheck"] == true {
+        tracker.refresh_bundles(candidates, &authority)?
+    } else {
+        tracker.materialize_bundles(candidates, &authority)?
+    };
     let diagnostics = output["diagnostics"]
         .as_array_mut()
         .context("Materialization diagnostics are unavailable")?;
@@ -315,6 +424,17 @@ impl super::WorkspaceService {
         status["completedApps"] = json!(completed);
         status["totalApps"] = json!(total);
         let diagnostics = project_diagnostics(&status["diagnostics"]);
+        let mut diagnostics = diagnostics;
+        let pending = self
+            .tracking_authorization_issues
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Tracking diagnostic lock failed"))?;
+        for diagnostic in pending
+            .iter()
+            .take(256usize.saturating_sub(diagnostics.len()))
+        {
+            diagnostics.push(diagnostic.clone());
+        }
         status["diagnostics"] = json!(diagnostics);
         Ok(status)
     }
@@ -359,7 +479,10 @@ impl super::WorkspaceService {
                     status["totalApplications"] =
                         json!(report["bundlePlans"].as_array().map_or(0, Vec::len));
                 }
-                let input = json!({"report":report,"replacePolicy":false});
+                // This marker is assembled here after spending native consent;
+                // it is never accepted as renderer-supplied authority.
+                let input = json!({"report":report,"replacePolicy":false,
+                    "explicitAuthorizationRecheck":true});
                 service.tracking_call("materialize_bundles", input).await
             }
             .await;
@@ -429,6 +552,73 @@ mod diagnostic_tests {
             .as_str()
             .unwrap()
             .contains("install root"));
+    }
+
+    #[test]
+    fn one_protected_rule_failure_is_grouped_across_application_rulesets() {
+        let input = [
+            "bundle-id",
+            "container",
+            "group-container",
+            "steam",
+            "xdg",
+            "windows",
+        ]
+        .into_iter()
+        .map(|name| {
+            json!({
+                "displayName":name,"message":"Do not repeat raw protected paths per app",
+                "rootDiagnostics":[{"inspectionSide":"protected","role":"save",
+                    "stage":"inspect_policy_overlap","reason":"Permission denied (os error 13)",
+                    "path":"/synthetic/protected","relativePath":"private-directory",
+                    "selectedRootPath":format!("/synthetic/{name}"),
+                    "grant":{"mustNotBeProjected":true}}]
+            })
+        })
+        .collect::<Vec<_>>();
+        let projected = project_diagnostics(&json!(input));
+        let shared = projected
+            .iter()
+            .filter(|item| item["code"] == "tracking_policy_protection_unavailable")
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0]["affectedApplications"], 6);
+        assert_eq!(shared[0]["path"], "/synthetic/protected");
+        assert!(shared[0].get("grant").is_none());
+        assert_eq!(projected.len(), 7);
+        assert!(projected
+            .iter()
+            .filter(|item| item["name"] != "Shared tracking safety rule")
+            .all(|item| item["message"]
+                .as_str()
+                .unwrap()
+                .contains("shared protected-folder")));
+    }
+
+    #[test]
+    fn intentionally_omitted_roles_are_not_reported_as_permission_failures() {
+        for code in [
+            "unselected_role",
+            "data_only_container_boundary_omitted",
+            "container_boundary_indexed_via_verified_children",
+        ] {
+            let projected = project_diagnostics(&json!([{
+                "displayName":"Synthetic partial app","message":"Coverage is partial",
+                "rootDiagnostics":[{"code":code,"omitted":true,
+                    "message":"Explicitly not selected; no complete-application coverage.",
+                    "path":"/synthetic/installation"}],
+            }]));
+            assert_eq!(projected[1]["code"], code);
+            assert_eq!(projected[1]["severity"], "info");
+            assert!(!projected[1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("could not be verified"));
+            assert!(!projected[1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Permission"));
+        }
     }
 
     #[test]

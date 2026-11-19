@@ -115,6 +115,64 @@ fn protected_products_are_not_enrolled_or_treated_as_unresolved_apps() {
 }
 
 #[test]
+fn protected_only_inventory_is_informational_unless_notices_are_truncated() {
+    let temp = temporary();
+    let root = temp.path();
+    let scope = mac_scope(root);
+    app(&root.join("Applications/One.app"), "com.noland.connect");
+    app(&root.join("Applications/Two.app"), "app.quicksave.desktop");
+    let mut backend = FixtureBundleBackend::new(root, Platform::MacOs).unwrap();
+    let report = run(&mut backend, &scope);
+    assert!(plans(&report).is_empty());
+    assert!(unresolved(&report).is_empty());
+    assert_eq!(report["inventoryIncomplete"], false);
+    assert_eq!(report["diagnostics"].as_array().unwrap().len(), 2);
+    assert_eq!(report["omittedDiagnostics"], 0);
+    let report = discover_software_bundles_with_backend(
+        &mut backend,
+        &scope,
+        BundlePlanLimits {
+            max_diagnostics: 1,
+            ..BundlePlanLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report["inventoryIncomplete"], true);
+    assert_eq!(report["diagnostics"].as_array().unwrap().len(), 1);
+    assert_eq!(report["omittedDiagnostics"], 1);
+}
+
+#[test]
+fn explicit_protected_inventory_scope_is_an_informational_exclusion() {
+    let temp = temporary();
+    let root = temp.path();
+    let mut scope = mac_scope(root);
+    scope.protected_roots = scope.application_directories.clone();
+    let mut backend = FixtureBundleBackend::new(root, Platform::MacOs).unwrap();
+    let report = run(&mut backend, &scope);
+    assert_eq!(report["inventoryIncomplete"], false);
+    assert_eq!(report["diagnostics"][0]["code"], "protected_inventory_path");
+    assert_eq!(report["examinedEntries"], 0);
+}
+
+#[test]
+fn missing_bundle_metadata_remains_unresolved_and_incomplete() {
+    let temp = temporary();
+    let root = temp.path();
+    let scope = mac_scope(root);
+    fs::create_dir_all(root.join("Applications/Unknown.app")).unwrap();
+    let mut backend = FixtureBundleBackend::new(root, Platform::MacOs).unwrap();
+    let report = run(&mut backend, &scope);
+    assert!(plans(&report).is_empty());
+    assert_eq!(unresolved(&report).len(), 1);
+    assert!(has_reason(
+        &unresolved(&report)[0],
+        "invalid_bundle_identity_metadata"
+    ));
+    assert_eq!(report["inventoryIncomplete"], true);
+}
+
+#[test]
 fn real_native_install_and_exact_bundle_data_not_title_folders() {
     let temp = temporary();
     let root = temp.path();
@@ -294,6 +352,11 @@ fn container_metadata_and_validated_signed_groups_bind_exact_owners() {
     let plan = &plans(&report)[0];
     assert!(has_path(plan, &data));
     assert!(has_path(plan, &data.join("Data/Documents")));
+    assert!(has_path(
+        plan,
+        &data.join("Data/Library/Application Support")
+    ));
+    assert!(has_path(plan, &data.join("Data/Library/Preferences")));
     assert!(has_path(plan, &group));
     assert!(!has_path(plan, &unrelated));
     let group_root = roots(plan)
@@ -699,6 +762,165 @@ struct AuditedBackend {
     deny_native_path: Option<PathBuf>,
 }
 
+struct NativeCatalogFixture {
+    inner: FixtureBundleBackend,
+    catalog: MacApplicationInventory,
+    unavailable: bool,
+    installation_base: PathBuf,
+}
+impl SoftwareBundleBackend for NativeCatalogFixture {
+    fn platform(&self) -> Platform {
+        Platform::MacOs
+    }
+    fn kind(&self) -> BackendKind {
+        BackendKind::IsolatedFixture
+    }
+    fn mac_application_inventory(
+        &mut self,
+        _: &[PathBuf],
+        _: usize,
+    ) -> anyhow::Result<Option<MacApplicationInventory>> {
+        if self.unavailable {
+            return Err(
+                anyhow::anyhow!("synthetic-private-native-error-body").context(
+                    super::backend::MacInventoryFailure("native_inventory_response_decode"),
+                ),
+            );
+        }
+        Ok(Some(self.catalog.clone()))
+    }
+    fn inspect_native(&mut self, path: &Path) -> anyhow::Result<Option<NativeNode>> {
+        assert!(
+            path.starts_with(self.installation_base.parent().unwrap()),
+            "unapproved OS hint must not be opened"
+        );
+        self.inner.inspect_native(path)
+    }
+    fn list_directory(
+        &mut self,
+        path: &Path,
+        maximum: usize,
+    ) -> anyhow::Result<Option<DirectoryEntries>> {
+        assert_ne!(
+            path, self.installation_base,
+            "native inventory must not crawl application folders"
+        );
+        self.inner.list_directory(path, maximum)
+    }
+    fn read_metadata(
+        &mut self,
+        path: &Path,
+        maximum: usize,
+    ) -> anyhow::Result<Option<MetadataDocument>> {
+        self.inner.read_metadata(path, maximum)
+    }
+}
+
+#[test]
+fn native_catalog_candidates_replace_folder_crawling_without_becoming_authority() {
+    let temp = temporary();
+    let scope = mac_scope(temp.path());
+    let bundle = temp.path().join("Applications/Registered.app");
+    app(&bundle, "org.fixture.Registered");
+    let mut paths = vec![
+        bundle.clone(),
+        bundle,
+        PathBuf::from("/outside-policy/Unknown.app"),
+    ];
+    let case_alias = temp.path().join("Applications/REGISTERED.app");
+    if case_alias.exists() {
+        paths.push(case_alias);
+    }
+    let mut backend = NativeCatalogFixture {
+        inner: FixtureBundleBackend::new(temp.path(), Platform::MacOs).unwrap(),
+        catalog: MacApplicationInventory {
+            paths,
+            incomplete: false,
+        },
+        unavailable: false,
+        installation_base: temp.path().join("Applications"),
+    };
+    let report =
+        discover_software_bundles_with_backend(&mut backend, &scope, BundlePlanLimits::default())
+            .unwrap();
+    assert_eq!(
+        report["bundlePlans"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    assert!(report["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["code"] == "native_application_candidate_rejected"));
+}
+
+#[test]
+fn unavailable_or_partial_native_inventory_never_falls_back_to_folder_scanning() {
+    for unavailable in [true, false] {
+        let temp = temporary();
+        let scope = mac_scope(temp.path());
+        let bundle = temp.path().join("Applications/Present.app");
+        app(&bundle, "org.fixture.Present");
+        let mut backend = NativeCatalogFixture {
+            inner: FixtureBundleBackend::new(temp.path(), Platform::MacOs).unwrap(),
+            catalog: MacApplicationInventory {
+                paths: vec![bundle],
+                incomplete: true,
+            },
+            unavailable,
+            installation_base: temp.path().join("Applications"),
+        };
+        let report = discover_software_bundles_with_backend(
+            &mut backend,
+            &scope,
+            BundlePlanLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(report["inventoryIncomplete"], true, "{report}");
+        assert_eq!(
+            report["bundlePlans"].as_array().unwrap().len(),
+            if unavailable { 0 } else { 1 }
+        );
+        if unavailable {
+            assert!(report["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value["code"] == "native_inventory_response_decode"));
+            assert!(!report
+                .to_string()
+                .contains("synthetic-private-native-error-body"));
+        }
+    }
+}
+
+#[test]
+fn native_registration_does_not_replace_missing_bundle_identity_with_a_name() {
+    let temp = temporary();
+    let scope = mac_scope(temp.path());
+    let bundle = temp
+        .path()
+        .join("Applications/RegisteredWithoutMetadata.app");
+    fs::create_dir_all(&bundle).unwrap();
+    let mut backend = NativeCatalogFixture {
+        inner: FixtureBundleBackend::new(temp.path(), Platform::MacOs).unwrap(),
+        catalog: MacApplicationInventory {
+            paths: vec![bundle],
+            incomplete: false,
+        },
+        unavailable: false,
+        installation_base: temp.path().join("Applications"),
+    };
+    let report = run(&mut backend, &scope);
+    assert!(plans(&report).is_empty());
+    assert_eq!(unresolved(&report).len(), 1);
+    assert!(has_reason(
+        &unresolved(&report)[0],
+        "invalid_bundle_identity_metadata"
+    ));
+}
+
 impl SoftwareBundleBackend for AuditedBackend {
     fn platform(&self) -> Platform {
         self.inner.platform()
@@ -850,6 +1072,33 @@ fn metadata_entries_paths_and_root_budgets_are_hard_bounded() {
 }
 
 #[test]
+fn denied_installation_stays_unresolved_without_reading_its_metadata() {
+    let temp = temporary();
+    let root = temp.path();
+    let scope = mac_scope(root);
+    let denied = root.join("Applications/Denied.app");
+    app(&denied, "org.fixture.Denied");
+    let mut backend = AuditedBackend {
+        inner: FixtureBundleBackend::new(root, Platform::MacOs).unwrap(),
+        read_paths: Vec::new(),
+        mutate_executable_during_signing: None,
+        deny_native_path: Some(denied.clone()),
+    };
+    let report = run(&mut backend, &scope);
+    assert!(plans(&report).is_empty());
+    assert_eq!(unresolved(&report).len(), 1);
+    assert!(has_reason(
+        &unresolved(&report)[0],
+        "installation_identity_unverified"
+    ));
+    assert_eq!(report["inventoryIncomplete"], true);
+    assert!(backend.read_paths.is_empty());
+    assert!(report["diagnostics"].as_array().unwrap().iter().any(|row| {
+        row["code"] == "native_permission_denied" && row["path"].as_str() == denied.to_str()
+    }));
+}
+
+#[test]
 fn native_permission_gap_is_distinct_from_absent_root_and_never_counted_as_source() {
     let temp = temporary();
     let root = temp.path();
@@ -868,6 +1117,7 @@ fn native_permission_gap_is_distinct_from_absent_root_and_never_counted_as_sourc
     assert!(has_reason(plan, "native_permission_denied"));
     assert!(!has_path(plan, &denied));
     assert_eq!(plan["rootsComplete"], false);
+    assert_eq!(report["inventoryIncomplete"], true);
     assert!(report["diagnostics"]
         .as_array()
         .unwrap()

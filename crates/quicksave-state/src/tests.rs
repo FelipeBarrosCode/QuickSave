@@ -25,6 +25,18 @@ fn fixture() -> (TempDir, MemoryVault, WorkspaceStore) {
     (temp, vault, store)
 }
 
+fn legacy_vault_read_count(vault: &MemoryVault) -> usize {
+    // Fresh single-item presence checks prevent legacy fallback after encrypted
+    // state rollback. Count actual legacy key/nonce reads separately, so these
+    // optimization tests do not prohibit the new anti-rollback guard.
+    vault.access_log().unwrap()["reads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|read| read[1] != crate::secret_store::ENCRYPTED_VAULT_ACCOUNT)
+        .count()
+}
+
 fn b2_input(name: &str) -> Value {
     json!({
         "kind":"backblaze_b2","name":name,"bucket":"synthetic-bucket","prefix":"backups",
@@ -99,6 +111,79 @@ fn tracked(store: &WorkspaceStore, provider: &str) {
         "dirtyGeneration":1,
     })).unwrap();
     store.seal_tracking_grant("software-1").unwrap();
+}
+
+#[test]
+fn execution_tracking_verification_holds_one_read_scope_without_republishing_state() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Weak,
+    };
+    struct ObservedVault {
+        backing: MemoryVault,
+        inner: std::sync::Mutex<Weak<Inner>>,
+        checking: AtomicBool,
+        checked: AtomicUsize,
+    }
+    impl CredentialVault for ObservedVault {
+        fn read(&self, service: &str, account: &str) -> Result<Option<Zeroizing<String>>> {
+            if self.checking.load(Ordering::Acquire) {
+                let inner = self.inner.lock().unwrap().upgrade().unwrap();
+                assert!(
+                    inner.operation.try_lock().is_err(),
+                    "authority read escaped its state scope"
+                );
+                self.checked.fetch_add(1, Ordering::AcqRel);
+            }
+            self.backing.read(service, account)
+        }
+        fn write(&self, service: &str, account: &str, value: &str) -> Result<()> {
+            self.backing.write(service, account, value)
+        }
+        fn delete(&self, service: &str, account: &str) -> Result<()> {
+            self.backing.delete(service, account)
+        }
+        fn accounts(&self, service: &str) -> Result<Vec<String>> {
+            self.backing.accounts(service)
+        }
+        fn account_inventory_supported(&self) -> bool {
+            true
+        }
+    }
+    for encrypted in [false, true] {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let vault = Arc::new(ObservedVault {
+            backing: MemoryVault::default(),
+            inner: std::sync::Mutex::new(Weak::new()),
+            checking: AtomicBool::new(false),
+            checked: AtomicUsize::new(0),
+        });
+        let store =
+            WorkspaceStore::open_with_vault(&temp.path().join("state"), vault.clone()).unwrap();
+        *vault.inner.lock().unwrap() = Arc::downgrade(&store.inner);
+        store
+            .update_software(&json!({"id":"read-scope","appId":"synthetic.application",
+            "name":"Synthetic","tracked":true,"roots":roots("/synthetic/approved"),
+            "dirtyGeneration":1}))
+            .unwrap();
+        store.seal_tracking_grant("read-scope").unwrap();
+        if encrypted {
+            store.migrate_to_encrypted_state().unwrap();
+        }
+        let before = std::fs::read(temp.path().join("state/state.json")).unwrap();
+        vault.checking.store(true, Ordering::Release);
+        assert!(store.verify_tracking_grant("read-scope").unwrap());
+        vault.checking.store(false, Ordering::Release);
+        assert!(vault.checked.load(Ordering::Acquire) > 0);
+        assert_eq!(
+            std::fs::read(temp.path().join("state/state.json")).unwrap(),
+            before
+        );
+        store
+            .revoke_grant("tracking", &json!({"softwareId":"read-scope"}))
+            .unwrap();
+        assert!(!store.verify_tracking_grant("read-scope").unwrap());
+    }
 }
 
 #[cfg(unix)]
@@ -981,6 +1066,60 @@ fn autosave_grants_bind_provider_root_and_preserve_events_during_upload() {
 }
 
 #[test]
+fn encrypted_migration_preserves_provider_keys_tracking_autosave_and_historical_baseline() {
+    let (temp, vault, store) = fixture();
+    let provider = connected(&store);
+    tracked(&store, &provider);
+    store.set_autosave("software-1", &provider, true).unwrap();
+    store
+        .update_software(&json!({"id":"software-1","baseline":{
+            "name":"retained-original-baseline","hash":"synthetic-retained-hash","grant":null,
+        }}))
+        .unwrap();
+    let before = store.software_record("software-1").unwrap();
+    let access = store
+        .provider_access(&provider, "fixture-operation")
+        .unwrap();
+    store.migrate_to_encrypted_state().unwrap();
+    assert_eq!(store.software_record("software-1").unwrap(), before);
+    assert!(store.verify_tracking_grant("software-1").unwrap());
+    assert!(store
+        .verify_autosave_grant("software-1", &provider)
+        .unwrap());
+    let after = store
+        .provider_access(&provider, "fixture-operation")
+        .unwrap();
+    assert_eq!(after.repository_key, access.repository_key);
+    assert_eq!(after.session, access.session);
+    let serialized = fs::read_to_string(temp.path().join("workspace/state.json")).unwrap();
+    assert!(!serialized.contains("synthetic-provider-secret"));
+    assert!(!serialized.contains(&hex::encode(access.repository_key)));
+    let restarted =
+        WorkspaceStore::open_with_vault(&temp.path().join("workspace"), Arc::new(vault)).unwrap();
+    assert!(restarted.verify_tracking_grant("software-1").unwrap());
+    assert!(restarted
+        .verify_autosave_grant("software-1", &provider)
+        .unwrap());
+    assert_eq!(
+        restarted
+            .provider_access(&provider, "fixture-operation")
+            .unwrap()
+            .repository_key,
+        access.repository_key
+    );
+    restarted
+        .set_autosave("software-1", &provider, false)
+        .unwrap();
+    assert!(!store
+        .verify_autosave_grant("software-1", &provider)
+        .unwrap());
+    assert_eq!(
+        restarted.software_record("software-1").unwrap()["baseline"],
+        before["baseline"]
+    );
+}
+
+#[test]
 fn current_confirmation_requires_saved_clean_reconciled_matching_nonzero_generations() {
     for unknown in [0, 1, u64::MAX] {
         for status in [
@@ -1332,14 +1471,11 @@ fn canonical_json_grants_ignore_map_order_but_not_array_or_scope_changes() {
 }
 
 #[test]
-fn native_document_macs_are_device_root_and_purpose_bound_without_state_or_repeat_vault_io() {
+fn native_document_macs_are_device_root_and_purpose_bound_without_state_or_repeat_key_reads() {
     let (temp, vault, store) = fixture();
     let before = fs::read(temp.path().join("workspace/state.json")).unwrap();
     let recovery = store.recovery_mac(b"synthetic native journal").unwrap();
-    let reads = vault.access_log().unwrap()["reads"]
-        .as_array()
-        .unwrap()
-        .len();
+    let reads = legacy_vault_read_count(&vault);
     assert_eq!(
         store.recovery_mac(b"synthetic native journal").unwrap(),
         recovery
@@ -1352,13 +1488,7 @@ fn native_document_macs_are_device_root_and_purpose_bound_without_state_or_repea
         store.recovery_mac(b"different native journal").unwrap(),
         recovery
     );
-    assert_eq!(
-        vault.access_log().unwrap()["reads"]
-            .as_array()
-            .unwrap()
-            .len(),
-        reads
-    );
+    assert_eq!(legacy_vault_read_count(&vault), reads);
     assert_eq!(
         fs::read(temp.path().join("workspace/state.json")).unwrap(),
         before
@@ -1483,10 +1613,7 @@ fn metadata_frame_reuses_one_document_for_4096_trait_verifications_but_not_threa
         .unwrap();
     let state = temp.path().join("workspace/state.json");
     let held = temp.path().join("workspace/held-metadata-state.json");
-    let before_reads = vault.access_log().unwrap()["reads"]
-        .as_array()
-        .unwrap()
-        .len();
+    let before_reads = legacy_vault_read_count(&vault);
     store
         .with_metadata_verification_snapshot(|| {
             fs::rename(&state, &held)?;
@@ -1516,14 +1643,7 @@ fn metadata_frame_reuses_one_document_for_4096_trait_verifications_but_not_threa
             Ok(())
         })
         .unwrap();
-    assert_eq!(
-        vault.access_log().unwrap()["reads"]
-            .as_array()
-            .unwrap()
-            .len()
-            - before_reads,
-        4096
-    );
+    assert_eq!(legacy_vault_read_count(&vault) - before_reads, 4096);
 }
 
 #[test]
@@ -1531,10 +1651,7 @@ fn metadata_frame_keeps_real_revocation_checks_and_discards_changed_results_with
     let (_temp, vault, store) = fixture();
     let scope = json!({"softwareId":"synthetic-metadata","roots":[]});
     let signature = store.issue_grant("tracking", &scope).unwrap();
-    let reads = vault.access_log().unwrap()["reads"]
-        .as_array()
-        .unwrap()
-        .len();
+    let reads = legacy_vault_read_count(&vault);
     store
         .with_metadata_verification_snapshot(|| {
             assert!(store.verify_grant("tracking", &scope, &signature)?);
@@ -1543,14 +1660,7 @@ fn metadata_frame_keeps_real_revocation_checks_and_discards_changed_results_with
             Ok(())
         })
         .unwrap();
-    assert_eq!(
-        vault.access_log().unwrap()["reads"]
-            .as_array()
-            .unwrap()
-            .len()
-            - reads,
-        2
-    );
+    assert_eq!(legacy_vault_read_count(&vault) - reads, 2);
     let mut calls = 0;
     let result = store.with_metadata_verification_snapshot(|| {
         calls += 1;

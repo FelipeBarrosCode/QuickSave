@@ -72,6 +72,9 @@ pub struct StateSoftware {
     pub name: String,
     #[serde(default)]
     pub tracked: bool,
+    /// Denial-only latch. Clearing this never grants authority by itself.
+    #[serde(default)]
+    pub authorization_pending: bool,
     #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default = "default_software_status")]
@@ -150,6 +153,7 @@ impl StateSoftware {
             app_id: None,
             source_identity: None,
             tracked: false,
+            authorization_pending: false,
             provider_id: None,
             status: default_software_status(),
             autosave: false,
@@ -188,6 +192,9 @@ impl StateSoftware {
     /// A native Tracker result supplies the status and reconciliation state.
     /// This projection never verifies or replaces its source index/receipt.
     pub(crate) fn current_confirmation(&self) -> Option<u64> {
+        if self.authorization_pending {
+            return None;
+        }
         (self.tracked
             && self.status == "saved"
             && !self.dirty
@@ -266,7 +273,13 @@ impl StateSoftware {
         ensure!(
             matches!(
                 self.status.as_str(),
-                "needs_backup" | "saved" | "checking" | "uploading" | "error" | "not_tracked"
+                "needs_backup"
+                    | "saved"
+                    | "checking"
+                    | "uploading"
+                    | "error"
+                    | "not_tracked"
+                    | "needs_authorization"
             ),
             "invalid software status"
         );
@@ -961,6 +974,13 @@ pub struct WorkspaceDocument {
     pub providers: Vec<ProviderRecord>,
     pub software: Vec<StateSoftware>,
     pub settings: WorkspaceSettings,
+    /// UI hint only. Authenticated pending entries inside the vault determine
+    /// whether a credential can actually be used.
+    #[serde(default)]
+    pub(crate) credential_setup_pending: bool,
+    /// Private persistence only; sanitized DTOs never expose encrypted envelopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) encrypted_secrets: Option<crate::secret_store::EncryptedSecretsSlots>,
 }
 
 impl Default for WorkspaceDocument {
@@ -971,6 +991,8 @@ impl Default for WorkspaceDocument {
             providers: Vec::new(),
             software: Vec::new(),
             settings: WorkspaceSettings::default(),
+            credential_setup_pending: false,
+            encrypted_secrets: None,
         }
     }
 }
@@ -978,6 +1000,9 @@ impl Default for WorkspaceDocument {
 impl WorkspaceDocument {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(self.version == 2, "unsupported workspace state version");
+        if let Some(slots) = &self.encrypted_secrets {
+            slots.validate()?;
+        }
         ensure!(
             self.providers.len() <= MAX_PROVIDERS,
             "too many provider profiles"

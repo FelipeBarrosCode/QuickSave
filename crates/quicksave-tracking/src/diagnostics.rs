@@ -156,6 +156,7 @@ fn native_stage_name(stage: DirectoryIdentityInspectionStage) -> &'static str {
         DirectoryIdentityInspectionStage::RevalidateRootIdentity => "revalidate_root_identity",
         DirectoryIdentityInspectionStage::RevalidatePinnedRoot => "revalidate_pinned_root",
         DirectoryIdentityInspectionStage::UnsupportedPlatform => "unsupported_platform",
+        DirectoryIdentityInspectionStage::NativeNamespaceProof => "native_namespace_proof",
         _ => "unknown",
     }
 }
@@ -265,7 +266,11 @@ impl std::error::Error for RootContext {}
 pub(crate) fn message(error: &anyhow::Error) -> String {
     // Keep the actual failure even if a native path consumes the display
     // budget. Exact root/path/stage are separate bounded diagnostic fields.
-    bounded_message(format_args!("{}; {error:#}", error.root_cause()))
+    if error.chain().nth(1).is_none() {
+        bounded_message(format_args!("{error}"))
+    } else {
+        bounded_message(format_args!("{}; {error:#}", error.root_cause()))
+    }
 }
 
 pub(crate) fn bounded_message(args: fmt::Arguments<'_>) -> String {
@@ -350,6 +355,9 @@ pub(crate) fn root_failure(error: &anyhow::Error) -> Option<Value> {
     if error.downcast_ref::<ScopeGrantViolation>().is_some() {
         value["code"] = json!("native_scope_grant_violation");
     }
+    if error.is::<quicksave_platform::LinkOutsideLogicalRoot>() {
+        value["code"] = json!("native_root_link_layout_unsupported");
+    }
     if let Some(failure) = error.downcast_ref::<PolicyRootFailure>() {
         value["selectedRootPath"] = json!(failure.selected);
         value["protectedRootPath"] = json!(failure.protected);
@@ -393,7 +401,19 @@ impl fmt::Display for RootFailures {
 }
 impl std::error::Error for RootFailures {}
 
+#[derive(Debug)]
+pub(crate) struct NoSelectedRoots(pub Vec<Value>);
+impl fmt::Display for NoSelectedRoots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("No independently verified roots remain in the selected roles. Installation/runtime or whole-container scopes were intentionally omitted; no bundle was created.")
+    }
+}
+impl std::error::Error for NoSelectedRoots {}
+
 pub(crate) fn failures(error: &anyhow::Error) -> Vec<Value> {
+    if let Some(omissions) = error.downcast_ref::<NoSelectedRoots>() {
+        return omissions.0.clone();
+    }
     error
         .downcast_ref::<RootFailures>()
         .map(|failures| failures.0.clone())
