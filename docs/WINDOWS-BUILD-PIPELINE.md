@@ -1,13 +1,15 @@
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
-# Windows build pipeline
+# Windows build pipeline (now part of desktop CI)
 
-`.github/workflows/windows-build.yml` builds the desktop on a native GitHub-hosted
-Windows runner for pushes/PRs to `main`, or a manual Actions run.
+Windows x64 and ARM64 are now included in
+`.github/workflows/desktop-build.yml`. See
+[DESKTOP-BUILD-PIPELINE.md](DESKTOP-BUILD-PIPELINE.md) for the full native test and
+packaging matrix. The former Windows-only workflow was replaced, not duplicated.
 
-The job verifies the pinned upstream/fork, installs locked npm dependencies, runs
-frontend tests, checks Windows integration/service test sources, and builds an
-unsigned x64 NSIS installer using Tauri and the MSVC Rust target.
-The artifact is named `quicksave-windows-x64-unsigned-<commit>` and kept for 14
+Each Windows job verifies the pinned upstream/fork, runs frontend, native Rust
+workspace and desktop unit tests, and builds an unsigned NSIS installer using
+Tauri and a matching native MSVC Rust target.
+Artifacts are named `quicksave-windows-<arch>-unsigned-<commit>` and kept for 7
 days. Download it from the successful workflow run's **Artifacts** section.
 
 This does not publish a GitHub Release, sign an executable, configure a provider,
