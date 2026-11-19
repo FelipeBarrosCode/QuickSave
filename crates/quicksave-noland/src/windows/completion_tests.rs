@@ -36,6 +36,11 @@ impl TrackingStore for Store {
             if error.is::<quicksave_state::MetadataProjectionChanged>() {
                 quicksave_tracking::TrackingProjectionChanged.into()
             } else {
+                // This adapter exists only in isolated tests with MemoryVault.
+                // Preserve the first failure rather than showing only the later
+                // persistent authorization-denial latch. Never print grants,
+                // records, credentials or key bytes.
+                eprintln!("isolated completion fixture grant verification failed: {error:#}");
                 error
             }
         })
