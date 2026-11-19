@@ -36,7 +36,7 @@ jobs:
           python -c 'import json; from pathlib import Path; print("matrix=" + json.dumps({"include": json.loads(Path(".github/desktop-targets.json").read_text())}, separators=(",", ":")))' >> "$GITHUB_OUTPUT"
 
   desktop:
-    name: ${{ matrix.name }} native tests and unsigned packages
+    name: ${{ matrix.name }} ${{ matrix.execution || 'native' }} tests and unsigned packages
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -79,8 +79,8 @@ jobs:
           key: ${{ matrix.name }}
           cache-on-failure: true
 
-      - name: Verify this is a native runner, not a cross-check
-        run: python scripts/check_ci_native_host.py "${{ matrix.target }}"
+      - name: Verify target execution mode
+        run: python scripts/check_ci_native_host.py "${{ matrix.target }}" "${{ matrix.execution || 'native' }}"
 
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'

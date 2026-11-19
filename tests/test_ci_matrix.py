@@ -12,9 +12,10 @@ SPEC.loader.exec_module(HOST)
 
 
 class DesktopMatrixTests(unittest.TestCase):
-    def test_all_six_native_desktop_targets_are_present_exactly_once(self):
+    def test_all_desktop_targets_are_present_exactly_once(self):
         rows = json.loads((ROOT / ".github/desktop-targets.json").read_text())
         expected = {
+            "windows-x86": ("windows-2025", "i686-pc-windows-msvc", "x64", "nsis"),
             "windows-x64": ("windows-2025", "x86_64-pc-windows-msvc", "x64", "nsis"),
             "windows-arm64": ("windows-11-arm", "aarch64-pc-windows-msvc", "arm64", "nsis"),
             "macos-x64": ("macos-15-intel", "x86_64-apple-darwin", "x64", "app,dmg"),
@@ -29,7 +30,22 @@ class DesktopMatrixTests(unittest.TestCase):
                 tuple(row[key] for key in ("runner", "target", "python_arch", "bundles")),
                 expected[row["name"]],
             )
-            self.assertEqual(set(row), {"name", "runner", "target", "python_arch", "bundles"})
+            fields = {"name", "runner", "target", "python_arch", "bundles"}
+            if row["name"] == "windows-x86":
+                fields.add("execution")
+                self.assertEqual(row["execution"], "wow64")
+            self.assertEqual(set(row), fields)
+
+    def test_wow64_is_explicit_and_cannot_impersonate_native_x86_or_arm(self):
+        HOST.verify_native_host("i686-pc-windows-msvc", "Windows", "AMD64",
+            "x86_64-pc-windows-msvc", "wow64")
+        for args in [
+            ("i686-pc-windows-msvc", "Windows", "AMD64", "x86_64-pc-windows-msvc", "native"),
+            ("aarch64-pc-windows-msvc", "Windows", "AMD64", "x86_64-pc-windows-msvc", "wow64"),
+            ("i686-pc-windows-msvc", "Linux", "AMD64", "x86_64-pc-windows-msvc", "wow64"),
+        ]:
+            with self.assertRaises(ValueError):
+                HOST.verify_native_host(*args)
 
     def test_native_architecture_guard_accepts_all_six_targets(self):
         for system, machine, target in [

@@ -451,7 +451,11 @@ fn open_entry_inner(
         WindowsMetadata::from_file(parent)?.kind == NativeEntryKind::Directory,
         "Windows restore parent is not a real directory",
     )?;
-    let mut encoded = name.encode_utf16().collect::<Vec<_>>();
+    // This private sentinel reopens the actual pinned directory for a fresh
+    // enumeration cursor; the NT filesystem namespace does not accept ".".
+    let mut encoded = if name == "." { "" } else { name }
+        .encode_utf16()
+        .collect::<Vec<_>>();
     require(
         encoded.len() * 2 < u16::MAX as usize,
         "native name exceeds NT bound",

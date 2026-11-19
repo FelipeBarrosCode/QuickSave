@@ -608,22 +608,11 @@ fn open_child(parent: &File, name: &str, directory: bool) -> Result<File> {
 }
 
 fn open_dot(parent: &File) -> Result<File> {
-    // NtCreateFile's handle-relative namespace does not accept "." on Windows
-    // (STATUS_OBJECT_NAME_INVALID). Reopen the actual pinned vnode instead of
-    // resolving its path or duplicating its shared enumeration cursor.
+    // NT uses an empty relative name to reopen the held directory itself.
+    // "." is not an NT filename, and Win32 ReOpenFile is not reliable for
+    // directory handles originating from NtCreateFile. No path is resolved.
     let before = metadata(parent, true)?;
-    let handle = unsafe {
-        ReOpenFile(
-            parent.as_raw_handle(),
-            FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | FILE_LIST_DIRECTORY | FILE_TRAVERSE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(io::Error::last_os_error()).context("reopen pinned directory");
-    }
-    let file = unsafe { File::from_raw_handle(handle) };
+    let file = open_native(parent, "", true)?;
     let after = metadata(&file, true)?;
     ensure!(
         before.device == after.device && before.file_id == after.file_id,
@@ -688,7 +677,12 @@ fn open_options_sharing(
     allow_reparse_leaf: bool,
     sharing: u32,
 ) -> Result<File> {
-    if name != "." {
+    if name.is_empty() {
+        ensure!(
+            directory == Some(true) && disposition == FILE_OPEN,
+            "held-directory reopen cannot create or open a regular file"
+        );
+    } else {
         validate_windows_component(name)?;
     }
     let mut encoded: Vec<u16> = name.encode_utf16().collect();
@@ -710,7 +704,7 @@ fn open_options_sharing(
         RootDirectory: parent.as_raw_handle(),
         ObjectName: &native_name,
         Attributes: OBJ_CASE_INSENSITIVE
-            | if allow_reparse_leaf {
+            | if allow_reparse_leaf || name.is_empty() {
                 0
             } else {
                 OBJ_DONT_REPARSE

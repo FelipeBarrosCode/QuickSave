@@ -329,7 +329,16 @@ fn open_at_sharing(
     if name != "." {
         component(OsStr::new(name))?;
     }
-    let mut encoded: Vec<u16> = name.encode_utf16().collect();
+    // Only this private "." sentinel reopens the held directory. The NT
+    // namespace requires a zero-length relative name, not a literal dot.
+    let reopen_directory = name == ".";
+    require(
+        !reopen_directory || (directory == Some(true) && disposition == OPEN),
+        "held-directory reopen cannot create or open a regular file",
+    )?;
+    let mut encoded: Vec<u16> = if reopen_directory { "" } else { name }
+        .encode_utf16()
+        .collect();
     require(
         encoded.len() * 2 < u16::MAX as usize,
         "native name exceeds UTF-16 bound",
@@ -343,7 +352,12 @@ fn open_at_sharing(
         length: size_of::<ObjectAttributes>() as u32,
         root_directory: parent.as_raw_handle(),
         name: &name,
-        attributes: 0x40 | if allow_link { 0 } else { 0x1000 },
+        attributes: 0x40
+            | if allow_link || reopen_directory {
+                0
+            } else {
+                0x1000
+            },
         security,
         quality: ptr::null(),
     };

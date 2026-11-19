@@ -152,7 +152,15 @@ fn open(parent: &File, leaf: &str, directory: bool, access: u32, sharing: u32) -
     {
         return Err(rejected());
     }
-    let mut encoded: Vec<u16> = leaf.encode_utf16().collect();
+    let reopen_directory = leaf == ".";
+    if reopen_directory && !directory {
+        return Err(rejected());
+    }
+    // A zero-length NT relative name reopens the actual held directory. No
+    // pathname lookup, dot component, reparse traversal or cursor sharing.
+    let mut encoded: Vec<u16> = if reopen_directory { "" } else { leaf }
+        .encode_utf16()
+        .collect();
     let name = UnicodeString {
         length: (encoded.len() * 2) as u16,
         maximum_length: (encoded.len() * 2) as u16,
@@ -162,7 +170,7 @@ fn open(parent: &File, leaf: &str, directory: bool, access: u32, sharing: u32) -
         length: size_of::<ObjectAttributes>() as u32,
         root: parent.as_raw_handle(),
         name: &name,
-        attributes: 0x40 | 0x1000,
+        attributes: 0x40 | if reopen_directory { 0 } else { 0x1000 },
         security: ptr::null(),
         quality: ptr::null(),
     };

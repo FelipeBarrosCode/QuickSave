@@ -1,5 +1,13 @@
 [
   {
+    "name": "windows-x86",
+    "runner": "windows-2025",
+    "target": "i686-pc-windows-msvc",
+    "python_arch": "x64",
+    "bundles": "nsis",
+    "execution": "wow64"
+  },
+  {
     "name": "windows-x64",
     "runner": "windows-2025",
     "target": "x86_64-pc-windows-msvc",

@@ -2,10 +2,12 @@
 # Desktop builds and tests
 
 `.github/workflows/desktop-build.yml` runs on main pushes, PRs to main, and manual
-dispatch. `.github/desktop-targets.json` defines six native build/test jobs:
+dispatch. `.github/desktop-targets.json` defines six native build/test jobs plus
+an explicitly labeled Windows x86/WOW64 job:
 
 | OS | Architecture | Runner | Packages |
 | --- | --- | --- | --- |
+| Windows | x86 (32-bit, WOW64 tests) | windows-2025 x64 | unsigned NSIS installer |
 | Windows | x64 | windows-2025 | unsigned NSIS installer |
 | Windows | ARM64 | windows-11-arm | unsigned NSIS installer |
 | macOS | Intel x64 | macos-15-intel | unsigned app in DMG |
@@ -26,8 +28,10 @@ platforms.
 The preparation job verifies upstream/fork provenance and runs Python tests,
 including matrix completeness and native-host guard tests. Every matrix job:
 
-1. Confirms Python's OS/architecture and the Rust host match the target. A
-   cross-compile or an x64 process posing as ARM64 does not pass this gate.
+1. Confirms Python's OS/architecture and the Rust host match the native target.
+   The separate x86 job explicitly validates x64 Windows/WOW64 execution; it
+   builds and executes real 32-bit test binaries, not just cross-checking them.
+   Neither mode allows an x64 process to impersonate ARM64.
 2. Re-verifies provenance on the target filesystem.
 3. Installs locked frontend dependencies, runs frontend tests, typechecks/builds.
 4. Executes all Rust workspace targets/tests natively, with one test thread.
@@ -49,15 +53,25 @@ packages fail the job. Artifacts expire after seven days.
 
 ## Scope and limitations
 
-This is the three desktop OS families on x64/ARM64, **not every OS or CPU ever
-made**. There are no Android/iOS, 32-bit x86/ARM, RISC-V, BSD, musl, or old-OS
+This is the three desktop OS families on x64/ARM64 plus Windows x86, **not every
+OS or CPU ever made**. There are no Android/iOS, 32-bit Linux/ARM, RISC-V, BSD, musl, or old-OS
 acceptance claims. There is no separate macOS universal binary; both architectures
 have their own natively tested package.
 
 These jobs do not perform GUI installation/launch acceptance, real credential
 vault authorization, cloud backup/restore, signing, notarization, or publishing a
 GitHub Release. Unsupported runtime capabilities must still fail explicitly.
-A six-platform green build is not whole Shared Storage acceptance.
+A seven-target green build is not whole Shared Storage acceptance.
+
+## Hourly monitoring
+
+`.github/workflows/ci-health.yml` checks the latest main push build hourly
+(minute 17, UTC, subject to GitHub scheduling delays) or on manual dispatch.
+It reports every job and fails if the latest completed main build failed, was
+cancelled, or has no matching run. A running build is explicitly reported as
+unconfirmed, not as all-green. This read-only check does not rebuild the matrix,
+push fixes, access credentials, publish releases, or pretend to be an autonomous
+coding agent. Fixing failures still requires an active agent session.
 
 The workflow cannot run until pushed to the user's chosen GitHub remote. Local
 matrix/unit tests and a macOS host check are not Windows/Linux acceptance.
