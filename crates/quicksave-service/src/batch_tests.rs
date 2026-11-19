@@ -106,6 +106,7 @@ fn fixture_source_mac(key: &[u8; 32], value: &Value) -> Result<String> {
     )
 }
 fn fixture_root_metadata(root: &SafeRoot) -> Result<Value> {
+    #[cfg(not(windows))]
     let metadata = root.clone_root_directory_handle()?.metadata()?;
     #[cfg(unix)]
     {
@@ -122,11 +123,48 @@ fn fixture_root_metadata(root: &SafeRoot) -> Result<Value> {
             },
             "metadata":{
                 "mode":metadata.mode(),"owner":metadata.uid(),"group":metadata.gid(),
-                "link_count":metadata.nlink(),
+                "linkCount":metadata.nlink(),
             },
         }))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let native =
+            noland_snapshot::WindowsMetadata::from_file(&root.clone_root_directory_handle()?)?;
+        ensure!(
+            native.kind == noland_snapshot::NativeEntryKind::Directory,
+            "Fixture full-scope root is not a native directory"
+        );
+        let time = |ticks: i64| -> Result<(i64, u32)> {
+            Ok((
+                ticks
+                    .div_euclid(10_000_000)
+                    .checked_sub(11_644_473_600)
+                    .context("Fixture native timestamp exceeds representable range")?,
+                ticks.rem_euclid(10_000_000) as u32 * 100,
+            ))
+        };
+        let modified = time(native.last_write_time)?;
+        let changed = time(native.change_time)?;
+        Ok(json!({
+            "stamp":{
+                "device":native.identity.volume,"file_id":native.identity.file_id,
+                "size":native.size,
+                "modified_seconds":modified.0,"modified_nanoseconds":modified.1,
+                "changed_seconds":changed.0,"changed_nanoseconds":changed.1,
+            },
+            "metadata":{
+                "platform":"windows",
+                "identity":{"device":native.identity.volume,"fileId":native.identity.file_id},
+                "kind":"directory","size":native.size,
+                "creationTime":native.creation_time,"lastAccessTime":native.last_access_time,
+                "lastWriteTime":native.last_write_time,"changeTime":native.change_time,
+                "attributes":native.attributes,"linkCount":native.number_of_links,
+                "reparseTag":native.reparse_tag,
+            },
+        }))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = metadata;
         bail!("This isolated full-scope fixture requires Unix native metadata")

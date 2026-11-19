@@ -31,6 +31,7 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+noland-snapshot = { path = "../../shared-storage/crates/noland-snapshot" }
 
 [target.'cfg(unix)'.dev-dependencies]
 bytes = "1"
@@ -39,5 +40,4 @@ noland-rpc = { path = "../../shared-storage/crates/noland-rpc" }
 noland-state-core = { path = "../../shared-storage/crates/noland-state-core" }
 noland-storage = { path = "../../shared-storage/crates/noland-storage" }
 noland-crypto = { path = "../../shared-storage/crates/noland-crypto" }
-noland-snapshot = { path = "../../shared-storage/crates/noland-snapshot" }
 noland-pack = { path = "../../shared-storage/crates/noland-pack" }

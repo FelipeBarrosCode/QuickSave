@@ -32,7 +32,13 @@ impl TrackingStore for Store {
         self.0.issue_grant(kind, scope)
     }
     fn verify_grant(&self, kind: &str, scope: &Value, grant: &Value) -> Result<bool> {
-        self.0.verify_grant(kind, scope, grant)
+        self.0.verify_grant(kind, scope, grant).map_err(|error| {
+            if error.is::<quicksave_state::MetadataProjectionChanged>() {
+                quicksave_tracking::TrackingProjectionChanged.into()
+            } else {
+                error
+            }
+        })
     }
     fn revoke_grant(&self, kind: &str, scope: &Value) -> Result<()> {
         self.0.revoke_grant(kind, scope)

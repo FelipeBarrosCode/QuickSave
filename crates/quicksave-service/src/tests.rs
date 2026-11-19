@@ -9,6 +9,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const SECRET: &str = "DO_NOT_EXPOSE_ACCESS_TOKEN_OR_MASTER_KEY";
 
+// Parser/orchestration fixtures only; these paths are never opened.
+fn synthetic_path(path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", path.replace('/', "\\"))
+    } else {
+        path.to_owned()
+    }
+}
+
 struct FakeStore {
     document: Mutex<Value>,
     access_reads: AtomicUsize,
@@ -28,7 +37,7 @@ impl FakeStore {
                     "id":"software-1","appId":"stable.app.identity","name":"Synthetic application",
                     "tracked":true,"providerId":"provider-1","status":"needs_backup","autosave":false,
                     "dirty":true,"dirtyGeneration":1,"trackingGrant":{"opaque":"native signature"},
-                    "roots":[{"id":"root-1","path":"/synthetic/approved","role":"manual","identity":{"device":7,"fileId":[11,0]},"allowedFiles":null}],
+                    "roots":[{"id":"root-1","path":synthetic_path("/synthetic/approved"),"role":"manual","identity":{"device":7,"fileId":[11,0]},"allowedFiles":null}],
                 }],
             })),
             access_reads: AtomicUsize::new(0),
@@ -582,7 +591,7 @@ impl ServiceEngine for FakeEngine {
                 ),
                 "restore_recovery_scope" => Ok(json!({
                     "operationId":input["operationId"],"providerId":"provider-1",
-                    "frozenPlanFingerprint":"c".repeat(64),"roots":[{"path":"/synthetic/original-restore-target"}],
+                    "frozenPlanFingerprint":"c".repeat(64),"roots":[{"path":synthetic_path("/synthetic/original-restore-target")}],
                     "summary":"Recover only original owned local restore outputs. No cloud connection or download is authorized.",
                 })),
                 "recover_restore_local" => {
@@ -812,7 +821,7 @@ async fn native_previews_match_renderer_contract_without_exposing_engine_authori
             "preview_restore",
             json!({
                 "providerId":"provider-1","bundleId":"b","appId":"a",
-                "destination":"/synthetic/native-target","mode":"create_new",
+                "destination":synthetic_path("/synthetic/native-target"),"mode":"create_new",
             }),
         )
         .await
@@ -916,7 +925,7 @@ async fn approval_scope_is_deterministic_vault_free_and_binds_scope() {
     assert_eq!(before, again);
     assert_eq!(
         before["software"]["roots"][0]["path"],
-        "/synthetic/approved"
+        synthetic_path("/synthetic/approved")
     );
     assert_eq!(fixture.store.access_reads.load(Ordering::SeqCst), 0);
     fixture.store.document.lock().unwrap()["software"][0]["roots"][0]["allowedFiles"] =
@@ -1381,7 +1390,7 @@ async fn imported_profiles_stay_read_only_without_a_separate_native_write_action
         .service
         .execute_authorized(
             "import_noland",
-            json!({"stateFile":"/synthetic/read-only-source/state.json"}),
+            json!({"stateFile":synthetic_path("/synthetic/read-only-source/state.json")}),
         )
         .await
         .unwrap();
@@ -1803,7 +1812,7 @@ fn error_categories_never_echo_private_bodies() {
 async fn native_pins_are_excluded_from_scope_digest_and_preserved_for_owned_download() {
     let fixture = Fixture::new(false);
     let preview = fixture.service.execute_authorized("preview_restore",
-        json!({"providerId":"provider-1","bundleId":"bundle-1","appId":"app-1","destination":"/synthetic/approved-destination","mode":"create_new"}))
+        json!({"providerId":"provider-1","bundleId":"bundle-1","appId":"app-1","destination":synthetic_path("/synthetic/approved-destination"),"mode":"create_new"}))
         .await.unwrap();
     let mut params =
         json!({"restorePreviewId":preview["previewId"],"overwriteAcknowledgement":false});
@@ -1812,7 +1821,7 @@ async fn native_pins_are_excluded_from_scope_digest_and_preserved_for_owned_down
         .approval_scope("download", &params)
         .await
         .unwrap();
-    let proofs = json!([{"path":"/synthetic/approved-destination","kind":"directory","identity":{"device":7,"fileId":[42,0]}}]);
+    let proofs = json!([{"path":synthetic_path("/synthetic/approved-destination"),"kind":"directory","identity":{"device":7,"fileId":[42,0]}}]);
     params["_approvedPaths"] = proofs.clone();
     let after = fixture
         .service

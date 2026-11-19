@@ -1015,7 +1015,7 @@ mod tests {
             "sourceIdentity":{"app_id":"steam:480","display_name":"Synthetic application"},
             "name":"Synthetic application","providerId":"isolated-provider","tracked":true,
             "roots":[{
-                "id":"save-root","path":"/isolated-fixture/application","role":"save",
+                "id":"save-root","path":if cfg!(windows) { r"C:\isolated-fixture\application" } else { "/isolated-fixture/application" },"role":"save",
                 "identity":{"device":1,"fileId":[2,0]},"allowedFiles":null,
             }],
             "trackingGrant":{"fixtureOnly":"not-a-production-grant"},
