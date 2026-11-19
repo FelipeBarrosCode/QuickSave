@@ -34,6 +34,13 @@ impl Drop for WriterLock {
 }
 
 pub(crate) fn initialize_with_key(repository: &Path, key: &RepositoryKey) -> Result<Value> {
+    // The legacy local format requires durable private directory operations.
+    // Windows' desktop-native adapter is not acceptance of that separate engine.
+    // Refuse before creating even an empty directory on unsupported hosts.
+    ensure!(
+        cfg!(any(target_os = "macos", target_os = "linux")),
+        "legacy local repository initialization is unsupported on this platform"
+    );
     let path = absolute_root(repository)?;
     quicksave_platform::ensure_private_directory(&path).context(
         "repository must be a native private directory (0700 on Unix), without symlinks",

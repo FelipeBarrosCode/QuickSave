@@ -531,14 +531,23 @@ mod tests {
             )),
             _ => None,
         };
-        assert_eq!(proof?,Some(false),
+        // Boot layout is a real runtime precondition, not an invariant of the
+        // CPU or OS label. Extra mounts MUST retain Unsupported (None), not
+        // acquire a fabricated disjointness proof just to satisfy CI.
+        assert_eq!(proof?,admitted.then_some(false),
             "native proof unavailable: data-capabilities={:?}, system-capabilities={:?}, layout-admitted={admitted}, rejection={rejection:?}, volume-identity={volume_identity:?}, additional={additional:?}",
             dv.as_ref().map(|v|(v.format,v.valid)),sv.as_ref().map(|v|(v.format,v.valid)));
-        assert_eq!(selected.apfs_data_overlap_proof(&selected)?, Some(true));
+        assert_eq!(
+            selected.apfs_data_overlap_proof(&selected)?,
+            admitted.then_some(true)
+        );
         let child_path = selected_path.join("child");
         std::fs::create_dir(&child_path)?;
         let child = Root::open(&child_path)?;
-        assert_eq!(selected.apfs_data_overlap_proof(&child)?, Some(true));
+        assert_eq!(
+            selected.apfs_data_overlap_proof(&child)?,
+            admitted.then_some(true)
+        );
         std::fs::rename(&selected_path, temporary.path().join("moved"))?;
         assert!(selected.apfs_data_overlap_proof(&protected).is_err());
         Ok(())

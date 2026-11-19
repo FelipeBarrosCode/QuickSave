@@ -8,4 +8,12 @@ fn unsupported_durable_mutations_are_not_reported_as_success() {
     let key = quicksave_engine::RepositoryKey::from_bytes([0x5a; 32]);
     assert!(quicksave_engine::initialize_with_key(&repository, &key).is_err());
     assert!(!repository.exists());
+    std::fs::create_dir(&repository).unwrap();
+    std::fs::write(repository.join("existing.dat"), b"retain").unwrap();
+    assert!(quicksave_engine::initialize_with_key(&repository, &key).is_err());
+    assert_eq!(
+        std::fs::read(repository.join("existing.dat")).unwrap(),
+        b"retain"
+    );
+    assert_eq!(std::fs::read_dir(&repository).unwrap().count(), 1);
 }

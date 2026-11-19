@@ -24,7 +24,21 @@ fn approval_proves_disjointness_without_entering_a_denied_protected_subdirectory
     let result = selected.overlaps_for_approval(&excluded);
     let census = selected.overlaps_directory_identities(&excluded);
     fs::remove_dir(&opaque)?;
-    assert!(!result?);
+    match result {
+        Ok(overlap) => assert!(!overlap),
+        Err(error) => {
+            // Unsupported mount layouts must use the directory census; the
+            // synthetic mode-000 directory must then fail closed, not report
+            // successful disjointness. Other errors remain test failures.
+            assert!(census.is_err());
+            assert!(
+                error.chain().any(|cause| cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)),
+                "unexpected approval failure: {error:#}"
+            );
+        }
+    }
     if unsafe { libc::geteuid() } != 0 {
         assert!(
             census.is_err(),
