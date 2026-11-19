@@ -343,7 +343,19 @@ fn admitted_mount_boundary(m: &Mount) -> bool {
                     .get(.."/System/Volumes/Data/".len())
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/System/Volumes/Data/"));
             let local_volume = Path::new(text).parent() == Some(Path::new("/Volumes"));
-            (system_auxiliary || local_volume)
+            // Modern macOS also mounts the immutable PKI trust-store asset on
+            // the sealed System namespace. Admit only its exact structural
+            // shape and read-only local APFS metadata. As with other portals,
+            // the proof still pins/reopens its parent and mount-root vnodes.
+            let trust_store =
+                text.strip_prefix(
+                    "/System/Library/AssetsV2/com_apple_MobileAsset_PKITrustStore/purpose_auto/",
+                )
+                .and_then(|suffix| suffix.strip_suffix(".asset/.AssetData"))
+                .is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) && m.flags & (LOCAL | READONLY | UNION) == (LOCAL | READONLY);
+            (system_auxiliary || local_volume || trust_store)
                 && m.kind == b"apfs"
                 && m.flags & (LOCAL | UNION) == LOCAL
         }
@@ -374,6 +386,40 @@ fn canonical_root(root: &Root) -> Result<Option<Root>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn immutable_system_trust_store_is_a_pinned_portal_not_a_writable_alias() {
+        let path = format!(
+            "/System/Library/AssetsV2/com_apple_MobileAsset_PKITrustStore/purpose_auto/{}.asset/.AssetData",
+            "a".repeat(64));
+        let mount = Mount {
+            path: path.as_bytes().to_vec(),
+            kind: b"apfs".to_vec(),
+            fsid: [8, 0],
+            flags: LOCAL | READONLY,
+        };
+        assert!(admitted_mount_boundary(&mount));
+        for flags in [LOCAL, READONLY, LOCAL | READONLY | UNION] {
+            assert!(!admitted_mount_boundary(&Mount {
+                flags,
+                ..mount.clone()
+            }));
+        }
+        for wrong in [
+            path.replace("/purpose_auto/", "/other/"),
+            path.replace(".asset/.AssetData", ".asset/child"),
+            path.replace(&"a".repeat(64), "../../Data"),
+            path.replace("/System/Library/", "/System/Volumes/Data/Library/"),
+        ] {
+            assert!(!admitted_mount_boundary(&Mount {
+                path: wrong.into_bytes(),
+                ..mount.clone()
+            }));
+        }
+        assert!(!admitted_mount_boundary(&Mount {
+            kind: b"smbfs".to_vec(),
+            ..mount
+        }));
+    }
     fn fixture_volumes() -> (Volume, Volume, Vec<Mount>) {
         let valid = DIR_HARDLINKS | VOL_GROUPS | SEALED;
         let data = Volume {
