@@ -66,6 +66,7 @@ fn run(arguments: Arguments) -> Result<serde_json::Value> {
             "platform": quicksave_platform::capabilities(),
             "integrations": quicksave_integrations::integration_capabilities(),
             "engineLimits": quicksave_client::engine_limits(),
+            "localRepositorySupported": quicksave_client::local_repository_supported(),
             "product": "QuickSave",
             "releaseStage": "development-preview",
             "nolandRepositoryCompatibility": false,

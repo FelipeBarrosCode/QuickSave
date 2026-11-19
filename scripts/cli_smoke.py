@@ -212,8 +212,11 @@ def smoke(binary: Path, temporary_parent: Path | None) -> dict:
         capabilities = invoke("capabilities")
         platform = capabilities.get("platform", capabilities)
         filesystem = platform.get("filesystem", {})
-        writable = filesystem.get("durable_create_new")
-        require(isinstance(writable, bool), "CLI has no explicit durable-write capability")
+        durable = filesystem.get("durable_create_new")
+        require(isinstance(durable, bool), "CLI has no explicit durable-write capability")
+        supported = capabilities.get("localRepositorySupported")
+        require(isinstance(supported, bool), "CLI has no explicit local-repository capability")
+        writable = durable and supported
         init_arguments = (
             "init", "--repository", str(repository), "--key-file", str(key),
         )
@@ -226,7 +229,10 @@ def smoke(binary: Path, temporary_parent: Path | None) -> dict:
                 "status": "unsupported-refusal-verified",
                 "platform": platform.get("platform"),
                 "round_trip": False,
-                "reason": filesystem.get("windows_durable_write_status", "durable writes unavailable"),
+                "reason": (
+                    "legacy local repository format unavailable" if not supported
+                    else filesystem.get("windows_durable_write_status", "durable writes unavailable")
+                ),
                 "commands": command_count,
             }
 

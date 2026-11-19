@@ -38,7 +38,7 @@ pub(crate) fn initialize_with_key(repository: &Path, key: &RepositoryKey) -> Res
     // Windows' desktop-native adapter is not acceptance of that separate engine.
     // Refuse before creating even an empty directory on unsupported hosts.
     ensure!(
-        cfg!(any(target_os = "macos", target_os = "linux")),
+        crate::local_repository_supported(),
         "legacy local repository initialization is unsupported on this platform"
     );
     let path = absolute_root(repository)?;

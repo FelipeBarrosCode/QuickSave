@@ -24,6 +24,11 @@ use anyhow::Result;
 pub use quicksave_content::RepositoryKey;
 use serde_json::Value;
 
+/// Legacy local-format availability, independent of desktop Shared Storage.
+pub const fn local_repository_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
 /// Actual engine format/capture limits, independent of the platform walk limit.
 ///
 /// These are bounded preview limits, not a throughput or platform-acceptance

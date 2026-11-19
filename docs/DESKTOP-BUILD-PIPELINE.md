@@ -31,6 +31,12 @@ workspace tests and isolated CLI smoke tests. Its Linux jobs install the native
 libelf/DBus/OpenSSL headers too. An all-green desktop matrix alone does not mean
 this separate workflow passed.
 
+The CLI's `localRepositorySupported` capability is separate from native
+filesystem durability and desktop Shared Storage support. On Windows the
+legacy local CLI format remains unsupported: smoke tests require explicit
+refusal with no recovery-key creation or repository mutation, not a round-trip
+claim.
+
 The preparation job verifies upstream/fork provenance and runs Python tests,
 including matrix completeness and native-host guard tests. Every matrix job:
 

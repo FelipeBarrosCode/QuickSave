@@ -22,6 +22,10 @@ pub fn engine_limits() -> Value {
     quicksave_engine::limits()
 }
 
+pub fn local_repository_supported() -> bool {
+    quicksave_engine::local_repository_supported()
+}
+
 /// Make an absolute literal path without following symlinks or accepting `..`.
 /// The platform adapter subsequently opens all ancestors without following links.
 pub fn literal_path(path: &Path) -> Result<PathBuf> {
@@ -138,6 +142,11 @@ fn read_key_with_stamp(path: &Path) -> Result<(RepositoryKey, FileStamp)> {
 }
 
 pub fn initialize_repository(repository: &Path, key_file: &Path) -> Result<Value> {
+    // Native filesystem durability is not acceptance of the legacy local
+    // repository format. Refuse before generating/publishing an external key.
+    if !local_repository_supported() {
+        bail!("legacy local repository initialization is unsupported on this platform");
+    }
     let repository = literal_path(repository)?;
     let key_file = external_key_path(key_file, &[&repository])?;
     let (root, name) = key_parent(&key_file)?;
@@ -459,6 +468,24 @@ impl Drop for OperationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn unsupported_local_initialization_never_creates_keys_or_repository_entries() {
+        assert!(!local_repository_supported());
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let repository = temp.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        let key = temp.path().join("recovery.key");
+        let error = initialize_repository(&repository, &key).unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert!(!key.exists());
+        assert!(std::fs::read_dir(&repository).unwrap().next().is_none());
+        let absent = temp.path().join("absent-repository");
+        assert!(initialize_repository(&absent, &key).is_err());
+        assert!(!absent.exists());
+        assert!(!key.exists());
+    }
 
     #[cfg(unix)]
     fn private_temp() -> tempfile::TempDir {
